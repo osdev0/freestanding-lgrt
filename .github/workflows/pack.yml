@@ -1,3 +1,7 @@
+# Part of cc-runtime, under the Apache License v2.0 with LLVM Exceptions.
+# See LICENSE.TXT for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
 name: Pack cc-runtime
 
 on:

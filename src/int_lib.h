@@ -4,7 +4,7 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// 2024/01/21 - Modified by mintsuki for use inside cc-runtime
+// 2024/01/21 - Modified by Mintsuki for use inside cc-runtime
 //
 //===----------------------------------------------------------------------===//
 //
@@ -22,7 +22,7 @@
 
 // ABI macro definitions
 
-#if __ARM_EABI__
+#ifdef __ARM_EABI__
 #ifdef COMPILER_RT_ARMHF_TARGET
 #define COMPILER_RT_ABI
 #else

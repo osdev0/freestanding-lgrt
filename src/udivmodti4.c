@@ -4,6 +4,8 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// 2026/10/17 - Modified by Mintsuki for use inside cc-runtime
+//
 //===----------------------------------------------------------------------===//
 //
 // This file implements __udivmodti4 for the compiler_rt library.
@@ -85,7 +87,7 @@ static inline du_int udiv128by64to64(du_int u1, du_int u0, du_int v,
                                      du_int *r) {
 #if defined(__x86_64__)
   du_int result;
-  __asm__("divq %[v]"
+  __asm__("{divq %[v]|div %[v]}"
           : "=a"(result), "=d"(*r)
           : [ v ] "r"(v), "a"(u0), "d"(u1));
   return result;

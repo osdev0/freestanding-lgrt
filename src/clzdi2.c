@@ -4,7 +4,7 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// 2024/08/10 - Modified by mintsuki for use inside cc-runtime
+// 2024/08/10 - Modified by Mintsuki for use inside cc-runtime
 //
 //===----------------------------------------------------------------------===//
 //
@@ -16,12 +16,11 @@
 
 // Returns: the number of leading 0-bits
 
-#if !defined(__clang__) &&                                                     \
-    ((defined(__sparc__) && defined(__arch64__)) || defined(__mips64) ||       \
-     (defined(__riscv) && __SIZEOF_POINTER__ >= 8))
+#if defined(__riscv) && __SIZEOF_POINTER__ >= 8
 // On 64-bit architectures with neither a native clz instruction nor a native
-// ctz instruction, gcc resolves __builtin_clz to __clzdi2 rather than
-// __clzsi2, leading to infinite recursion.
+// ctz instruction, `__builtin_clz` resolves to `__clzdi2` rather than
+// __clzsi2 as libgcc does not ship with `__clzsi2`, leading to infinite
+// recursion.
 #define __builtin_clz(a) __clzsi2(a)
 extern int __clzsi2(si_int);
 #endif

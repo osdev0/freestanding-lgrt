@@ -4,7 +4,7 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// 2024/01/21 - Modified by mintsuki for use inside cc-runtime
+// 2024/01/21 - Modified by Mintsuki for use inside cc-runtime
 //
 //===----------------------------------------------------------------------===//
 //
@@ -65,8 +65,7 @@ typedef union {
   } s;
 } udwords;
 
-#if defined(__LP64__) || defined(__wasm__) || defined(__mips64) ||             \
-    defined(__SIZEOF_INT128__)
+#if defined(__LP64__) || defined(__SIZEOF_INT128__)
 #define CRT_HAS_128BIT
 #endif
 
