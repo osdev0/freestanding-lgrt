@@ -1,9 +1,10 @@
-cc-runtime
-==========
+freestanding-lgrt
+=================
 
-cc-runtime is a freestanding, easy to integrate subset of LLVM's compiler-rt
-builtins: the libgcc-compatible routines that GCC and Clang call for operations
-a target can't do inline, packed into a single C file.
+freestanding-lgrt, the freestanding LLVM and GCC runtime, is an easy to
+integrate subset of LLVM's compiler-rt builtins: the libgcc-compatible routines
+that GCC and Clang call for operations a target can't do inline, packed into a
+single C file.
 
 It covers the integer routines, the atomics, and the architecture-specific
 helpers.
@@ -12,10 +13,10 @@ Supported targets are ELF ones, built with GCC or Clang, for x86-64, IA-32,
 aarch64, 32-bit ARM, 32- and 64-bit RISC-V, and 32- and 64-bit LoongArch, plus
 16-bit x86 code built with -m16 (GCC, or Clang 12 or later).
 
-To use it, compile src/cc-runtime.c with the same compiler and flags as the rest
-of the program, but without LTO (-fno-lto), and link the object in. The program
-must provide memcpy, memmove, memset and memcmp. Unsupported compilers, object
-formats and architectures stop the build with an error.
+To use it, compile src/freestanding-lgrt.c with the same compiler and flags as
+the rest of the program, but without LTO (-fno-lto), and link the object in.
+The program must provide memcpy, memmove, memset and memcmp. Unsupported
+compilers, object formats and architectures stop the build with an error.
 
 Relevant licenses apply: see license headers in source files, LICENSE.TXT and
 CREDITS.TXT.

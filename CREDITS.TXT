@@ -37,5 +37,5 @@ D: ARM improvements.
 
 N: Mintsuki
 E: mintsuki@protonmail.com
-D: cc-runtime: the selection of builtins, their packing into a single C file
-D: (pack.sh), and the modifications noted in the source files.
+D: freestanding-lgrt: the selection of builtins, their packing into a single
+D: C file (pack.sh), and the modifications noted in the source files.

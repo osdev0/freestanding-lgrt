@@ -1,2 +1,2 @@
-/src/cc-runtime.c
-/src/cc-runtime.o
+/src/freestanding-lgrt.c
+/src/freestanding-lgrt.o

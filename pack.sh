@@ -1,6 +1,6 @@
 #! /bin/sh
 #
-# Part of cc-runtime, under the Apache License v2.0 with LLVM Exceptions.
+# Part of freestanding-lgrt, under the Apache License v2.0 with LLVM Exceptions.
 # See LICENSE.TXT for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
@@ -75,9 +75,10 @@ EOF
 # Converts an assembly source, as printed by asm-inline.awk, to C. Preprocessor
 # directives are kept as they are, and the assembly lines become top-level
 # __asm__ statements. The invocations of the macros that the assembly source
-# itself can see are expanded by the C preprocessor through CC_RUNTIME_ASM,
-# everything else is emitted verbatim in string literals. As the converted
-# code is assembly, __ASSEMBLER__ is considered defined in the directives.
+# itself can see are expanded by the C preprocessor through
+# FREESTANDING_LGRT_ASM, everything else is emitted verbatim in string literals.
+# As the converted code is assembly, __ASSEMBLER__ is considered defined in the
+# directives.
 #
 # With hygiene set, the code gets its own .pushsection, and the macros and
 # assembler macros it defines are undefined afterwards, as if it were a
@@ -203,7 +204,7 @@ function convert(s,    out, raw, i, c, j, k, word, inv) {
                 inv = substr(s, i, j - i)
                 if (inv ~ /[\\']/)
                     fail("macro invocation cannot be stringified: " inv)
-                out = out lit(raw) " CC_RUNTIME_ASM(" inv ")"
+                out = out lit(raw) " FREESTANDING_LGRT_ASM(" inv ")"
                 raw = ""
             } else {
                 raw = raw word
@@ -537,19 +538,19 @@ asm_to_c() {
 prelude_macros=$(sed -n 's/^[[:space:]]*#[[:space:]]*define[[:space:]]\{1,\}\([A-Za-z_][A-Za-z0-9_]*\).*/\1/p' \
     src/int_endianness.h src/assembly.h | tr '\n' ' ')
 
-cat >src/cc-runtime.c <<'EOF'
+cat >src/freestanding-lgrt.c <<'EOF'
 #pragma GCC diagnostic ignored "-Wunused-function"
 
-#define CC_RUNTIME_ASM_STR(...) #__VA_ARGS__
-#define CC_RUNTIME_ASM(...) CC_RUNTIME_ASM_STR(__VA_ARGS__)
+#define FREESTANDING_LGRT_ASM_STR(...) #__VA_ARGS__
+#define FREESTANDING_LGRT_ASM(...) FREESTANDING_LGRT_ASM_STR(__VA_ARGS__)
 
 EOF
 
-cat src/int_endianness.h >> src/cc-runtime.c
-asm_to_c src/assembly.h 0 >> src/cc-runtime.c
-cat src/int_types.h src/int_lib.h src/int_util.h >> src/cc-runtime.c
+cat src/int_endianness.h >> src/freestanding-lgrt.c
+asm_to_c src/assembly.h 0 >> src/freestanding-lgrt.c
+cat src/int_types.h src/int_lib.h src/int_util.h >> src/freestanding-lgrt.c
 
-for f in $(find src -name '*.c' | grep -v 'cc-runtime\.c' | LC_ALL=C sort); do
+for f in $(find src -name '*.c' | grep -v 'freestanding-lgrt\.c' | LC_ALL=C sort); do
     guard=$(arch_guard "$f")
     superseded=$(supersede_guard "$f")
     if [ -n "$superseded" ]; then
@@ -562,11 +563,11 @@ for f in $(find src -name '*.c' | grep -v 'cc-runtime\.c' | LC_ALL=C sort); do
     if [ -n "$guard" ]; then
         echo "#endif"
     fi
-done >> src/cc-runtime.c
+done >> src/freestanding-lgrt.c
 
 for f in $(cd src && echo *.inc); do
-    sed -e "/#include \"$f\"/{r src/$f" -e "d}" src/cc-runtime.c > src/cc-runtime.c.tmp
-    mv src/cc-runtime.c.tmp src/cc-runtime.c
+    sed -e "/#include \"$f\"/{r src/$f" -e "d}" src/freestanding-lgrt.c > src/freestanding-lgrt.c.tmp
+    mv src/freestanding-lgrt.c.tmp src/freestanding-lgrt.c
 done
 
 for f in $(find src -name '*.S' | LC_ALL=C sort); do
@@ -596,30 +597,30 @@ for f in $(find src -name '*.S' | LC_ALL=C sort); do
             ;;
     esac
     echo "#endif"
-done >> src/cc-runtime.c
+done >> src/freestanding-lgrt.c
 
-cat >>src/cc-runtime.c <<'EOF'
+cat >>src/freestanding-lgrt.c <<'EOF'
 
-#undef CC_RUNTIME_ASM_STR
-#undef CC_RUNTIME_ASM
+#undef FREESTANDING_LGRT_ASM_STR
+#undef FREESTANDING_LGRT_ASM
 EOF
 
 rm -f asm-inline.awk asm-to-c.awk asm-instance.awk asm-lse.tmp
 
 # System headers go to the top, except stdatomic.h, which the C11 functions
 # include only where their guard lets them be built.
-grep '#include <' src/cc-runtime.c | grep -v '<stdatomic\.h>' > saved-includes
-sed -e '/#include <stdatomic\.h>/b' -e '/#include/d' src/cc-runtime.c > src/cc-runtime.c.tmp
-mv src/cc-runtime.c.tmp src/cc-runtime.c
-cat saved-includes src/cc-runtime.c > src/cc-runtime.c.tmp
-mv src/cc-runtime.c.tmp src/cc-runtime.c
+grep '#include <' src/freestanding-lgrt.c | grep -v '<stdatomic\.h>' > saved-includes
+sed -e '/#include <stdatomic\.h>/b' -e '/#include/d' src/freestanding-lgrt.c > src/freestanding-lgrt.c.tmp
+mv src/freestanding-lgrt.c.tmp src/freestanding-lgrt.c
+cat saved-includes src/freestanding-lgrt.c > src/freestanding-lgrt.c.tmp
+mv src/freestanding-lgrt.c.tmp src/freestanding-lgrt.c
 rm -f saved-includes
 
-awk '{for(x=1;x<=NF;x++)if($x~/_EXTERNAL_COUNTER/){sub(/_EXTERNAL_COUNTER/,++i)}}1' src/cc-runtime.c > src/cc-runtime.c.tmp
-mv src/cc-runtime.c.tmp src/cc-runtime.c
+awk '{for(x=1;x<=NF;x++)if($x~/_EXTERNAL_COUNTER/){sub(/_EXTERNAL_COUNTER/,++i)}}1' src/freestanding-lgrt.c > src/freestanding-lgrt.c.tmp
+mv src/freestanding-lgrt.c.tmp src/freestanding-lgrt.c
 
 # The packed file starts with the license and credits, then a gate that stops
-# the build where cc-runtime isn't supported, before any header can fail.
+# the build where freestanding-lgrt isn't supported, before any header can fail.
 sed -e 's|^|// |' -e 's| *$||' LICENSE.TXT > packed-header
 echo '//' >> packed-header
 echo '// ---- Start of embedded CREDITS.TXT, as referred to above ----' >> packed-header
@@ -637,22 +638,22 @@ cat >>packed-header <<'EOF'
      defined(__TINYC__) || defined(__PCC__) || defined(__LCC__) ||             \
      defined(__COMPCERT__) || defined(__CC_ARM) ||                             \
      defined(__TI_COMPILER_VERSION__))
-#error "cc-runtime: unsupported compiler, use GCC or Clang"
+#error "freestanding-lgrt: unsupported compiler, use GCC or Clang"
 #endif
 // Workaround: Clang up to 16, bare-metal x86, AArch64 and LoongArch: it does
 // not always define __ELF__, so only targets known not to be ELF are ruled out.
 #if !defined(__ELF__) &&                                                       \
     (!defined(__clang__) || __clang_major__ >= 17 || defined(_WIN32) ||        \
      defined(__CYGWIN__) || defined(__APPLE__) || defined(__MACH__))
-#error "cc-runtime: unsupported object format, only ELF is supported"
+#error "freestanding-lgrt: unsupported object format, only ELF is supported"
 #endif
 #if !defined(__x86_64__) && !defined(__i386__) && !defined(__ia16__) &&        \
     !defined(__aarch64__) && !defined(__arm__) && !defined(__riscv) &&         \
     !defined(__loongarch__)
-#error "cc-runtime: unsupported architecture"
+#error "freestanding-lgrt: unsupported architecture"
 #endif
 
 EOF
-cat packed-header src/cc-runtime.c > src/cc-runtime.c.tmp
-mv src/cc-runtime.c.tmp src/cc-runtime.c
+cat packed-header src/freestanding-lgrt.c > src/freestanding-lgrt.c.tmp
+mv src/freestanding-lgrt.c.tmp src/freestanding-lgrt.c
 rm -f packed-header

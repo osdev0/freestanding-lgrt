@@ -1,8 +1,8 @@
-# Part of cc-runtime, under the Apache License v2.0 with LLVM Exceptions.
+# Part of freestanding-lgrt, under the Apache License v2.0 with LLVM Exceptions.
 # See LICENSE.TXT for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-name: Pack cc-runtime
+name: Pack freestanding-lgrt
 
 on:
   push:
@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   pack:
-    name: Pack cc-runtime
+    name: Pack freestanding-lgrt
     runs-on: ubuntu-latest
 
     steps:
@@ -23,24 +23,24 @@ jobs:
         with:
           fetch-depth: '0'
 
-      - name: Pack cc-runtime
+      - name: Pack freestanding-lgrt
         run: |
           set -ex
           ./pack.sh
           mkdir -p /tmp/packed/src
-          mv src/cc-runtime.c /tmp/packed/src/
+          mv src/freestanding-lgrt.c /tmp/packed/src/
           cp CREDITS.TXT LICENSE.TXT README /tmp/packed/
 
-      - name: Push packed cc-runtime
+      - name: Push packed freestanding-lgrt
         run: |
           set -ex
           git config user.name 'Mintsuki'
           git config user.email 'mintsuki@protonmail.com'
-          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/osdev0/cc-runtime.git
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
           git fetch --all
           git checkout packed || git checkout --orphan packed
           git rm -rfq .
           cp -R /tmp/packed/. ./
           git add -f .
-          git commit --allow-empty -m "Push packed cc-runtime.c"
+          git commit --allow-empty -m "Push packed freestanding-lgrt.c"
           git push origin packed
