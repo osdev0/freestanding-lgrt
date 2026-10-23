@@ -38,4 +38,5 @@ D: ARM improvements.
 N: Mintsuki
 E: mintsuki@protonmail.com
 D: freestanding-lgrt: the selection of builtins, their packing into a single
-D: C file (pack.sh), and the modifications noted in the source files.
+D: C file (pack.sh), the functions of C23's stdbit.h (stdc_*.c), and the
+D: modifications noted in the source files.
