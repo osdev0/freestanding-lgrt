@@ -352,7 +352,8 @@
 // N: Mintsuki
 // E: mintsuki@protonmail.com
 // D: freestanding-lgrt: the selection of builtins, their packing into a single
-// D: C file (pack.sh), and the modifications noted in the source files.
+// D: C file (pack.sh), the functions of C23's stdbit.h (stdc_*.c), and the
+// D: modifications noted in the source files.
 //
 // ---- End of embedded CREDITS.TXT ----
 
@@ -4201,6 +4202,1300 @@ COMPILER_RT_ABI int __popcountti2(ti_int a) {
 }
 
 #endif // CRT_HAS_128BIT
+//===-- stdc_bit_ceil_uc.c ------------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_bit_ceil_uc from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned char stdc_bit_ceil_uc(unsigned char value) {
+  // The width of the type that __builtin_clz counts the leading zeros of.
+  const int bits = (int)sizeof(unsigned int) * __CHAR_BIT__;
+  if (value <= 1)
+    return 1;
+  // 2 to the bit width of value - 1, where the type has a bit for it.
+  int exponent = bits - __builtin_clz((unsigned int)value - 1);
+  if (exponent >= (int)sizeof(value) * __CHAR_BIT__)
+    return 0;
+  return (unsigned char)(1u << exponent);
+}
+//===-- stdc_bit_ceil_ui.c ------------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_bit_ceil_ui from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_bit_ceil_ui(unsigned int value) {
+  // The width of the type that __builtin_clz counts the leading zeros of.
+  const int bits = (int)sizeof(unsigned int) * __CHAR_BIT__;
+  if (value <= 1)
+    return 1;
+  // 2 to the bit width of value - 1, where the type has a bit for it.
+  int exponent = bits - __builtin_clz(value - 1);
+  if (exponent >= (int)sizeof(value) * __CHAR_BIT__)
+    return 0;
+  return 1u << exponent;
+}
+//===-- stdc_bit_ceil_ul.c ------------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_bit_ceil_ul from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned long stdc_bit_ceil_ul(unsigned long value) {
+  // The width of the type that __builtin_clzl counts the leading zeros of.
+  const int bits = (int)sizeof(unsigned long) * __CHAR_BIT__;
+  if (value <= 1)
+    return 1;
+  // 2 to the bit width of value - 1, where the type has a bit for it.
+  int exponent = bits - __builtin_clzl(value - 1);
+  if (exponent >= (int)sizeof(value) * __CHAR_BIT__)
+    return 0;
+  return 1ul << exponent;
+}
+//===-- stdc_bit_ceil_ull.c -----------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_bit_ceil_ull from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned long long stdc_bit_ceil_ull(unsigned long long value) {
+  // The width of the type that __builtin_clzll counts the leading zeros of.
+  const int bits = (int)sizeof(unsigned long long) * __CHAR_BIT__;
+  if (value <= 1)
+    return 1;
+  // 2 to the bit width of value - 1, where the type has a bit for it.
+  int exponent = bits - __builtin_clzll(value - 1);
+  if (exponent >= (int)sizeof(value) * __CHAR_BIT__)
+    return 0;
+  return 1ull << exponent;
+}
+//===-- stdc_bit_ceil_us.c ------------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_bit_ceil_us from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned short stdc_bit_ceil_us(unsigned short value) {
+  // The width of the type that __builtin_clz counts the leading zeros of.
+  const int bits = (int)sizeof(unsigned int) * __CHAR_BIT__;
+  if (value <= 1)
+    return 1;
+  // 2 to the bit width of value - 1, where the type has a bit for it.
+  int exponent = bits - __builtin_clz((unsigned int)value - 1);
+  if (exponent >= (int)sizeof(value) * __CHAR_BIT__)
+    return 0;
+  return (unsigned short)(1u << exponent);
+}
+//===-- stdc_bit_floor_uc.c -----------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_bit_floor_uc from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned char stdc_bit_floor_uc(unsigned char value) {
+  // The width of the type that __builtin_clz counts the leading zeros of.
+  const int bits = (int)sizeof(unsigned int) * __CHAR_BIT__;
+  if (value == 0)
+    return 0;
+  // 2 to the index of the most significant one of value.
+  return (unsigned char)(1u << (bits - 1 - __builtin_clz(value)));
+}
+//===-- stdc_bit_floor_ui.c -----------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_bit_floor_ui from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_bit_floor_ui(unsigned int value) {
+  // The width of the type that __builtin_clz counts the leading zeros of.
+  const int bits = (int)sizeof(unsigned int) * __CHAR_BIT__;
+  if (value == 0)
+    return 0;
+  // 2 to the index of the most significant one of value.
+  return 1u << (bits - 1 - __builtin_clz(value));
+}
+//===-- stdc_bit_floor_ul.c -----------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_bit_floor_ul from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned long stdc_bit_floor_ul(unsigned long value) {
+  // The width of the type that __builtin_clzl counts the leading zeros of.
+  const int bits = (int)sizeof(unsigned long) * __CHAR_BIT__;
+  if (value == 0)
+    return 0;
+  // 2 to the index of the most significant one of value.
+  return 1ul << (bits - 1 - __builtin_clzl(value));
+}
+//===-- stdc_bit_floor_ull.c ----------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_bit_floor_ull from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned long long stdc_bit_floor_ull(unsigned long long value) {
+  // The width of the type that __builtin_clzll counts the leading zeros of.
+  const int bits = (int)sizeof(unsigned long long) * __CHAR_BIT__;
+  if (value == 0)
+    return 0;
+  // 2 to the index of the most significant one of value.
+  return 1ull << (bits - 1 - __builtin_clzll(value));
+}
+//===-- stdc_bit_floor_us.c -----------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_bit_floor_us from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned short stdc_bit_floor_us(unsigned short value) {
+  // The width of the type that __builtin_clz counts the leading zeros of.
+  const int bits = (int)sizeof(unsigned int) * __CHAR_BIT__;
+  if (value == 0)
+    return 0;
+  // 2 to the index of the most significant one of value.
+  return (unsigned short)(1u << (bits - 1 - __builtin_clz(value)));
+}
+//===-- stdc_bit_width_uc.c -----------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_bit_width_uc from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_bit_width_uc(unsigned char value) {
+  // The width of the type that __builtin_clz counts the leading zeros of.
+  const int bits = (int)sizeof(unsigned int) * __CHAR_BIT__;
+  if (value == 0)
+    return 0;
+  return (unsigned int)(bits - __builtin_clz(value));
+}
+//===-- stdc_bit_width_ui.c -----------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_bit_width_ui from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_bit_width_ui(unsigned int value) {
+  // The width of the type that __builtin_clz counts the leading zeros of.
+  const int bits = (int)sizeof(unsigned int) * __CHAR_BIT__;
+  if (value == 0)
+    return 0;
+  return (unsigned int)(bits - __builtin_clz(value));
+}
+//===-- stdc_bit_width_ul.c -----------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_bit_width_ul from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_bit_width_ul(unsigned long value) {
+  // The width of the type that __builtin_clzl counts the leading zeros of.
+  const int bits = (int)sizeof(unsigned long) * __CHAR_BIT__;
+  if (value == 0)
+    return 0;
+  return (unsigned int)(bits - __builtin_clzl(value));
+}
+//===-- stdc_bit_width_ull.c ----------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_bit_width_ull from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_bit_width_ull(unsigned long long value) {
+  // The width of the type that __builtin_clzll counts the leading zeros of.
+  const int bits = (int)sizeof(unsigned long long) * __CHAR_BIT__;
+  if (value == 0)
+    return 0;
+  return (unsigned int)(bits - __builtin_clzll(value));
+}
+//===-- stdc_bit_width_us.c -----------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_bit_width_us from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_bit_width_us(unsigned short value) {
+  // The width of the type that __builtin_clz counts the leading zeros of.
+  const int bits = (int)sizeof(unsigned int) * __CHAR_BIT__;
+  if (value == 0)
+    return 0;
+  return (unsigned int)(bits - __builtin_clz(value));
+}
+//===-- stdc_count_ones_uc.c ----------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_count_ones_uc from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_count_ones_uc(unsigned char value) {
+  return (unsigned int)__builtin_popcount(value);
+}
+//===-- stdc_count_ones_ui.c ----------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_count_ones_ui from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_count_ones_ui(unsigned int value) {
+  return (unsigned int)__builtin_popcount(value);
+}
+//===-- stdc_count_ones_ul.c ----------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_count_ones_ul from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_count_ones_ul(unsigned long value) {
+  return (unsigned int)__builtin_popcountl(value);
+}
+//===-- stdc_count_ones_ull.c ---------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_count_ones_ull from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_count_ones_ull(unsigned long long value) {
+  return (unsigned int)__builtin_popcountll(value);
+}
+//===-- stdc_count_ones_us.c ----------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_count_ones_us from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_count_ones_us(unsigned short value) {
+  return (unsigned int)__builtin_popcount(value);
+}
+//===-- stdc_count_zeros_uc.c ---------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_count_zeros_uc from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_count_zeros_uc(unsigned char value) {
+  // The zeros of value are the ones of its complement.
+  return (unsigned int)__builtin_popcount((unsigned char)~value);
+}
+//===-- stdc_count_zeros_ui.c ---------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_count_zeros_ui from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_count_zeros_ui(unsigned int value) {
+  // The zeros of value are the ones of its complement.
+  return (unsigned int)__builtin_popcount(~value);
+}
+//===-- stdc_count_zeros_ul.c ---------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_count_zeros_ul from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_count_zeros_ul(unsigned long value) {
+  // The zeros of value are the ones of its complement.
+  return (unsigned int)__builtin_popcountl(~value);
+}
+//===-- stdc_count_zeros_ull.c --------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_count_zeros_ull from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_count_zeros_ull(unsigned long long value) {
+  // The zeros of value are the ones of its complement.
+  return (unsigned int)__builtin_popcountll(~value);
+}
+//===-- stdc_count_zeros_us.c ---------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_count_zeros_us from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_count_zeros_us(unsigned short value) {
+  // The zeros of value are the ones of its complement.
+  return (unsigned int)__builtin_popcount((unsigned short)~value);
+}
+//===-- stdc_first_leading_one_uc.c ---------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_first_leading_one_uc from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_first_leading_one_uc(unsigned char value) {
+  // __builtin_clz counts the leading zeros of an unsigned int, which has these
+  // many more bits than value.
+  const int extra = (int)(sizeof(unsigned int) - sizeof(value)) * __CHAR_BIT__;
+  if (value == 0)
+    return 0;
+  return (unsigned int)(__builtin_clz(value) - extra) + 1;
+}
+//===-- stdc_first_leading_one_ui.c ---------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_first_leading_one_ui from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_first_leading_one_ui(unsigned int value) {
+  if (value == 0)
+    return 0;
+  return (unsigned int)__builtin_clz(value) + 1;
+}
+//===-- stdc_first_leading_one_ul.c ---------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_first_leading_one_ul from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_first_leading_one_ul(unsigned long value) {
+  if (value == 0)
+    return 0;
+  return (unsigned int)__builtin_clzl(value) + 1;
+}
+//===-- stdc_first_leading_one_ull.c --------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_first_leading_one_ull from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_first_leading_one_ull(unsigned long long value) {
+  if (value == 0)
+    return 0;
+  return (unsigned int)__builtin_clzll(value) + 1;
+}
+//===-- stdc_first_leading_one_us.c ---------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_first_leading_one_us from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_first_leading_one_us(unsigned short value) {
+  // __builtin_clz counts the leading zeros of an unsigned int, which has these
+  // many more bits than value.
+  const int extra = (int)(sizeof(unsigned int) - sizeof(value)) * __CHAR_BIT__;
+  if (value == 0)
+    return 0;
+  return (unsigned int)(__builtin_clz(value) - extra) + 1;
+}
+//===-- stdc_first_leading_zero_uc.c --------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_first_leading_zero_uc from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_first_leading_zero_uc(unsigned char value) {
+  // __builtin_clz counts the leading zeros of an unsigned int, which has these
+  // many more bits than value.
+  const int extra = (int)(sizeof(unsigned int) - sizeof(value)) * __CHAR_BIT__;
+  // The first leading zero of value is the first leading one of its
+  // complement.
+  unsigned char complement = (unsigned char)~value;
+  if (complement == 0)
+    return 0;
+  return (unsigned int)(__builtin_clz(complement) - extra) + 1;
+}
+//===-- stdc_first_leading_zero_ui.c --------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_first_leading_zero_ui from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_first_leading_zero_ui(unsigned int value) {
+  // The first leading zero of value is the first leading one of its
+  // complement.
+  unsigned int complement = ~value;
+  if (complement == 0)
+    return 0;
+  return (unsigned int)__builtin_clz(complement) + 1;
+}
+//===-- stdc_first_leading_zero_ul.c --------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_first_leading_zero_ul from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_first_leading_zero_ul(unsigned long value) {
+  // The first leading zero of value is the first leading one of its
+  // complement.
+  unsigned long complement = ~value;
+  if (complement == 0)
+    return 0;
+  return (unsigned int)__builtin_clzl(complement) + 1;
+}
+//===-- stdc_first_leading_zero_ull.c -------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_first_leading_zero_ull from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_first_leading_zero_ull(unsigned long long value) {
+  // The first leading zero of value is the first leading one of its
+  // complement.
+  unsigned long long complement = ~value;
+  if (complement == 0)
+    return 0;
+  return (unsigned int)__builtin_clzll(complement) + 1;
+}
+//===-- stdc_first_leading_zero_us.c --------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_first_leading_zero_us from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_first_leading_zero_us(unsigned short value) {
+  // __builtin_clz counts the leading zeros of an unsigned int, which has these
+  // many more bits than value.
+  const int extra = (int)(sizeof(unsigned int) - sizeof(value)) * __CHAR_BIT__;
+  // The first leading zero of value is the first leading one of its
+  // complement.
+  unsigned short complement = (unsigned short)~value;
+  if (complement == 0)
+    return 0;
+  return (unsigned int)(__builtin_clz(complement) - extra) + 1;
+}
+//===-- stdc_first_trailing_one_uc.c --------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_first_trailing_one_uc from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_first_trailing_one_uc(unsigned char value) {
+  if (value == 0)
+    return 0;
+  return (unsigned int)__builtin_ctz(value) + 1;
+}
+//===-- stdc_first_trailing_one_ui.c --------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_first_trailing_one_ui from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_first_trailing_one_ui(unsigned int value) {
+  if (value == 0)
+    return 0;
+  return (unsigned int)__builtin_ctz(value) + 1;
+}
+//===-- stdc_first_trailing_one_ul.c --------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_first_trailing_one_ul from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_first_trailing_one_ul(unsigned long value) {
+  if (value == 0)
+    return 0;
+  return (unsigned int)__builtin_ctzl(value) + 1;
+}
+//===-- stdc_first_trailing_one_ull.c -------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_first_trailing_one_ull from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_first_trailing_one_ull(unsigned long long value) {
+  if (value == 0)
+    return 0;
+  return (unsigned int)__builtin_ctzll(value) + 1;
+}
+//===-- stdc_first_trailing_one_us.c --------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_first_trailing_one_us from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_first_trailing_one_us(unsigned short value) {
+  if (value == 0)
+    return 0;
+  return (unsigned int)__builtin_ctz(value) + 1;
+}
+//===-- stdc_first_trailing_zero_uc.c -------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_first_trailing_zero_uc from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_first_trailing_zero_uc(unsigned char value) {
+  // The first trailing zero of value is the first trailing one of its
+  // complement.
+  unsigned char complement = (unsigned char)~value;
+  if (complement == 0)
+    return 0;
+  return (unsigned int)__builtin_ctz(complement) + 1;
+}
+//===-- stdc_first_trailing_zero_ui.c -------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_first_trailing_zero_ui from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_first_trailing_zero_ui(unsigned int value) {
+  // The first trailing zero of value is the first trailing one of its
+  // complement.
+  unsigned int complement = ~value;
+  if (complement == 0)
+    return 0;
+  return (unsigned int)__builtin_ctz(complement) + 1;
+}
+//===-- stdc_first_trailing_zero_ul.c -------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_first_trailing_zero_ul from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_first_trailing_zero_ul(unsigned long value) {
+  // The first trailing zero of value is the first trailing one of its
+  // complement.
+  unsigned long complement = ~value;
+  if (complement == 0)
+    return 0;
+  return (unsigned int)__builtin_ctzl(complement) + 1;
+}
+//===-- stdc_first_trailing_zero_ull.c ------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_first_trailing_zero_ull from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_first_trailing_zero_ull(unsigned long long value) {
+  // The first trailing zero of value is the first trailing one of its
+  // complement.
+  unsigned long long complement = ~value;
+  if (complement == 0)
+    return 0;
+  return (unsigned int)__builtin_ctzll(complement) + 1;
+}
+//===-- stdc_first_trailing_zero_us.c -------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_first_trailing_zero_us from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_first_trailing_zero_us(unsigned short value) {
+  // The first trailing zero of value is the first trailing one of its
+  // complement.
+  unsigned short complement = (unsigned short)~value;
+  if (complement == 0)
+    return 0;
+  return (unsigned int)__builtin_ctz(complement) + 1;
+}
+//===-- stdc_has_single_bit_uc.c ------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_has_single_bit_uc from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+_Bool stdc_has_single_bit_uc(unsigned char value) {
+  return value != 0 && (value & (value - 1)) == 0;
+}
+//===-- stdc_has_single_bit_ui.c ------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_has_single_bit_ui from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+_Bool stdc_has_single_bit_ui(unsigned int value) {
+  return value != 0 && (value & (value - 1)) == 0;
+}
+//===-- stdc_has_single_bit_ul.c ------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_has_single_bit_ul from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+_Bool stdc_has_single_bit_ul(unsigned long value) {
+  return value != 0 && (value & (value - 1)) == 0;
+}
+//===-- stdc_has_single_bit_ull.c -----------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_has_single_bit_ull from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+_Bool stdc_has_single_bit_ull(unsigned long long value) {
+  return value != 0 && (value & (value - 1)) == 0;
+}
+//===-- stdc_has_single_bit_us.c ------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_has_single_bit_us from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+_Bool stdc_has_single_bit_us(unsigned short value) {
+  return value != 0 && (value & (value - 1)) == 0;
+}
+//===-- stdc_leading_ones_uc.c --------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_leading_ones_uc from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_leading_ones_uc(unsigned char value) {
+  // __builtin_clz counts the leading zeros of an unsigned int, which has these
+  // many more bits than value.
+  const int extra = (int)(sizeof(unsigned int) - sizeof(value)) * __CHAR_BIT__;
+  // The leading ones of value are the leading zeros of its complement.
+  unsigned char complement = (unsigned char)~value;
+  if (complement == 0)
+    return sizeof(value) * __CHAR_BIT__;
+  return (unsigned int)(__builtin_clz(complement) - extra);
+}
+//===-- stdc_leading_ones_ui.c --------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_leading_ones_ui from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_leading_ones_ui(unsigned int value) {
+  // The leading ones of value are the leading zeros of its complement.
+  unsigned int complement = ~value;
+  if (complement == 0)
+    return sizeof(value) * __CHAR_BIT__;
+  return (unsigned int)__builtin_clz(complement);
+}
+//===-- stdc_leading_ones_ul.c --------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_leading_ones_ul from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_leading_ones_ul(unsigned long value) {
+  // The leading ones of value are the leading zeros of its complement.
+  unsigned long complement = ~value;
+  if (complement == 0)
+    return sizeof(value) * __CHAR_BIT__;
+  return (unsigned int)__builtin_clzl(complement);
+}
+//===-- stdc_leading_ones_ull.c -------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_leading_ones_ull from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_leading_ones_ull(unsigned long long value) {
+  // The leading ones of value are the leading zeros of its complement.
+  unsigned long long complement = ~value;
+  if (complement == 0)
+    return sizeof(value) * __CHAR_BIT__;
+  return (unsigned int)__builtin_clzll(complement);
+}
+//===-- stdc_leading_ones_us.c --------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_leading_ones_us from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_leading_ones_us(unsigned short value) {
+  // __builtin_clz counts the leading zeros of an unsigned int, which has these
+  // many more bits than value.
+  const int extra = (int)(sizeof(unsigned int) - sizeof(value)) * __CHAR_BIT__;
+  // The leading ones of value are the leading zeros of its complement.
+  unsigned short complement = (unsigned short)~value;
+  if (complement == 0)
+    return sizeof(value) * __CHAR_BIT__;
+  return (unsigned int)(__builtin_clz(complement) - extra);
+}
+//===-- stdc_leading_zeros_uc.c -------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_leading_zeros_uc from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_leading_zeros_uc(unsigned char value) {
+  // __builtin_clz counts the leading zeros of an unsigned int, which has these
+  // many more bits than value.
+  const int extra = (int)(sizeof(unsigned int) - sizeof(value)) * __CHAR_BIT__;
+  if (value == 0)
+    return sizeof(value) * __CHAR_BIT__;
+  return (unsigned int)(__builtin_clz(value) - extra);
+}
+//===-- stdc_leading_zeros_ui.c -------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_leading_zeros_ui from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_leading_zeros_ui(unsigned int value) {
+  if (value == 0)
+    return sizeof(value) * __CHAR_BIT__;
+  return (unsigned int)__builtin_clz(value);
+}
+//===-- stdc_leading_zeros_ul.c -------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_leading_zeros_ul from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_leading_zeros_ul(unsigned long value) {
+  if (value == 0)
+    return sizeof(value) * __CHAR_BIT__;
+  return (unsigned int)__builtin_clzl(value);
+}
+//===-- stdc_leading_zeros_ull.c ------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_leading_zeros_ull from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_leading_zeros_ull(unsigned long long value) {
+  if (value == 0)
+    return sizeof(value) * __CHAR_BIT__;
+  return (unsigned int)__builtin_clzll(value);
+}
+//===-- stdc_leading_zeros_us.c -------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_leading_zeros_us from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_leading_zeros_us(unsigned short value) {
+  // __builtin_clz counts the leading zeros of an unsigned int, which has these
+  // many more bits than value.
+  const int extra = (int)(sizeof(unsigned int) - sizeof(value)) * __CHAR_BIT__;
+  if (value == 0)
+    return sizeof(value) * __CHAR_BIT__;
+  return (unsigned int)(__builtin_clz(value) - extra);
+}
+//===-- stdc_trailing_ones_uc.c -------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_trailing_ones_uc from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_trailing_ones_uc(unsigned char value) {
+  // The trailing ones of value are the trailing zeros of its complement.
+  unsigned char complement = (unsigned char)~value;
+  if (complement == 0)
+    return sizeof(value) * __CHAR_BIT__;
+  return (unsigned int)__builtin_ctz(complement);
+}
+//===-- stdc_trailing_ones_ui.c -------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_trailing_ones_ui from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_trailing_ones_ui(unsigned int value) {
+  // The trailing ones of value are the trailing zeros of its complement.
+  unsigned int complement = ~value;
+  if (complement == 0)
+    return sizeof(value) * __CHAR_BIT__;
+  return (unsigned int)__builtin_ctz(complement);
+}
+//===-- stdc_trailing_ones_ul.c -------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_trailing_ones_ul from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_trailing_ones_ul(unsigned long value) {
+  // The trailing ones of value are the trailing zeros of its complement.
+  unsigned long complement = ~value;
+  if (complement == 0)
+    return sizeof(value) * __CHAR_BIT__;
+  return (unsigned int)__builtin_ctzl(complement);
+}
+//===-- stdc_trailing_ones_ull.c ------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_trailing_ones_ull from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_trailing_ones_ull(unsigned long long value) {
+  // The trailing ones of value are the trailing zeros of its complement.
+  unsigned long long complement = ~value;
+  if (complement == 0)
+    return sizeof(value) * __CHAR_BIT__;
+  return (unsigned int)__builtin_ctzll(complement);
+}
+//===-- stdc_trailing_ones_us.c -------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_trailing_ones_us from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_trailing_ones_us(unsigned short value) {
+  // The trailing ones of value are the trailing zeros of its complement.
+  unsigned short complement = (unsigned short)~value;
+  if (complement == 0)
+    return sizeof(value) * __CHAR_BIT__;
+  return (unsigned int)__builtin_ctz(complement);
+}
+//===-- stdc_trailing_zeros_uc.c ------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_trailing_zeros_uc from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_trailing_zeros_uc(unsigned char value) {
+  if (value == 0)
+    return sizeof(value) * __CHAR_BIT__;
+  return (unsigned int)__builtin_ctz(value);
+}
+//===-- stdc_trailing_zeros_ui.c ------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_trailing_zeros_ui from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_trailing_zeros_ui(unsigned int value) {
+  if (value == 0)
+    return sizeof(value) * __CHAR_BIT__;
+  return (unsigned int)__builtin_ctz(value);
+}
+//===-- stdc_trailing_zeros_ul.c ------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_trailing_zeros_ul from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_trailing_zeros_ul(unsigned long value) {
+  if (value == 0)
+    return sizeof(value) * __CHAR_BIT__;
+  return (unsigned int)__builtin_ctzl(value);
+}
+//===-- stdc_trailing_zeros_ull.c -----------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_trailing_zeros_ull from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_trailing_zeros_ull(unsigned long long value) {
+  if (value == 0)
+    return sizeof(value) * __CHAR_BIT__;
+  return (unsigned int)__builtin_ctzll(value);
+}
+//===-- stdc_trailing_zeros_us.c ------------------------------------------===//
+//
+// Part of freestanding-lgrt, under the Apache License v2.0 with LLVM
+// Exceptions. See LICENSE.TXT for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements stdc_trailing_zeros_us from C23's stdbit.h.
+//
+//===----------------------------------------------------------------------===//
+
+unsigned int stdc_trailing_zeros_us(unsigned short value) {
+  if (value == 0)
+    return sizeof(value) * __CHAR_BIT__;
+  return (unsigned int)__builtin_ctz(value);
+}
 //===-- subvdi3.c - Implement __subvdi3 -----------------------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.

@@ -6,8 +6,8 @@ integrate subset of LLVM's compiler-rt builtins: the libgcc-compatible routines
 that GCC and Clang call for operations a target can't do inline, packed into a
 single C file.
 
-It covers the integer routines, the atomics, and the architecture-specific
-helpers.
+It covers the integer routines, the atomics, the architecture-specific helpers,
+and the functions of C23's stdbit.h.
 
 Supported targets are ELF ones, built with GCC or Clang, for x86-64, IA-32,
 aarch64, 32-bit ARM, 32- and 64-bit RISC-V, and 32- and 64-bit LoongArch, plus
