@@ -2,21 +2,28 @@ freestanding-lgrt
 =================
 
 freestanding-lgrt, the freestanding LLVM and GCC runtime, is an easy to
-integrate subset of LLVM's compiler-rt builtins: the libgcc-compatible routines
-that GCC and Clang call for operations a target can't do inline, packed into a
-single C file.
+integrate implementation of the libgcc-compatible routines that GCC and Clang
+call for operations a target can't do inline, in a single C file.
 
 It covers the integer routines, the atomics, the architecture-specific helpers,
-and the functions of C23's stdbit.h.
+and the functions of C23's stdbit.h. The atomic routines exist only where the
+compiler implements pointer-sized atomic operations inline.
 
-Supported targets are ELF ones, built with GCC or Clang, for x86-64, IA-32,
-aarch64, 32-bit ARM, 32- and 64-bit RISC-V, and 32- and 64-bit LoongArch, plus
-16-bit x86 code built with -m16 (GCC, or Clang 12 or later).
+Supported targets are ELF ones, built with GCC 4.7 or later or Clang 6 or
+later, for x86-64 (including x32), IA-32, aarch64, 32-bit ARM (ARMv4T to
+ARMv8.1-M), 32- and 64-bit RISC-V, 32- and 64-bit LoongArch, MIPS, PowerPC,
+s390x, SPARC, Alpha, PA-RISC, m68k, SuperH, Hexagon, and ARC, plus 16-bit x86
+code built with -m16 (GCC, or Clang 12 or later).
 
 To use it, compile src/freestanding-lgrt.c with the same compiler and flags as
 the rest of the program, but without LTO (-fno-lto), and link the object in.
-The program must provide memcpy, memmove, memset and memcmp. Unsupported
-compilers, object formats and architectures stop the build with an error.
+The program must provide memcpy, memmove, memset, and memcmp. Compilers other
+than GCC and Clang stop the build with an error.
 
-Relevant licenses apply: see license headers in source files, LICENSE.TXT and
-CREDITS.TXT.
+Known compiler issues:
+
+- Clang 12 at -Oz miscompiles code that its machine outliner factors out for
+  ARM M-profile targets: build with -mno-outline there.
+- On MIPS64, and on SPARC64 with Clang before 21, GCC and Clang pass __int128
+  arguments differently: build the library with the same compiler as the code
+  that calls its 16-byte atomic routines.
