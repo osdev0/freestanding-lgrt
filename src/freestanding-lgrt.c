@@ -14,16 +14,19 @@
  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-
 #if !defined(__GNUC__) && !defined(__clang__)
 #error "freestanding-lgrt requires GCC or Clang"
 #endif
 
-/* GCC 12 for SuperH miscompiles conditional branches when optimising. */
+/*
+ * Workaround: GCC 12, SuperH: it miscompiles conditional branches when
+ * optimising, so the file is built without optimisation there.
+ */
 #if !defined(__clang__) && defined(__sh__) && __GNUC__ == 12
 #pragma GCC optimize ("O0")
 #endif
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -42,9 +45,10 @@ __extension__ typedef unsigned __int128 lgrt_u128;
 #endif
 
 /*
- * With the compilers below, __builtin_trap() becomes a call to abort or an
- * instruction that does not trap, so execute one that traps instead, and spin in
- * case it does not.
+ * Workaround: Clang before 10, RISC-V; Clang before 9, Hexagon; GCC, SuperH;
+ * GCC 4.8, AArch64 and ARM: __builtin_trap() becomes a call to abort or an
+ * instruction that does not trap, so these execute one that traps instead,
+ * and spin in case it does not.
  */
 #if defined(__clang__)
 #if defined(__riscv) && __clang_major__ < 10
@@ -106,37 +110,37 @@ __extension__ typedef unsigned __int128 lgrt_u128;
 #endif
 
 /*
- * The compiler's bit-counting and byte-swapping builtins can compile into calls
- * to the routines below, so these must never use them.
+ * The compiler's bit-counting and byte-swapping builtins can compile into
+ * calls to the routines below, so these must never use them.
  */
 
 static inline uint32_t lgrt_clz32(uint32_t x) {
     uint32_t n = 0;
     uint32_t s;
 
-    s = (uint32_t)(x < 0x00010000u) << 4;
+    s = (uint32_t)(x < 0x00010000) << 4;
     x <<= s;
     n += s;
-    s = (uint32_t)(x < 0x01000000u) << 3;
+    s = (uint32_t)(x < 0x01000000) << 3;
     x <<= s;
     n += s;
-    s = (uint32_t)(x < 0x10000000u) << 2;
+    s = (uint32_t)(x < 0x10000000) << 2;
     x <<= s;
     n += s;
-    s = (uint32_t)(x < 0x40000000u) << 1;
+    s = (uint32_t)(x < 0x40000000) << 1;
     x <<= s;
     n += s;
     /* The leading one, if any, is now in one of the top two bits. */
-    return n + (x < 0x80000000u) + (x == 0);
+    return n + (uint32_t)(x < (uint32_t)0x80000000) + (uint32_t)(x == 0);
 }
 
 static inline uint32_t lgrt_clz64(uint64_t x) {
     uint32_t hi = (uint32_t)(x >> 32);
     uint32_t lo = (uint32_t)x;
-    uint32_t z = (hi == 0);
+    uint32_t z = (uint32_t)(hi == 0);
 
     /* Search lo if hi is zero, else hi. */
-    return (z << 5) + lgrt_clz32(hi | (lo & (0u - z)));
+    return (z << 5) + lgrt_clz32(hi | (lo & ((uint32_t)0 - z)));
 }
 
 LGRT_AAPCS int __clzsi2(int32_t a);
@@ -155,9 +159,9 @@ LGRT_AAPCS int __clzti2(lgrt_i128 a) {
     lgrt_u128 x = (lgrt_u128)a;
     uint64_t hi = (uint64_t)(x >> 64);
     uint64_t lo = (uint64_t)x;
-    uint64_t z = (hi == 0);
+    uint64_t z = (uint64_t)(hi == 0);
 
-    return (int)((z << 6) + lgrt_clz64(hi | (lo & (0u - z))));
+    return (int)((z << 6) + lgrt_clz64(hi | (lo & ((uint64_t)0 - z))));
 }
 #endif
 
@@ -165,29 +169,29 @@ static inline uint32_t lgrt_ctz32(uint32_t x) {
     uint32_t n = 0;
     uint32_t s;
 
-    s = (uint32_t)((x & 0x0000ffffu) == 0) << 4;
+    s = (uint32_t)((x & 0x0000ffff) == 0) << 4;
     x >>= s;
     n += s;
-    s = (uint32_t)((x & 0x000000ffu) == 0) << 3;
+    s = (uint32_t)((x & 0x000000ff) == 0) << 3;
     x >>= s;
     n += s;
-    s = (uint32_t)((x & 0x0000000fu) == 0) << 2;
+    s = (uint32_t)((x & 0x0000000f) == 0) << 2;
     x >>= s;
     n += s;
-    s = (uint32_t)((x & 0x00000003u) == 0) << 1;
+    s = (uint32_t)((x & 0x00000003) == 0) << 1;
     x >>= s;
     n += s;
     /* The lowest one, if any, is now in one of the bottom two bits. */
-    return n + ((x & 1u) == 0) + (x == 0);
+    return n + (uint32_t)((x & 1) == 0) + (uint32_t)(x == 0);
 }
 
 static inline uint32_t lgrt_ctz64(uint64_t x) {
     uint32_t lo = (uint32_t)x;
     uint32_t hi = (uint32_t)(x >> 32);
-    uint32_t z = (lo == 0);
+    uint32_t z = (uint32_t)(lo == 0);
 
     /* Search hi if lo is zero, else lo. */
-    return (z << 5) + lgrt_ctz32(lo | (hi & (0u - z)));
+    return (z << 5) + lgrt_ctz32(lo | (hi & ((uint32_t)0 - z)));
 }
 
 LGRT_AAPCS int __ctzsi2(int32_t a);
@@ -204,9 +208,9 @@ LGRT_AAPCS int __ctzdi2(int64_t a) {
 static inline uint32_t lgrt_ctz128(lgrt_u128 x) {
     uint64_t lo = (uint64_t)x;
     uint64_t hi = (uint64_t)(x >> 64);
-    uint64_t z = (lo == 0);
+    uint64_t z = (uint64_t)(lo == 0);
 
-    return (uint32_t)(z << 6) + lgrt_ctz64(lo | (hi & (0u - z)));
+    return (uint32_t)(z << 6) + lgrt_ctz64(lo | (hi & ((uint64_t)0 - z)));
 }
 
 LGRT_AAPCS int __ctzti2(lgrt_i128 a);
@@ -253,16 +257,16 @@ LGRT_AAPCS int __ffsti2(lgrt_i128 a) {
  */
 
 static inline uint32_t lgrt_nibble_popcounts32(uint32_t x) {
-    x -= (x >> 1) & 0x55555555u;
-    return (x & 0x33333333u) + ((x >> 2) & 0x33333333u);
+    x -= (x >> 1) & 0x55555555;
+    return (x & 0x33333333) + ((x >> 2) & 0x33333333);
 }
 
 /* Each nibble of x must be at most 8. */
 static inline uint32_t lgrt_sum_nibbles32(uint32_t x) {
-    x = (x & 0x0f0f0f0fu) + ((x >> 4) & 0x0f0f0f0fu);
+    x = (x & 0x0f0f0f0f) + ((x >> 4) & 0x0f0f0f0f);
     x += x >> 8;
     x += x >> 16;
-    return x & 0xffu;
+    return x & 0xff;
 }
 
 LGRT_AAPCS int __popcountsi2(int32_t a);
@@ -272,20 +276,23 @@ LGRT_AAPCS int __popcountsi2(int32_t a) {
 
 #if LGRT_HAS_INT128
 
-/* Targets with 128-bit integers have 64-bit registers: count 64 bits at a time. */
+/*
+ * Targets with 128-bit integers have 64-bit registers: count 64 bits at a
+ * time.
+ */
 
 static inline uint64_t lgrt_nibble_popcounts64(uint64_t x) {
-    x -= (x >> 1) & 0x5555555555555555u;
-    return (x & 0x3333333333333333u) + ((x >> 2) & 0x3333333333333333u);
+    x -= (x >> 1) & 0x5555555555555555;
+    return (x & 0x3333333333333333) + ((x >> 2) & 0x3333333333333333);
 }
 
 /* Each nibble of x must be at most 8. */
 static inline uint32_t lgrt_sum_nibbles64(uint64_t x) {
-    x = (x & 0x0f0f0f0f0f0f0f0fu) + ((x >> 4) & 0x0f0f0f0f0f0f0f0fu);
+    x = (x & 0x0f0f0f0f0f0f0f0f) + ((x >> 4) & 0x0f0f0f0f0f0f0f0f);
     x += x >> 8;
     x += x >> 16;
     x += x >> 32;
-    return (uint32_t)x & 0xffu;
+    return (uint32_t)x & 0xff;
 }
 
 LGRT_AAPCS int __popcountdi2(int64_t a);
@@ -321,7 +328,7 @@ static inline uint32_t lgrt_parity32(uint32_t x) {
     x ^= x >> 4;
     x ^= x >> 2;
     x ^= x >> 1;
-    return x & 1u;
+    return x & 1;
 }
 
 LGRT_AAPCS int __paritysi2(int32_t a);
@@ -347,7 +354,7 @@ LGRT_AAPCS int __parityti2(lgrt_i128 a) {
 #endif
 
 static inline uint32_t lgrt_bswap32(uint32_t x) {
-    x = ((x >> 8) & 0x00ff00ffu) | ((x & 0x00ff00ffu) << 8);
+    x = ((x >> 8) & 0x00ff00ff) | ((x & 0x00ff00ff) << 8);
     return (x >> 16) | (x << 16);
 }
 
@@ -365,8 +372,8 @@ LGRT_AAPCS uint64_t __bswapdi2(uint64_t a) {
 }
 
 /*
- * Compilers may implement double-word comparisons by calling these routines, so
- * they compare single-word halves.
+ * Compilers may implement double-word comparisons by calling these routines,
+ * so they compare single-word halves.
  */
 
 LGRT_AAPCS int __cmpdi2(int64_t a, int64_t b);
@@ -441,22 +448,22 @@ LGRT_AAPCS int __ucmpti2(lgrt_u128 a, lgrt_u128 b) {
 
 LGRT_AAPCS int64_t __negdi2(int64_t a);
 LGRT_AAPCS int64_t __negdi2(int64_t a) {
-    return (int64_t)(0u - (uint64_t)a);
+    return (int64_t)((uint64_t)0 - (uint64_t)a);
 }
 
 #if LGRT_HAS_INT128
 LGRT_AAPCS lgrt_i128 __negti2(lgrt_i128 a);
 LGRT_AAPCS lgrt_i128 __negti2(lgrt_i128 a) {
-    return (lgrt_i128)(0u - (lgrt_u128)a);
+    return (lgrt_i128)((lgrt_u128)0 - (lgrt_u128)a);
 }
 #endif
 
 /*
- * Variable double-word shifts can compile into calls to these routines, so they
- * shift single-word halves. No shift may reach the width of its operand: the
- * count is masked, and bits crossing between the halves move in two steps, as
- * the masked count may be zero. Signed right shifts are arithmetic with GCC and
- * Clang.
+ * Variable double-word shifts can compile into calls to these routines, so
+ * they shift single-word halves. No shift may reach the width of its operand:
+ * the count is masked, and bits crossing between the halves move in two steps,
+ * as the masked count may be zero. Signed right shifts are arithmetic with GCC
+ * and Clang.
  */
 
 LGRT_AAPCS int64_t __ashldi3(int64_t a, int b);
@@ -465,13 +472,13 @@ LGRT_AAPCS int64_t __ashldi3(int64_t a, int b) {
     uint32_t lo = (uint32_t)x;
     uint32_t hi = (uint32_t)(x >> 32);
     uint32_t n = (uint32_t)b;
-    uint32_t s = n & 31u;
+    uint32_t s = n & 31;
 
-    if ((n & 32u) != 0) {
+    if ((n & 32) != 0) {
         hi = lo << s;
         lo = 0;
     } else {
-        hi = (hi << s) | ((lo >> 1) >> (31u - s));
+        hi = (hi << s) | ((lo >> 1) >> (31 - s));
         lo <<= s;
     }
     return (int64_t)(((uint64_t)hi << 32) | lo);
@@ -484,13 +491,13 @@ LGRT_AAPCS lgrt_i128 __ashlti3(lgrt_i128 a, int b) {
     uint64_t lo = (uint64_t)x;
     uint64_t hi = (uint64_t)(x >> 64);
     uint32_t n = (uint32_t)b;
-    uint32_t s = n & 63u;
+    uint32_t s = n & 63;
 
-    if ((n & 64u) != 0) {
+    if ((n & 64) != 0) {
         hi = lo << s;
         lo = 0;
     } else {
-        hi = (hi << s) | ((lo >> 1) >> (63u - s));
+        hi = (hi << s) | ((lo >> 1) >> (63 - s));
         lo <<= s;
     }
     return (lgrt_i128)(((lgrt_u128)hi << 64) | lo);
@@ -503,13 +510,13 @@ LGRT_AAPCS int64_t __ashrdi3(int64_t a, int b) {
     uint32_t lo = (uint32_t)x;
     uint32_t hi = (uint32_t)(x >> 32);
     uint32_t n = (uint32_t)b;
-    uint32_t s = n & 31u;
+    uint32_t s = n & 31;
 
-    if ((n & 32u) != 0) {
+    if ((n & 32) != 0) {
         lo = (uint32_t)((int32_t)hi >> s);
         hi = (uint32_t)((int32_t)hi >> 31);
     } else {
-        lo = (lo >> s) | ((hi << 1) << (31u - s));
+        lo = (lo >> s) | ((hi << 1) << (31 - s));
         hi = (uint32_t)((int32_t)hi >> s);
     }
     return (int64_t)(((uint64_t)hi << 32) | lo);
@@ -522,13 +529,13 @@ LGRT_AAPCS lgrt_i128 __ashrti3(lgrt_i128 a, int b) {
     uint64_t lo = (uint64_t)x;
     uint64_t hi = (uint64_t)(x >> 64);
     uint32_t n = (uint32_t)b;
-    uint32_t s = n & 63u;
+    uint32_t s = n & 63;
 
-    if ((n & 64u) != 0) {
+    if ((n & 64) != 0) {
         lo = (uint64_t)((int64_t)hi >> s);
         hi = (uint64_t)((int64_t)hi >> 63);
     } else {
-        lo = (lo >> s) | ((hi << 1) << (63u - s));
+        lo = (lo >> s) | ((hi << 1) << (63 - s));
         hi = (uint64_t)((int64_t)hi >> s);
     }
     return (lgrt_i128)(((lgrt_u128)hi << 64) | lo);
@@ -541,13 +548,13 @@ LGRT_AAPCS int64_t __lshrdi3(int64_t a, int b) {
     uint32_t lo = (uint32_t)x;
     uint32_t hi = (uint32_t)(x >> 32);
     uint32_t n = (uint32_t)b;
-    uint32_t s = n & 31u;
+    uint32_t s = n & 31;
 
-    if ((n & 32u) != 0) {
+    if ((n & 32) != 0) {
         lo = hi >> s;
         hi = 0;
     } else {
-        lo = (lo >> s) | ((hi << 1) << (31u - s));
+        lo = (lo >> s) | ((hi << 1) << (31 - s));
         hi >>= s;
     }
     return (int64_t)(((uint64_t)hi << 32) | lo);
@@ -560,13 +567,13 @@ LGRT_AAPCS lgrt_i128 __lshrti3(lgrt_i128 a, int b) {
     uint64_t lo = (uint64_t)x;
     uint64_t hi = (uint64_t)(x >> 64);
     uint32_t n = (uint32_t)b;
-    uint32_t s = n & 63u;
+    uint32_t s = n & 63;
 
-    if ((n & 64u) != 0) {
+    if ((n & 64) != 0) {
         lo = hi >> s;
         hi = 0;
     } else {
-        lo = (lo >> s) | ((hi << 1) << (63u - s));
+        lo = (lo >> s) | ((hi << 1) << (63 - s));
         hi >>= s;
     }
     return (lgrt_i128)(((lgrt_u128)hi << 64) | lo);
@@ -591,7 +598,7 @@ static inline uint32_t lgrt_shift_add_mul32(uint32_t a, uint32_t b) {
     uint32_t r = 0;
 
     while (small != 0) {
-        r += big & (0u - (small & 1u));
+        r += big & ((uint32_t)0 - (small & 1));
         big <<= 1;
         small >>= 1;
     }
@@ -611,7 +618,7 @@ static inline uint64_t lgrt_shift_add_mul64(uint64_t a, uint64_t b) {
     uint64_t r = 0;
 
     while (small != 0) {
-        r += big & (0u - (small & 1u));
+        r += big & ((uint64_t)0 - (small & 1));
         big <<= 1;
         small >>= 1;
     }
@@ -631,15 +638,15 @@ LGRT_AAPCS int64_t __muldi3(int64_t a, int64_t b) {
  * (2^16 - 1)^2 + 2^16 - 1 < 2^32.
  */
 static inline uint64_t lgrt_wide_mul32(uint32_t a, uint32_t b) {
-    uint32_t a0 = a & 0xffffu;
+    uint32_t a0 = a & 0xffff;
     uint32_t a1 = a >> 16;
-    uint32_t b0 = b & 0xffffu;
+    uint32_t b0 = b & 0xffff;
     uint32_t b1 = b >> 16;
     uint32_t p00 = a0 * b0;
     uint32_t m1 = a1 * b0 + (p00 >> 16);
-    uint32_t m2 = a0 * b1 + (m1 & 0xffffu);
+    uint32_t m2 = a0 * b1 + (m1 & 0xffff);
     uint32_t hi = a1 * b1 + (m1 >> 16) + (m2 >> 16);
-    uint32_t lo = (m2 << 16) | (p00 & 0xffffu);
+    uint32_t lo = (m2 << 16) | (p00 & 0xffff);
 
     return ((uint64_t)hi << 32) | lo;
 }
@@ -666,15 +673,15 @@ LGRT_AAPCS int64_t __muldi3(int64_t a, int64_t b) {
  * (2^32 - 1)^2 + 2^32 - 1 < 2^64.
  */
 static inline lgrt_u128 lgrt_wide_mul64(uint64_t a, uint64_t b) {
-    uint64_t a0 = a & 0xffffffffu;
+    uint64_t a0 = a & 0xffffffff;
     uint64_t a1 = a >> 32;
-    uint64_t b0 = b & 0xffffffffu;
+    uint64_t b0 = b & 0xffffffff;
     uint64_t b1 = b >> 32;
     uint64_t p00 = a0 * b0;
     uint64_t m1 = a1 * b0 + (p00 >> 32);
-    uint64_t m2 = a0 * b1 + (m1 & 0xffffffffu);
+    uint64_t m2 = a0 * b1 + (m1 & 0xffffffff);
     uint64_t hi = a1 * b1 + (m1 >> 32) + (m2 >> 32);
-    uint64_t lo = (m2 << 32) | (p00 & 0xffffffffu);
+    uint64_t lo = (m2 << 32) | (p00 & 0xffffffff);
 
     return ((lgrt_u128)hi << 64) | lo;
 }
@@ -694,8 +701,8 @@ LGRT_AAPCS lgrt_i128 __multi3(lgrt_i128 a, lgrt_i128 b) {
 #endif
 
 /*
- * With -ftrapv, signed arithmetic can compile into calls to the routines below,
- * so they, and everything they call, compute on unsigned values.
+ * With -ftrapv, signed arithmetic can compile into calls to the routines
+ * below, so they, and everything they call, compute on unsigned values.
  *
  * Products of magnitudes overflow if both have a nonzero high half. Otherwise,
  * the smaller magnitude times each half of the larger one gives two partial
@@ -707,20 +714,20 @@ LGRT_AAPCS lgrt_i128 __multi3(lgrt_i128 a, lgrt_i128 b) {
 #if LGRT_64BIT
 
 /* On 64-bit targets, the product of the sign-extended operands is exact. */
-static inline uint32_t lgrt_mulo32(int32_t a, int32_t b, int *overflow) {
+static inline uint32_t lgrt_mulo32(int32_t a, int32_t b, bool *overflow) {
     uint64_t p = (uint64_t)a * (uint64_t)b;
 
-    *overflow = ((p + 0x80000000u) >> 32) != 0;
+    *overflow = ((p + (uint64_t)0x80000000) >> 32) != 0;
     return (uint32_t)p;
 }
 
 #else
 
-static inline uint32_t lgrt_mulo32(int32_t a, int32_t b, int *overflow) {
+static inline uint32_t lgrt_mulo32(int32_t a, int32_t b, bool *overflow) {
     uint32_t x = (uint32_t)a;
     uint32_t y = (uint32_t)b;
-    uint32_t xs = 0u - (x >> 31);
-    uint32_t ys = 0u - (y >> 31);
+    uint32_t xs = (uint32_t)0 - (x >> 31);
+    uint32_t ys = (uint32_t)0 - (y >> 31);
     uint32_t xm = (x ^ xs) - xs;
     uint32_t ym = (y ^ ys) - ys;
     uint32_t neg = (x ^ y) >> 31;
@@ -730,35 +737,39 @@ static inline uint32_t lgrt_mulo32(int32_t a, int32_t b, int *overflow) {
     uint32_t low;
     uint32_t p;
 
-    if (xm <= 0xffffu) {
+    if (xm <= 0xffff) {
         small = xm;
         big = ym;
-    } else if (ym <= 0xffffu) {
+    } else if (ym <= 0xffff) {
         small = ym;
         big = xm;
     } else {
-        *overflow = 1;
+        *overflow = true;
         return x * y;
     }
     mid = small * (big >> 16);
-    low = small * (big & 0xffffu);
+    low = small * (big & 0xffff);
     p = (mid << 16) + low;
-    *overflow = mid > 0xffffu || p < low || p > 0x7fffffffu + neg;
-    return (p ^ (0u - neg)) + neg;
+    *overflow = mid > 0xffff || p < low || p > (uint32_t)0x7fffffff + neg;
+    return (p ^ ((uint32_t)0 - neg)) + neg;
 }
 
 #endif
 
 LGRT_AAPCS int32_t __mulosi4(int32_t a, int32_t b, int *overflow);
 LGRT_AAPCS int32_t __mulosi4(int32_t a, int32_t b, int *overflow) {
-    return (int32_t)lgrt_mulo32(a, b, overflow);
+    bool overflowed;
+    uint32_t p = lgrt_mulo32(a, b, &overflowed);
+
+    *overflow = overflowed;
+    return (int32_t)p;
 }
 
-static inline uint64_t lgrt_mulo64(int64_t a, int64_t b, int *overflow) {
+static inline uint64_t lgrt_mulo64(int64_t a, int64_t b, bool *overflow) {
     uint64_t x = (uint64_t)a;
     uint64_t y = (uint64_t)b;
-    uint64_t xs = 0u - (x >> 63);
-    uint64_t ys = 0u - (y >> 63);
+    uint64_t xs = (uint64_t)0 - (x >> 63);
+    uint64_t ys = (uint64_t)0 - (y >> 63);
     uint64_t xm = (x ^ xs) - xs;
     uint64_t ym = (y ^ ys) - ys;
     uint64_t neg = (x ^ y) >> 63;
@@ -775,28 +786,35 @@ static inline uint64_t lgrt_mulo64(int64_t a, int64_t b, int *overflow) {
         small = (uint32_t)ym;
         big = xm;
     } else {
-        *overflow = 1;
+        *overflow = true;
         return x * y;
     }
     mid = (uint64_t)small * (uint32_t)(big >> 32);
     low = (uint64_t)small * (uint32_t)big;
     p = (mid << 32) + low;
-    *overflow = (mid >> 32) != 0 || p < low || p > 0x7fffffffffffffffu + neg;
-    return (p ^ (0u - neg)) + neg;
+    *overflow = (mid >> 32) != 0 || p < low
+        || p > (uint64_t)0x7fffffffffffffff + neg;
+    return (p ^ ((uint64_t)0 - neg)) + neg;
 }
 
 LGRT_AAPCS int64_t __mulodi4(int64_t a, int64_t b, int *overflow);
 LGRT_AAPCS int64_t __mulodi4(int64_t a, int64_t b, int *overflow) {
-    return (int64_t)lgrt_mulo64(a, b, overflow);
+    bool overflowed;
+    uint64_t p = lgrt_mulo64(a, b, &overflowed);
+
+    *overflow = overflowed;
+    return (int64_t)p;
 }
 
 #if LGRT_HAS_INT128
 
-static inline lgrt_u128 lgrt_mulo128(lgrt_i128 a, lgrt_i128 b, int *overflow) {
+static inline lgrt_u128 lgrt_mulo128(
+    lgrt_i128 a, lgrt_i128 b, bool *overflow
+) {
     lgrt_u128 x = (lgrt_u128)a;
     lgrt_u128 y = (lgrt_u128)b;
-    lgrt_u128 xs = 0u - (x >> 127);
-    lgrt_u128 ys = 0u - (y >> 127);
+    lgrt_u128 xs = (lgrt_u128)0 - (x >> 127);
+    lgrt_u128 ys = (lgrt_u128)0 - (y >> 127);
     lgrt_u128 xm = (x ^ xs) - xs;
     lgrt_u128 ym = (y ^ ys) - ys;
     lgrt_u128 neg = (x ^ y) >> 127;
@@ -813,28 +831,35 @@ static inline lgrt_u128 lgrt_mulo128(lgrt_i128 a, lgrt_i128 b, int *overflow) {
         small = (uint64_t)ym;
         big = xm;
     } else {
-        *overflow = 1;
+        *overflow = true;
         return x * y;
     }
     mid = (lgrt_u128)small * (uint64_t)(big >> 64);
     low = (lgrt_u128)small * (uint64_t)big;
     p = (mid << 64) + low;
-    /* No 128-bit constants: GCC 4.8 for AArch64 needs SIMD registers to load them. */
-    *overflow = (mid >> 64) != 0 || p < low ||
-        ((p >> 127) != 0 && (neg == 0 || (p << 1) != 0));
-    return (p ^ (0u - neg)) + neg;
+    /*
+     * Workaround: GCC 4.8, AArch64: it needs SIMD registers to load 128-bit
+     * constants, so this uses none.
+     */
+    *overflow = (mid >> 64) != 0 || p < low
+        || ((p >> 127) != 0 && (neg == 0 || (p << 1) != 0));
+    return (p ^ ((lgrt_u128)0 - neg)) + neg;
 }
 
 LGRT_AAPCS lgrt_i128 __muloti4(lgrt_i128 a, lgrt_i128 b, int *overflow);
 LGRT_AAPCS lgrt_i128 __muloti4(lgrt_i128 a, lgrt_i128 b, int *overflow) {
-    return (lgrt_i128)lgrt_mulo128(a, b, overflow);
+    bool overflowed;
+    lgrt_u128 p = lgrt_mulo128(a, b, &overflowed);
+
+    *overflow = overflowed;
+    return (lgrt_i128)p;
 }
 
 #endif
 
 LGRT_AAPCS int32_t __mulvsi3(int32_t a, int32_t b);
 LGRT_AAPCS int32_t __mulvsi3(int32_t a, int32_t b) {
-    int overflow;
+    bool overflow;
     uint32_t p = lgrt_mulo32(a, b, &overflow);
 
     if (overflow) {
@@ -845,7 +870,7 @@ LGRT_AAPCS int32_t __mulvsi3(int32_t a, int32_t b) {
 
 LGRT_AAPCS int64_t __mulvdi3(int64_t a, int64_t b);
 LGRT_AAPCS int64_t __mulvdi3(int64_t a, int64_t b) {
-    int overflow;
+    bool overflow;
     uint64_t p = lgrt_mulo64(a, b, &overflow);
 
     if (overflow) {
@@ -857,7 +882,7 @@ LGRT_AAPCS int64_t __mulvdi3(int64_t a, int64_t b) {
 #if LGRT_HAS_INT128
 LGRT_AAPCS lgrt_i128 __mulvti3(lgrt_i128 a, lgrt_i128 b);
 LGRT_AAPCS lgrt_i128 __mulvti3(lgrt_i128 a, lgrt_i128 b) {
-    int overflow;
+    bool overflow;
     lgrt_u128 p = lgrt_mulo128(a, b, &overflow);
 
     if (overflow) {
@@ -867,7 +892,9 @@ LGRT_AAPCS lgrt_i128 __mulvti3(lgrt_i128 a, lgrt_i128 b) {
 }
 #endif
 
-/* a + b overflows exactly when the sum's sign differs from those of a and b. */
+/*
+ * a + b overflows exactly when the sum's sign differs from those of a and b.
+ */
 
 LGRT_AAPCS int32_t __addvsi3(int32_t a, int32_t b);
 LGRT_AAPCS int32_t __addvsi3(int32_t a, int32_t b) {
@@ -875,7 +902,7 @@ LGRT_AAPCS int32_t __addvsi3(int32_t a, int32_t b) {
     uint32_t y = (uint32_t)b;
     uint32_t s = x + y;
 
-    if (((s ^ x) & (s ^ y)) >> 31) {
+    if ((((s ^ x) & (s ^ y)) >> 31) != 0) {
         LGRT_TRAP();
     }
     return (int32_t)s;
@@ -887,7 +914,7 @@ LGRT_AAPCS int64_t __addvdi3(int64_t a, int64_t b) {
     uint64_t y = (uint64_t)b;
     uint64_t s = x + y;
 
-    if (((s ^ x) & (s ^ y)) >> 63) {
+    if ((((s ^ x) & (s ^ y)) >> 63) != 0) {
         LGRT_TRAP();
     }
     return (int64_t)s;
@@ -900,7 +927,7 @@ LGRT_AAPCS lgrt_i128 __addvti3(lgrt_i128 a, lgrt_i128 b) {
     lgrt_u128 y = (lgrt_u128)b;
     lgrt_u128 s = x + y;
 
-    if (((s ^ x) & (s ^ y)) >> 127) {
+    if ((((s ^ x) & (s ^ y)) >> 127) != 0) {
         LGRT_TRAP();
     }
     return (lgrt_i128)s;
@@ -908,8 +935,8 @@ LGRT_AAPCS lgrt_i128 __addvti3(lgrt_i128 a, lgrt_i128 b) {
 #endif
 
 /*
- * a - b overflows exactly when a and b differ in sign and the difference's sign
- * differs from that of a.
+ * a - b overflows exactly when a and b differ in sign and the difference's
+ * sign differs from that of a.
  */
 
 LGRT_AAPCS int32_t __subvsi3(int32_t a, int32_t b);
@@ -918,7 +945,7 @@ LGRT_AAPCS int32_t __subvsi3(int32_t a, int32_t b) {
     uint32_t y = (uint32_t)b;
     uint32_t d = x - y;
 
-    if (((x ^ y) & (x ^ d)) >> 31) {
+    if ((((x ^ y) & (x ^ d)) >> 31) != 0) {
         LGRT_TRAP();
     }
     return (int32_t)d;
@@ -930,7 +957,7 @@ LGRT_AAPCS int64_t __subvdi3(int64_t a, int64_t b) {
     uint64_t y = (uint64_t)b;
     uint64_t d = x - y;
 
-    if (((x ^ y) & (x ^ d)) >> 63) {
+    if ((((x ^ y) & (x ^ d)) >> 63) != 0) {
         LGRT_TRAP();
     }
     return (int64_t)d;
@@ -943,7 +970,7 @@ LGRT_AAPCS lgrt_i128 __subvti3(lgrt_i128 a, lgrt_i128 b) {
     lgrt_u128 y = (lgrt_u128)b;
     lgrt_u128 d = x - y;
 
-    if (((x ^ y) & (x ^ d)) >> 127) {
+    if ((((x ^ y) & (x ^ d)) >> 127) != 0) {
         LGRT_TRAP();
     }
     return (lgrt_i128)d;
@@ -954,33 +981,34 @@ LGRT_AAPCS lgrt_i128 __subvti3(lgrt_i128 a, lgrt_i128 b) {
  * Without a divide instruction, compilers turn divisions into calls to the
  * routines below, at the operands' width but at least 64 bits on 64-bit
  * targets, or into calls to target-specific helpers that this file does not
- * define. So the routines below use / and % only on narrower operands, and only
- * where the target has a divide instruction for those, calling their own long
- * division elsewhere. The 32-bit routines never use them, as narrower operands
- * are promoted to int, and neither do the 64-bit ones on 64-bit targets.
+ * define. So the routines below use / and % only on narrower operands, and
+ * only where the target has a divide instruction for those, calling their own
+ * long division elsewhere. The 32-bit routines never use them, as narrower
+ * operands are promoted to int, and neither do the 64-bit ones on 64-bit
+ * targets.
  *
  * LGRT_HW_DIV32 tells whether the target has a divide instruction for 32-bit
  * operands, and LGRT_HW_DIV64 whether it has one for 64-bit operands held in
  * single registers.
  */
 
-#if defined(__i386__) || defined(__x86_64__) || defined(__aarch64__) || \
-    (defined(__arm__) && defined(__ARM_FEATURE_IDIV)) || defined(__mips__) || \
-    defined(__powerpc__) || defined(__s390__) || defined(__loongarch__) || \
-    (defined(__riscv) && defined(__riscv_div)) || defined(__sparc_v8__) || \
-    defined(__sparcv8) || defined(__sparc_v9__) || defined(__sparcv9) || \
-    defined(__mc68020__) || defined(__mc68030__) || defined(__mc68040__) || \
-    defined(__mc68060__) || defined(__mcfhwdiv__) || defined(__ARC_DIVREM__)
+#if defined(__i386__) || defined(__x86_64__) || defined(__aarch64__) \
+ || (defined(__arm__) && defined(__ARM_FEATURE_IDIV)) || defined(__mips__) \
+ || defined(__powerpc__) || defined(__s390__) || defined(__loongarch__) \
+ || (defined(__riscv) && defined(__riscv_div)) || defined(__sparc_v8__) \
+ || defined(__sparcv8) || defined(__sparc_v9__) || defined(__sparcv9) \
+ || defined(__mc68020__) || defined(__mc68030__) || defined(__mc68040__) \
+ || defined(__mc68060__) || defined(__mcfhwdiv__) || defined(__ARC_DIVREM__)
 #define LGRT_HW_DIV32 1
 #else
 #define LGRT_HW_DIV32 0
 #endif
 
-#if defined(__x86_64__) || defined(__aarch64__) || \
-    (defined(__mips64) && LGRT_64BIT) || defined(__powerpc64__) || \
-    defined(__s390x__) || defined(__loongarch64) || \
-    (defined(__riscv) && defined(__riscv_div) && __riscv_xlen == 64) || \
-    (defined(__sparc__) && defined(__arch64__))
+#if defined(__x86_64__) || defined(__aarch64__) \
+ || (defined(__mips64) && LGRT_64BIT) || defined(__powerpc64__) \
+ || defined(__s390x__) || defined(__loongarch64) \
+ || (defined(__riscv) && defined(__riscv_div) && __riscv_xlen == 64) \
+ || (defined(__sparc__) && defined(__arch64__))
 #define LGRT_HW_DIV64 1
 #else
 #define LGRT_HW_DIV64 0
@@ -993,11 +1021,11 @@ LGRT_AAPCS lgrt_i128 __subvti3(lgrt_i128 a, lgrt_i128 b) {
  */
 
 static inline uint32_t lgrt_div_clz32(uint32_t x) {
-    return (uint32_t)__builtin_clz((unsigned int)(x | 1u));
+    return (uint32_t)__builtin_clz((unsigned int)(x | 1));
 }
 
 static inline uint32_t lgrt_div_clz64(uint64_t x) {
-    return (uint32_t)__builtin_clzll((unsigned long long)(x | 1u));
+    return (uint32_t)__builtin_clzll((unsigned long long)(x | 1));
 }
 
 /*
@@ -1019,7 +1047,7 @@ static inline uint32_t lgrt_udivmod32(uint32_t a, uint32_t b, uint32_t *rem) {
     do {
         uint32_t c = (uint32_t)(a >= d);
 
-        a -= d & (0u - c);
+        a -= d & ((uint32_t)0 - c);
         q = (q << 1) | c;
         d >>= 1;
     } while (n-- != 0);
@@ -1032,15 +1060,16 @@ LGRT_AAPCS uint32_t __udivmodsi4(uint32_t a, uint32_t b, uint32_t *rem) {
     uint32_t r;
     uint32_t q = lgrt_udivmod32(a, b, &r);
 
-    if (rem != 0) {
+    if (rem != NULL) {
         *rem = r;
     }
     return q;
 }
 
 #if !LGRT_64BIT
-/* Divides with the divide instruction if there is one. */
-static inline uint32_t lgrt_hw_udivmod32(uint32_t a, uint32_t b, uint32_t *rem) {
+static inline uint32_t lgrt_hw_udivmod32(
+    uint32_t a, uint32_t b, uint32_t *rem
+) {
 #if LGRT_HW_DIV32
     *rem = a % b;
     return a / b;
@@ -1073,7 +1102,7 @@ static inline uint64_t lgrt_udivmod64(uint64_t a, uint64_t b, uint64_t *rem) {
     do {
         uint64_t c = (uint64_t)(a >= d);
 
-        a -= d & (0u - c);
+        a -= d & ((uint64_t)0 - c);
         q = (q << 1) | c;
         d >>= 1;
     } while (n-- != 0);
@@ -1086,7 +1115,7 @@ LGRT_AAPCS uint64_t __udivmoddi4(uint64_t a, uint64_t b, uint64_t *rem) {
     uint64_t r;
     uint64_t q = lgrt_udivmod64(a, b, &r);
 
-    if (rem != 0) {
+    if (rem != NULL) {
         *rem = r;
     }
     return q;
@@ -1094,8 +1123,9 @@ LGRT_AAPCS uint64_t __udivmoddi4(uint64_t a, uint64_t b, uint64_t *rem) {
 
 #if LGRT_HAS_INT128
 
-/* Divides with the divide instruction if there is one. */
-static inline uint64_t lgrt_hw_udivmod64(uint64_t a, uint64_t b, uint64_t *rem) {
+static inline uint64_t lgrt_hw_udivmod64(
+    uint64_t a, uint64_t b, uint64_t *rem
+) {
 #if LGRT_HW_DIV64
     *rem = a % b;
     return a / b;
@@ -1110,7 +1140,9 @@ static inline uint64_t lgrt_hw_udivmod64(uint64_t a, uint64_t b, uint64_t *rem) 
  * Divides hi:lo by v. As hi < v, the quotient fits in 64 bits, so divq cannot
  * fault.
  */
-static inline uint64_t lgrt_udiv128by64(uint64_t hi, uint64_t lo, uint64_t v, uint64_t *rem) {
+static inline uint64_t lgrt_udiv128by64(
+    uint64_t hi, uint64_t lo, uint64_t v, uint64_t *rem
+) {
     uint64_t q;
     uint64_t r;
 
@@ -1132,16 +1164,19 @@ static inline uint64_t lgrt_udiv128by64(uint64_t hi, uint64_t lo, uint64_t v, ui
  * estimate exceeds it by at most two, and as v has two digits, comparing with
  * the low one tells exactly whether the estimate is too large.
  */
-static inline uint32_t lgrt_udiv96by64(uint64_t u, uint32_t next, uint64_t v, uint64_t *rem) {
+static inline uint32_t lgrt_udiv96by64(
+    uint64_t u, uint32_t next, uint64_t v, uint64_t *rem
+) {
     uint64_t vh = v >> 32;
-    uint64_t vl = v & 0xffffffffu;
+    uint64_t vl = v & 0xffffffff;
     uint64_t r;
     uint64_t q = lgrt_hw_udivmod64(u, vh, &r);
 
     if ((q >> 32) != 0 || q * vl > ((r << 32) | next)) {
         q--;
         r += vh;
-        if ((r >> 32) == 0 && ((q >> 32) != 0 || q * vl > ((r << 32) | next))) {
+        if ((r >> 32) == 0
+         && ((q >> 32) != 0 || q * vl > ((r << 32) | next))) {
             q--;
         }
     }
@@ -1150,7 +1185,9 @@ static inline uint32_t lgrt_udiv96by64(uint64_t u, uint32_t next, uint64_t v, ui
 }
 
 /* Divides hi:lo by v, where hi < v, so that the quotient fits in 64 bits. */
-static inline uint64_t lgrt_udiv128by64(uint64_t hi, uint64_t lo, uint64_t v, uint64_t *rem) {
+static inline uint64_t lgrt_udiv128by64(
+    uint64_t hi, uint64_t lo, uint64_t v, uint64_t *rem
+) {
     uint32_t s = lgrt_div_clz64(v);
     uint64_t r;
     uint32_t q1;
@@ -1158,7 +1195,7 @@ static inline uint64_t lgrt_udiv128by64(uint64_t hi, uint64_t lo, uint64_t v, ui
 
     /* Normalise v. s may be zero, so bits move from lo to hi in two shifts. */
     v <<= s;
-    hi = (hi << s) | ((lo >> 1) >> (63u - s));
+    hi = (hi << s) | ((lo >> 1) >> (63 - s));
     lo <<= s;
     q1 = lgrt_udiv96by64(hi, (uint32_t)(lo >> 32), v, &r);
     q0 = lgrt_udiv96by64(r, (uint32_t)lo, v, &r);
@@ -1168,7 +1205,9 @@ static inline uint64_t lgrt_udiv128by64(uint64_t hi, uint64_t lo, uint64_t v, ui
 
 #endif
 
-static inline lgrt_u128 lgrt_udivmod128(lgrt_u128 a, lgrt_u128 b, lgrt_u128 *rem) {
+static inline lgrt_u128 lgrt_udivmod128(
+    lgrt_u128 a, lgrt_u128 b, lgrt_u128 *rem
+) {
     uint64_t ah = (uint64_t)(a >> 64);
     uint64_t al = (uint64_t)a;
     uint64_t bh = (uint64_t)(b >> 64);
@@ -1216,7 +1255,7 @@ LGRT_AAPCS lgrt_u128 __udivmodti4(lgrt_u128 a, lgrt_u128 b, lgrt_u128 *rem) {
     lgrt_u128 r;
     lgrt_u128 q = lgrt_udivmod128(a, b, &r);
 
-    if (rem != 0) {
+    if (rem != NULL) {
         *rem = r;
     }
     return q;
@@ -1224,7 +1263,10 @@ LGRT_AAPCS lgrt_u128 __udivmodti4(lgrt_u128 a, lgrt_u128 b, lgrt_u128 *rem) {
 
 #endif
 
-/* SuperH's __udivsi3 is assembly with a special convention, defined further on. */
+/*
+ * SuperH's __udivsi3 is assembly with a special convention, defined further
+ * on.
+ */
 #if !defined(__sh__)
 LGRT_AAPCS uint32_t __udivsi3(uint32_t a, uint32_t b);
 LGRT_AAPCS uint32_t __udivsi3(uint32_t a, uint32_t b) {
@@ -1286,8 +1328,8 @@ LGRT_AAPCS lgrt_u128 __umodti3(lgrt_u128 a, lgrt_u128 b) {
 static inline uint32_t lgrt_divmod32(int32_t a, int32_t b, uint32_t *rem) {
     uint32_t x = (uint32_t)a;
     uint32_t y = (uint32_t)b;
-    uint32_t xs = 0u - (x >> 31);
-    uint32_t ys = 0u - (y >> 31);
+    uint32_t xs = (uint32_t)0 - (x >> 31);
+    uint32_t ys = (uint32_t)0 - (y >> 31);
     uint32_t qs = xs ^ ys;
     uint32_t r;
     uint32_t q = lgrt_udivmod32((x ^ xs) - xs, (y ^ ys) - ys, &r);
@@ -1306,8 +1348,8 @@ LGRT_AAPCS int32_t __divsi3(int32_t a, int32_t b) {
 static inline uint64_t lgrt_divmod64(int64_t a, int64_t b, uint64_t *rem) {
     uint64_t x = (uint64_t)a;
     uint64_t y = (uint64_t)b;
-    uint64_t xs = 0u - (x >> 63);
-    uint64_t ys = 0u - (y >> 63);
+    uint64_t xs = (uint64_t)0 - (x >> 63);
+    uint64_t ys = (uint64_t)0 - (y >> 63);
     uint64_t qs = xs ^ ys;
     uint64_t r;
     uint64_t q = lgrt_udivmod64((x ^ xs) - xs, (y ^ ys) - ys, &r);
@@ -1325,11 +1367,13 @@ LGRT_AAPCS int64_t __divdi3(int64_t a, int64_t b) {
 
 #if LGRT_HAS_INT128
 
-static inline lgrt_u128 lgrt_divmod128(lgrt_i128 a, lgrt_i128 b, lgrt_u128 *rem) {
+static inline lgrt_u128 lgrt_divmod128(
+    lgrt_i128 a, lgrt_i128 b, lgrt_u128 *rem
+) {
     lgrt_u128 x = (lgrt_u128)a;
     lgrt_u128 y = (lgrt_u128)b;
-    lgrt_u128 xs = 0u - (x >> 127);
-    lgrt_u128 ys = 0u - (y >> 127);
+    lgrt_u128 xs = (lgrt_u128)0 - (x >> 127);
+    lgrt_u128 ys = (lgrt_u128)0 - (y >> 127);
     lgrt_u128 qs = xs ^ ys;
     lgrt_u128 r;
     lgrt_u128 q = lgrt_udivmod128((x ^ xs) - xs, (y ^ ys) - ys, &r);
@@ -1378,7 +1422,7 @@ LGRT_AAPCS int32_t __divmodsi4(int32_t a, int32_t b, int32_t *rem) {
     uint32_t r;
     uint32_t q = lgrt_divmod32(a, b, &r);
 
-    if (rem != 0) {
+    if (rem != NULL) {
         *rem = (int32_t)r;
     }
     return (int32_t)q;
@@ -1389,7 +1433,7 @@ LGRT_AAPCS int64_t __divmoddi4(int64_t a, int64_t b, int64_t *rem) {
     uint64_t r;
     uint64_t q = lgrt_divmod64(a, b, &r);
 
-    if (rem != 0) {
+    if (rem != NULL) {
         *rem = (int64_t)r;
     }
     return (int64_t)q;
@@ -1401,7 +1445,7 @@ LGRT_AAPCS lgrt_i128 __divmodti4(lgrt_i128 a, lgrt_i128 b, lgrt_i128 *rem) {
     lgrt_u128 r;
     lgrt_u128 q = lgrt_divmod128(a, b, &r);
 
-    if (rem != 0) {
+    if (rem != NULL) {
         *rem = (lgrt_i128)r;
     }
     return (lgrt_i128)q;
@@ -1417,20 +1461,20 @@ LGRT_AAPCS int32_t __negvsi2(int32_t a);
 LGRT_AAPCS int32_t __negvsi2(int32_t a) {
     uint32_t x = (uint32_t)a;
 
-    if (x == 0x80000000u) {
+    if (x == (uint32_t)0x80000000) {
         LGRT_TRAP();
     }
-    return (int32_t)(0u - x);
+    return (int32_t)((uint32_t)0 - x);
 }
 
 LGRT_AAPCS int64_t __negvdi2(int64_t a);
 LGRT_AAPCS int64_t __negvdi2(int64_t a) {
     uint64_t x = (uint64_t)a;
 
-    if (x == 0x8000000000000000u) {
+    if (x == (uint64_t)0x8000000000000000) {
         LGRT_TRAP();
     }
-    return (int64_t)(0u - x);
+    return (int64_t)((uint64_t)0 - x);
 }
 
 #if LGRT_HAS_INT128
@@ -1438,11 +1482,14 @@ LGRT_AAPCS lgrt_i128 __negvti2(lgrt_i128 a);
 LGRT_AAPCS lgrt_i128 __negvti2(lgrt_i128 a) {
     lgrt_u128 x = (lgrt_u128)a;
 
-    /* No 128-bit constant: GCC 4.8 for AArch64 needs SIMD registers to load it. */
+    /*
+     * Workaround: GCC 4.8, AArch64: it needs SIMD registers to load 128-bit
+     * constants, so this uses none.
+     */
     if ((x >> 127) != 0 && (x << 1) == 0) {
         LGRT_TRAP();
     }
-    return (lgrt_i128)(0u - x);
+    return (lgrt_i128)((lgrt_u128)0 - x);
 }
 #endif
 
@@ -1451,7 +1498,7 @@ LGRT_AAPCS lgrt_i128 __negvti2(lgrt_i128 a) {
 LGRT_AAPCS int32_t __absvsi2(int32_t a);
 LGRT_AAPCS int32_t __absvsi2(int32_t a) {
     uint32_t x = (uint32_t)a;
-    uint32_t s = 0u - (x >> 31);
+    uint32_t s = (uint32_t)0 - (x >> 31);
     uint32_t m = (x ^ s) - s;
 
     if ((m >> 31) != 0) {
@@ -1463,7 +1510,7 @@ LGRT_AAPCS int32_t __absvsi2(int32_t a) {
 LGRT_AAPCS int64_t __absvdi2(int64_t a);
 LGRT_AAPCS int64_t __absvdi2(int64_t a) {
     uint64_t x = (uint64_t)a;
-    uint64_t s = 0u - (x >> 63);
+    uint64_t s = (uint64_t)0 - (x >> 63);
     uint64_t m = (x ^ s) - s;
 
     if ((m >> 63) != 0) {
@@ -1476,7 +1523,7 @@ LGRT_AAPCS int64_t __absvdi2(int64_t a) {
 LGRT_AAPCS lgrt_i128 __absvti2(lgrt_i128 a);
 LGRT_AAPCS lgrt_i128 __absvti2(lgrt_i128 a) {
     lgrt_u128 x = (lgrt_u128)a;
-    lgrt_u128 s = 0u - (x >> 127);
+    lgrt_u128 s = (lgrt_u128)0 - (x >> 127);
     lgrt_u128 m = (x ^ s) - s;
 
     if ((m >> 127) != 0) {
@@ -1489,10 +1536,14 @@ LGRT_AAPCS lgrt_i128 __absvti2(lgrt_i128 a) {
 #if defined(__ARM_EABI__)
 
 LGRT_AAPCS uint32_t __aeabi_uidiv(uint32_t a, uint32_t b);
-LGRT_AAPCS uint32_t __aeabi_uidiv(uint32_t a, uint32_t b) __attribute__((__alias__("__udivsi3")));
+LGRT_AAPCS uint32_t __aeabi_uidiv(
+    uint32_t a, uint32_t b
+) __attribute__((__alias__("__udivsi3")));
 
 LGRT_AAPCS int32_t __aeabi_idiv(int32_t a, int32_t b);
-LGRT_AAPCS int32_t __aeabi_idiv(int32_t a, int32_t b) __attribute__((__alias__("__divsi3")));
+LGRT_AAPCS int32_t __aeabi_idiv(
+    int32_t a, int32_t b
+) __attribute__((__alias__("__divsi3")));
 
 /*
  * These return the quotient in r0 and the remainder in r1, which hold the low
@@ -1564,22 +1615,31 @@ LGRT_AAPCS uint64_t __aeabi_idivmod(int a, int b) {
  * These return the quotient in r0 and r1 and the remainder in r2 and r3, which
  * C cannot do. The dividend and divisor stay in r0 to r3 for the call, and the
  * third argument, on the stack, is the address of a slot for the remainder.
- * From sp at the call, the frame holds that address, padding, the slot, and the
- * saved registers. Popping the slot loads it in address order, which is how a
- * register pair holds a 64-bit value on either endianness.
+ * From sp at the call, the frame holds that address, padding, the slot, and
+ * the saved registers. Popping the slot loads it in address order, which is
+ * how a register pair holds a 64-bit value on either endianness.
  */
 
 #if defined(__ARM_FEATURE_PAC_DEFAULT)
 /* r12 holds the authentication code of lr, so it is saved with lr. */
 #if defined(__ARM_FEATURE_BTI_DEFAULT)
-#define LGRT_DIVMOD_ENTRY "pacbti r12, lr, sp\n" "push {r12, lr}\n"
+#define LGRT_DIVMOD_ENTRY \
+    "pacbti r12, lr, sp\n" \
+    "push {r12, lr}\n"
 #else
-#define LGRT_DIVMOD_ENTRY "pac r12, lr, sp\n" "push {r12, lr}\n"
+#define LGRT_DIVMOD_ENTRY \
+    "pac r12, lr, sp\n" \
+    "push {r12, lr}\n"
 #endif
 #define LGRT_DIVMOD_TEMP "r12"
-#define LGRT_DIVMOD_EXIT "pop {r2, r3, r12, lr}\n" "aut r12, lr, sp\n" "bx lr\n"
+#define LGRT_DIVMOD_EXIT \
+    "pop {r2, r3, r12, lr}\n" \
+    "aut r12, lr, sp\n" \
+    "bx lr\n"
 #else
-#define LGRT_DIVMOD_ENTRY LGRT_ASM_BTI "push {r4, lr}\n"
+#define LGRT_DIVMOD_ENTRY \
+    LGRT_ASM_BTI \
+    "push {r4, lr}\n"
 #define LGRT_DIVMOD_TEMP "r4"
 #if LGRT_THUMB1 && LGRT_ARM_V4T
 /* Thumb-1 cannot pop into lr, and r0 to r3 hold the results. */
@@ -1590,7 +1650,9 @@ LGRT_AAPCS uint64_t __aeabi_idivmod(int a, int b) {
     "add sp, sp, #4\n" \
     "bx lr\n"
 #elif LGRT_ARM_V4T
-#define LGRT_DIVMOD_EXIT "pop {r2, r3, r4, lr}\n" "bx lr\n"
+#define LGRT_DIVMOD_EXIT \
+    "pop {r2, r3, r4, lr}\n" \
+    "bx lr\n"
 #else
 #define LGRT_DIVMOD_EXIT "pop {r2, r3, r4, pc}\n"
 #endif
@@ -1608,22 +1670,26 @@ LGRT_AAPCS uint64_t __aeabi_idivmod(int a, int b) {
     LGRT_ASM_END
 
 /*
- * GCC warns that the parameters of naked functions are unused and, in older
- * versions, that they return no value.
+ * Workaround: GCC, ARM: it warns that the parameters of naked functions are
+ * unused and, in older versions, that they return no value.
  */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 #pragma GCC diagnostic ignored "-Wreturn-type"
 
 LGRT_AAPCS uint64_t __aeabi_uldivmod(uint64_t a, uint64_t b);
-LGRT_AAPCS __attribute__((__naked__)) uint64_t __aeabi_uldivmod(uint64_t a, uint64_t b) {
+LGRT_AAPCS __attribute__((__naked__)) uint64_t __aeabi_uldivmod(
+    uint64_t a, uint64_t b
+) {
     __asm__ volatile (
         LGRT_DIVMOD_ASM("__udivmoddi4")
     );
 }
 
 LGRT_AAPCS int64_t __aeabi_ldivmod(int64_t a, int64_t b);
-LGRT_AAPCS __attribute__((__naked__)) int64_t __aeabi_ldivmod(int64_t a, int64_t b) {
+LGRT_AAPCS __attribute__((__naked__)) int64_t __aeabi_ldivmod(
+    int64_t a, int64_t b
+) {
     __asm__ volatile (
         LGRT_DIVMOD_ASM("__divmoddi4")
     );
@@ -1633,13 +1699,17 @@ LGRT_AAPCS __attribute__((__naked__)) int64_t __aeabi_ldivmod(int64_t a, int64_t
 
 /* The run-time ABI's division by zero handlers, which programs may replace. */
 
-LGRT_AAPCS __attribute__((__weak__, __visibility__("hidden"))) int __aeabi_idiv0(int return_value);
-LGRT_AAPCS __attribute__((__weak__, __visibility__("hidden"))) int __aeabi_idiv0(int return_value) {
+LGRT_AAPCS int __aeabi_idiv0(
+    int return_value
+) __attribute__((__weak__, __visibility__("hidden")));
+LGRT_AAPCS int __aeabi_idiv0(int return_value) {
     return return_value;
 }
 
-LGRT_AAPCS __attribute__((__weak__, __visibility__("hidden"))) int64_t __aeabi_ldiv0(int64_t return_value);
-LGRT_AAPCS __attribute__((__weak__, __visibility__("hidden"))) int64_t __aeabi_ldiv0(int64_t return_value) {
+LGRT_AAPCS int64_t __aeabi_ldiv0(
+    int64_t return_value
+) __attribute__((__weak__, __visibility__("hidden")));
+LGRT_AAPCS int64_t __aeabi_ldiv0(int64_t return_value) {
     return return_value;
 }
 
@@ -1647,37 +1717,52 @@ LGRT_AAPCS __attribute__((__weak__, __visibility__("hidden"))) int64_t __aeabi_l
 
 LGRT_AAPCS int __aeabi_lcmp(int64_t a, int64_t b);
 LGRT_AAPCS int __aeabi_lcmp(int64_t a, int64_t b) {
-    return (int)((unsigned int)__cmpdi2(a, b) - 1u);
+    return (int)((unsigned int)__cmpdi2(a, b) - 1);
 }
 
 LGRT_AAPCS int __aeabi_ulcmp(uint64_t a, uint64_t b);
 LGRT_AAPCS int __aeabi_ulcmp(uint64_t a, uint64_t b) {
-    return (int)((unsigned int)__ucmpdi2(a, b) - 1u);
+    return (int)((unsigned int)__ucmpdi2(a, b) - 1);
 }
 
 LGRT_AAPCS int64_t __aeabi_lmul(int64_t a, int64_t b);
-LGRT_AAPCS int64_t __aeabi_lmul(int64_t a, int64_t b) __attribute__((__alias__("__muldi3")));
+LGRT_AAPCS int64_t __aeabi_lmul(
+    int64_t a, int64_t b
+) __attribute__((__alias__("__muldi3")));
 
 LGRT_AAPCS int64_t __aeabi_llsl(int64_t a, int b);
-LGRT_AAPCS int64_t __aeabi_llsl(int64_t a, int b) __attribute__((__alias__("__ashldi3")));
+LGRT_AAPCS int64_t __aeabi_llsl(
+    int64_t a, int b
+) __attribute__((__alias__("__ashldi3")));
 
 LGRT_AAPCS int64_t __aeabi_llsr(int64_t a, int b);
-LGRT_AAPCS int64_t __aeabi_llsr(int64_t a, int b) __attribute__((__alias__("__lshrdi3")));
+LGRT_AAPCS int64_t __aeabi_llsr(
+    int64_t a, int b
+) __attribute__((__alias__("__lshrdi3")));
 
 LGRT_AAPCS int64_t __aeabi_lasr(int64_t a, int b);
-LGRT_AAPCS int64_t __aeabi_lasr(int64_t a, int b) __attribute__((__alias__("__ashrdi3")));
+LGRT_AAPCS int64_t __aeabi_lasr(
+    int64_t a, int b
+) __attribute__((__alias__("__ashrdi3")));
 
 /*
  * C code can compile into calls to these routines, so they are assembly that
- * branches to memcpy and friends. Thumb-1 branches cannot reach those, so there
- * these call them, with r3 padding the stack to 8 bytes and, on ARMv4T,
+ * branches to memcpy and friends. Thumb-1 branches cannot reach those, so
+ * there these call them, with r3 padding the stack to 8 bytes and, on ARMv4T,
  * carrying the return address back.
  */
 
 #if LGRT_THUMB1 && LGRT_ARM_V4T
-#define LGRT_ASM_TAIL_CALL(f) "push {r3, lr}\n" "bl " f "\n" "pop {r2, r3}\n" "bx r3\n"
+#define LGRT_ASM_TAIL_CALL(f) \
+    "push {r3, lr}\n" \
+    "bl " f "\n" \
+    "pop {r2, r3}\n" \
+    "bx r3\n"
 #elif LGRT_THUMB1
-#define LGRT_ASM_TAIL_CALL(f) "push {r3, lr}\n" "bl " f "\n" "pop {r3, pc}\n"
+#define LGRT_ASM_TAIL_CALL(f) \
+    "push {r3, lr}\n" \
+    "bl " f "\n" \
+    "pop {r3, pc}\n"
 #elif defined(__thumb2__)
 #define LGRT_ASM_TAIL_CALL(f) "b.w " f "\n"
 #else
@@ -1689,7 +1774,9 @@ LGRT_AAPCS int64_t __aeabi_lasr(int64_t a, int b) __attribute__((__alias__("__as
 #pragma GCC diagnostic ignored "-Wreturn-type"
 
 LGRT_AAPCS void __aeabi_memcpy(void *dest, const void *src, size_t n);
-LGRT_AAPCS __attribute__((__naked__)) void __aeabi_memcpy(void *dest, const void *src, size_t n) {
+LGRT_AAPCS __attribute__((__naked__)) void __aeabi_memcpy(
+    void *dest, const void *src, size_t n
+) {
     __asm__ volatile (
         ".syntax unified\n"
         LGRT_ASM_BTI
@@ -1699,13 +1786,19 @@ LGRT_AAPCS __attribute__((__naked__)) void __aeabi_memcpy(void *dest, const void
 }
 
 LGRT_AAPCS void __aeabi_memcpy4(void *dest, const void *src, size_t n);
-LGRT_AAPCS void __aeabi_memcpy4(void *dest, const void *src, size_t n) __attribute__((__alias__("__aeabi_memcpy")));
+LGRT_AAPCS void __aeabi_memcpy4(
+    void *dest, const void *src, size_t n
+) __attribute__((__alias__("__aeabi_memcpy")));
 
 LGRT_AAPCS void __aeabi_memcpy8(void *dest, const void *src, size_t n);
-LGRT_AAPCS void __aeabi_memcpy8(void *dest, const void *src, size_t n) __attribute__((__alias__("__aeabi_memcpy")));
+LGRT_AAPCS void __aeabi_memcpy8(
+    void *dest, const void *src, size_t n
+) __attribute__((__alias__("__aeabi_memcpy")));
 
 LGRT_AAPCS void __aeabi_memmove(void *dest, const void *src, size_t n);
-LGRT_AAPCS __attribute__((__naked__)) void __aeabi_memmove(void *dest, const void *src, size_t n) {
+LGRT_AAPCS __attribute__((__naked__)) void __aeabi_memmove(
+    void *dest, const void *src, size_t n
+) {
     __asm__ volatile (
         ".syntax unified\n"
         LGRT_ASM_BTI
@@ -1715,10 +1808,14 @@ LGRT_AAPCS __attribute__((__naked__)) void __aeabi_memmove(void *dest, const voi
 }
 
 LGRT_AAPCS void __aeabi_memmove4(void *dest, const void *src, size_t n);
-LGRT_AAPCS void __aeabi_memmove4(void *dest, const void *src, size_t n) __attribute__((__alias__("__aeabi_memmove")));
+LGRT_AAPCS void __aeabi_memmove4(
+    void *dest, const void *src, size_t n
+) __attribute__((__alias__("__aeabi_memmove")));
 
 LGRT_AAPCS void __aeabi_memmove8(void *dest, const void *src, size_t n);
-LGRT_AAPCS void __aeabi_memmove8(void *dest, const void *src, size_t n) __attribute__((__alias__("__aeabi_memmove")));
+LGRT_AAPCS void __aeabi_memmove8(
+    void *dest, const void *src, size_t n
+) __attribute__((__alias__("__aeabi_memmove")));
 
 /*
  * memset takes the value before the count. The moves set flags, as Thumb-1
@@ -1726,7 +1823,9 @@ LGRT_AAPCS void __aeabi_memmove8(void *dest, const void *src, size_t n) __attrib
  */
 
 LGRT_AAPCS void __aeabi_memset(void *dest, size_t n, int c);
-LGRT_AAPCS __attribute__((__naked__)) void __aeabi_memset(void *dest, size_t n, int c) {
+LGRT_AAPCS __attribute__((__naked__)) void __aeabi_memset(
+    void *dest, size_t n, int c
+) {
     __asm__ volatile (
         ".syntax unified\n"
         LGRT_ASM_BTI
@@ -1739,13 +1838,19 @@ LGRT_AAPCS __attribute__((__naked__)) void __aeabi_memset(void *dest, size_t n, 
 }
 
 LGRT_AAPCS void __aeabi_memset4(void *dest, size_t n, int c);
-LGRT_AAPCS void __aeabi_memset4(void *dest, size_t n, int c) __attribute__((__alias__("__aeabi_memset")));
+LGRT_AAPCS void __aeabi_memset4(
+    void *dest, size_t n, int c
+) __attribute__((__alias__("__aeabi_memset")));
 
 LGRT_AAPCS void __aeabi_memset8(void *dest, size_t n, int c);
-LGRT_AAPCS void __aeabi_memset8(void *dest, size_t n, int c) __attribute__((__alias__("__aeabi_memset")));
+LGRT_AAPCS void __aeabi_memset8(
+    void *dest, size_t n, int c
+) __attribute__((__alias__("__aeabi_memset")));
 
 LGRT_AAPCS void __aeabi_memclr(void *dest, size_t n);
-LGRT_AAPCS __attribute__((__naked__)) void __aeabi_memclr(void *dest, size_t n) {
+LGRT_AAPCS __attribute__((__naked__)) void __aeabi_memclr(
+    void *dest, size_t n
+) {
     __asm__ volatile (
         ".syntax unified\n"
         LGRT_ASM_BTI
@@ -1757,13 +1862,19 @@ LGRT_AAPCS __attribute__((__naked__)) void __aeabi_memclr(void *dest, size_t n) 
 }
 
 LGRT_AAPCS void __aeabi_memclr4(void *dest, size_t n);
-LGRT_AAPCS void __aeabi_memclr4(void *dest, size_t n) __attribute__((__alias__("__aeabi_memclr")));
+LGRT_AAPCS void __aeabi_memclr4(
+    void *dest, size_t n
+) __attribute__((__alias__("__aeabi_memclr")));
 
 LGRT_AAPCS void __aeabi_memclr8(void *dest, size_t n);
-LGRT_AAPCS void __aeabi_memclr8(void *dest, size_t n) __attribute__((__alias__("__aeabi_memclr")));
+LGRT_AAPCS void __aeabi_memclr8(
+    void *dest, size_t n
+) __attribute__((__alias__("__aeabi_memclr")));
 
 LGRT_AAPCS int __aeabi_memcmp(const void *a, const void *b, size_t n);
-LGRT_AAPCS __attribute__((__naked__)) int __aeabi_memcmp(const void *a, const void *b, size_t n) {
+LGRT_AAPCS __attribute__((__naked__)) int __aeabi_memcmp(
+    const void *a, const void *b, size_t n
+) {
     __asm__ volatile (
         ".syntax unified\n"
         LGRT_ASM_BTI
@@ -1773,58 +1884,84 @@ LGRT_AAPCS __attribute__((__naked__)) int __aeabi_memcmp(const void *a, const vo
 }
 
 LGRT_AAPCS int __aeabi_memcmp4(const void *a, const void *b, size_t n);
-LGRT_AAPCS int __aeabi_memcmp4(const void *a, const void *b, size_t n) __attribute__((__alias__("__aeabi_memcmp")));
+LGRT_AAPCS int __aeabi_memcmp4(
+    const void *a, const void *b, size_t n
+) __attribute__((__alias__("__aeabi_memcmp")));
 
 LGRT_AAPCS int __aeabi_memcmp8(const void *a, const void *b, size_t n);
-LGRT_AAPCS int __aeabi_memcmp8(const void *a, const void *b, size_t n) __attribute__((__alias__("__aeabi_memcmp")));
+LGRT_AAPCS int __aeabi_memcmp8(
+    const void *a, const void *b, size_t n
+) __attribute__((__alias__("__aeabi_memcmp")));
 
 #pragma GCC diagnostic pop
 
 #endif
 
 /*
- * The atomic routines lock with pointer-sized atomics, so they exist only where
- * the compiler implements those inline, and not where compilers claim to but
- * get atomics wrong.
+ * The atomic routines lock with pointer-sized atomics, so they exist only
+ * where the compiler implements those inline, and not where compilers claim to
+ * but get atomics wrong.
  */
 #if defined(__i386__) && !defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4)
-/* Clang for the 80386 uses instructions the 80486 added. */
+/* Workaround: Clang, 80386: it uses instructions the 80486 added. */
 #define LGRT_BROKEN_ATOMICS 1
-#elif defined(__arm__) && (!defined(__ARM_ARCH) || __ARM_ARCH < 6 || \
-    (defined(__thumb__) && !defined(__thumb2__) && __ARM_ARCH < 8))
-/* No exclusive loads and stores before ARMv6, or in Thumb-1 before ARMv8-M Baseline. */
+#elif defined(__arm__) \
+   && (!defined(__ARM_ARCH) || __ARM_ARCH < 6 \
+    || (defined(__thumb__) && !defined(__thumb2__) && __ARM_ARCH < 8))
+/*
+ * No exclusive loads and stores before ARMv6, or in Thumb-1 before ARMv8-M
+ * Baseline.
+ */
 #define LGRT_BROKEN_ATOMICS 1
-#elif defined(__clang__) && defined(__arm__) && defined(__ARM_FEATURE_LDREX) && \
-    (__ARM_FEATURE_LDREX & 1) == 0
-/* Clang uses the byte, halfword, and doubleword exclusives that ARMv6K added. */
+#elif defined(__clang__) && defined(__arm__) && defined(__ARM_FEATURE_LDREX) \
+   && (__ARM_FEATURE_LDREX & 1) == 0
+/*
+ * Workaround: Clang, ARMv6 without K: it uses the byte, halfword, and
+ * doubleword exclusives that ARMv6K added.
+ */
 #define LGRT_BROKEN_ATOMICS 1
-#elif !defined(__clang__) && defined(__arm__) && defined(__linux__) && \
-    !defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1)
-/* GCC turns byte and halfword atomics into calls to __sync routines. */
+#elif !defined(__clang__) && defined(__arm__) && defined(__linux__) \
+   && !defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1)
+/*
+ * Workaround: GCC, ARM Linux without byte compare-and-swap: it turns byte and
+ * halfword atomics into calls to __sync routines.
+ */
 #define LGRT_BROKEN_ATOMICS 1
-#elif defined(__loongarch__) && defined(__loongarch_grlen) && __loongarch_grlen == 32 && \
-    !(defined(__clang__) && __clang_major__ >= 21)
-/* Compilers before Clang 21 get atomics wrong for 32-bit LoongArch. */
+#elif defined(__loongarch__) && defined(__loongarch_grlen) \
+   && __loongarch_grlen == 32 \
+   && !(defined(__clang__) && __clang_major__ >= 21)
+/*
+ * Workaround: GCC, and Clang before 21, 32-bit LoongArch: they get atomics
+ * wrong.
+ */
 #define LGRT_BROKEN_ATOMICS 1
 #elif defined(__hppa__)
-/* GCC implements even the __atomic builtins with calls to __sync routines. */
-#define LGRT_BROKEN_ATOMICS 1
-#elif defined(__sparc__) && !defined(__arch64__) && !defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4)
-/* Clang for SPARC V8 compiles atomics into calls to the routines below. */
-#define LGRT_BROKEN_ATOMICS 1
-#elif defined(__clang__) && __clang_major__ < 10 && defined(__riscv) && defined(__riscv_xlen) && \
-    __riscv_xlen == 64
 /*
- * Clang before 10 compares the sign-extended loaded word with an unextended one
- * in 32-bit compare-exchanges.
+ * Workaround: GCC, HPPA: it implements even the __atomic builtins with calls
+ * to __sync routines.
+ */
+#define LGRT_BROKEN_ATOMICS 1
+#elif defined(__sparc__) && !defined(__arch64__) \
+   && !defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4)
+/*
+ * Workaround: Clang, SPARC V8: it compiles atomics into calls to the routines
+ * below.
+ */
+#define LGRT_BROKEN_ATOMICS 1
+#elif defined(__clang__) && __clang_major__ < 10 && defined(__riscv) \
+   && defined(__riscv_xlen) && __riscv_xlen == 64
+/*
+ * Workaround: Clang before 10, 64-bit RISC-V: it compares the sign-extended
+ * loaded word with an unextended one in 32-bit compare-exchanges.
  */
 #define LGRT_BROKEN_ATOMICS 1
 #else
 #define LGRT_BROKEN_ATOMICS 0
 #endif
 
-#if (defined(__clang__) || __GNUC__ >= 5) && defined(__GCC_ATOMIC_POINTER_LOCK_FREE) && \
-    __GCC_ATOMIC_POINTER_LOCK_FREE == 2 && !LGRT_BROKEN_ATOMICS
+#if (defined(__clang__) || __GNUC__ >= 5) \
+ && defined(__GCC_ATOMIC_POINTER_LOCK_FREE) \
+ && __GCC_ATOMIC_POINTER_LOCK_FREE == 2 && !LGRT_BROKEN_ATOMICS
 #define LGRT_HAS_ATOMICS 1
 #else
 #define LGRT_HAS_ATOMICS 0
@@ -1832,20 +1969,18 @@ LGRT_AAPCS int __aeabi_memcmp8(const void *a, const void *b, size_t n) __attribu
 
 #if LGRT_HAS_ATOMICS
 
-#include <stdbool.h>
-
 /*
- * Compilers reserve the names of the atomic routines for their builtins, so the
- * routines have other names in C and get theirs from asm labels.
+ * Compilers reserve the names of the atomic routines for their builtins, so
+ * the routines have other names in C and get theirs from asm labels.
  */
 #define LGRT_STR(x) #x
 #define LGRT_XSTR(x) LGRT_STR(x)
 #define LGRT_ASM_LABEL(name) __asm__ (LGRT_XSTR(__USER_LABEL_PREFIX__) #name)
 
 /*
- * Clang turns atomic builtins on types aligned below their size, such as 64-bit
- * integers on IA-32, into calls to the routines below, so the builtins operate
- * on these types instead.
+ * Clang turns atomic builtins on types aligned below their size, such as
+ * 64-bit integers on IA-32, into calls to the routines below, so the builtins
+ * operate on these types instead.
  */
 typedef uint16_t lgrt_atomic_u16 __attribute__((__aligned__(2)));
 typedef uint32_t lgrt_atomic_u32 __attribute__((__aligned__(4)));
@@ -1853,23 +1988,26 @@ typedef uint64_t lgrt_atomic_u64 __attribute__((__aligned__(8)));
 #if LGRT_HAS_INT128
 typedef lgrt_u128 lgrt_atomic_u128 __attribute__((__aligned__(16)));
 #endif
-typedef uintptr_t lgrt_lock_word __attribute__((__aligned__(sizeof(uintptr_t))));
+typedef uintptr_t lgrt_lock_word __attribute__((__aligned__(
+    sizeof(uintptr_t)
+)));
 
 /*
  * Objects that are not lock-free are accessed under a lock chosen by hashing
- * their address: the lowest bits rarely tell objects apart, so they are dropped,
- * and higher ones are folded in.
+ * their address: the lowest bits rarely tell objects apart, so they are
+ * dropped, and higher ones are folded in.
  */
 #define LGRT_LOCK_BITS 9
+#define LGRT_LOCK_COUNT ((size_t)1 << LGRT_LOCK_BITS)
 
-static lgrt_lock_word lgrt_locks[1u << LGRT_LOCK_BITS];
+static lgrt_lock_word lgrt_locks[LGRT_LOCK_COUNT];
 
 static inline lgrt_lock_word *lgrt_lock_of(const volatile void *ptr) {
     uintptr_t h = (uintptr_t)ptr >> 3;
 
     h ^= h >> LGRT_LOCK_BITS;
     h ^= h >> (2 * LGRT_LOCK_BITS);
-    return &lgrt_locks[h & ((1u << LGRT_LOCK_BITS) - 1u)];
+    return &lgrt_locks[h & (LGRT_LOCK_COUNT - 1)];
 }
 
 static inline void lgrt_lock(lgrt_lock_word *lock) {
@@ -1884,32 +2022,36 @@ static inline void lgrt_unlock(lgrt_lock_word *lock) {
 }
 
 /*
- * An object of n bytes, for n of 1, 2, 4, 8, and 16, is accessed lock-free when
- * LGRT_LOCK_FREE(n) holds and the object is aligned to n. Every builtin on n
- * bytes sits under a plain if on that constant, so that it vanishes where the
- * constant is false instead of compiling into a call to the routine containing
- * it. Some compilers claim that 8-byte objects are always lock-free where they
- * are not: GCC 5 and 6 on 32-bit ARM without doubleword exclusives, which call
- * __sync routines for them, and Clang before 9 for the 80486, which uses the
- * cmpxchg8b that the Pentium added.
+ * An object of n bytes, for n of 1, 2, 4, 8, and 16, is accessed lock-free
+ * when LGRT_LOCK_FREE(n) holds and the object is aligned to n. Every builtin
+ * on n bytes sits under a plain if on that constant, so that it vanishes where
+ * the constant is false instead of compiling into a call to the routine
+ * containing it.
+ *
+ * Workaround: GCC 5 and 6, 32-bit ARM without doubleword exclusives; Clang
+ * before 9, 80486: they claim that 8-byte objects are always lock-free where
+ * they are not, GCC calling __sync routines for them and Clang using the
+ * cmpxchg8b that the Pentium added, so LGRT_LOCK_FREE(8) is false there.
  */
-#if (defined(__arm__) && !(defined(__ARM_FEATURE_LDREX) && (__ARM_FEATURE_LDREX & 8) != 0)) || \
-    (defined(__i386__) && !defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8))
+#if (defined(__arm__) \
+  && !(defined(__ARM_FEATURE_LDREX) && (__ARM_FEATURE_LDREX & 8) != 0)) \
+ || (defined(__i386__) && !defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8))
 #define LGRT_LOCK_FREE(n) ((n) != 8 && __atomic_always_lock_free(n, 0))
 #else
 #define LGRT_LOCK_FREE(n) (__atomic_always_lock_free(n, 0))
 #endif
 
 static inline bool lgrt_aligned(const volatile void *ptr, size_t n) {
-    return ((uintptr_t)ptr & (n - 1u)) == 0;
+    return ((uintptr_t)ptr & (n - 1)) == 0;
 }
 
 /*
- * Buffers other than the objects are not shared, but may be misaligned, so they
- * are copied with lgrt_copy, as are objects under their locks. When optimising
- * for size, Clang turns misaligned word accesses into calls to __aeabi_uread4
- * and friends on ARM without unaligned accesses, so there lgrt_copy copies
- * bytes, through volatile loads that it cannot merge into words.
+ * Buffers other than the objects are not shared, but may be misaligned, so
+ * they are copied with lgrt_copy, as are objects under their locks. When
+ * optimising for size, Clang turns misaligned word accesses into calls to
+ * __aeabi_uread4 and friends on ARM without unaligned accesses, so there
+ * lgrt_copy copies bytes, through volatile loads that it cannot merge into
+ * words.
  */
 #if defined(__clang__) && defined(__arm__) && !defined(__ARM_FEATURE_UNALIGNED)
 static inline void lgrt_copy(void *dest, const volatile void *src, size_t n) {
@@ -1927,9 +2069,9 @@ static inline void lgrt_copy(void *dest, const volatile void *src, size_t n) {
 }
 #endif
 
-/* These access an object of size bytes under its lock. */
-
-static inline void lgrt_locked_load(size_t size, const volatile void *src, void *dest) {
+static inline void lgrt_locked_load(
+    size_t size, const volatile void *src, void *dest
+) {
     lgrt_lock_word *lock = lgrt_lock_of(src);
 
     lgrt_lock(lock);
@@ -1937,7 +2079,9 @@ static inline void lgrt_locked_load(size_t size, const volatile void *src, void 
     lgrt_unlock(lock);
 }
 
-static inline void lgrt_locked_store(size_t size, volatile void *dest, const void *src) {
+static inline void lgrt_locked_store(
+    size_t size, volatile void *dest, const void *src
+) {
     lgrt_lock_word *lock = lgrt_lock_of(dest);
 
     lgrt_lock(lock);
@@ -1945,11 +2089,16 @@ static inline void lgrt_locked_store(size_t size, volatile void *dest, const voi
     lgrt_unlock(lock);
 }
 
-static inline void lgrt_locked_exchange(size_t size, volatile void *ptr, const void *val, void *old) {
+static inline void lgrt_locked_exchange(
+    size_t size, volatile void *ptr, const void *val, void *old
+) {
     lgrt_lock_word *lock = lgrt_lock_of(ptr);
 
     lgrt_lock(lock);
-    /* Callers may pass one buffer as both val and old, whose bytes are then swapped. */
+    /*
+     * Callers may pass one buffer as both val and old, whose bytes are then
+     * swapped.
+     */
     if (val != old) {
         lgrt_copy(old, ptr, size);
         lgrt_copy((void *)ptr, val, size);
@@ -1968,7 +2117,9 @@ static inline void lgrt_locked_exchange(size_t size, volatile void *ptr, const v
     lgrt_unlock(lock);
 }
 
-static inline bool lgrt_locked_compare_exchange(size_t size, volatile void *ptr, void *expected, const void *desired) {
+static inline bool lgrt_locked_compare_exchange(
+    size_t size, volatile void *ptr, void *expected, const void *desired
+) {
     lgrt_lock_word *lock = lgrt_lock_of(ptr);
     bool equal;
 
@@ -1986,17 +2137,19 @@ static inline bool lgrt_locked_compare_exchange(size_t size, volatile void *ptr,
 #if LGRT_HAS_INT128 && defined(__s390x__) && !defined(__clang__)
 
 /*
- * GCC compiles 16-byte atomic builtins on s390x into library calls, that is,
- * into calls to the routines below, so the 16-byte helpers further down use
- * these instead. lpq, stpq, and cdsg access aligned quadwords atomically,
- * through the even/odd register pairs in which GCC holds 128-bit values. Only
- * loads may pass earlier stores on s390x, which the serialisation after
- * sequentially consistent stores prevents, and cdsg serialises, so no memory
- * order needs more.
+ * Workaround: GCC, s390x: it compiles 16-byte atomic builtins into library
+ * calls, that is, into calls to the routines below, so the 16-byte helpers
+ * further down use these instead. lpq, stpq, and cdsg access aligned quadwords
+ * atomically, through the even/odd register pairs in which GCC holds 128-bit
+ * values. Only loads may pass earlier stores on s390x, which the serialisation
+ * after sequentially consistent stores prevents, and cdsg serialises, so no
+ * memory order needs more.
  */
 #define LGRT_S390X_ASM_16 1
 
-static inline lgrt_u128 lgrt_s390x_load_16(const volatile void *ptr, int model) {
+static inline lgrt_u128 lgrt_s390x_load_16(
+    const volatile void *ptr, int model
+) {
     const volatile lgrt_atomic_u128 *p = ptr;
     lgrt_u128 v;
 
@@ -2010,7 +2163,9 @@ static inline lgrt_u128 lgrt_s390x_load_16(const volatile void *ptr, int model) 
     return v;
 }
 
-static inline void lgrt_s390x_store_16(volatile void *ptr, lgrt_u128 val, int model) {
+static inline void lgrt_s390x_store_16(
+    volatile void *ptr, lgrt_u128 val, int model
+) {
     volatile lgrt_atomic_u128 *p = ptr;
 
     if (model == __ATOMIC_SEQ_CST) {
@@ -2035,8 +2190,10 @@ static inline void lgrt_s390x_store_16(volatile void *ptr, lgrt_u128 val, int mo
  * cdsg sets condition code 0 when it stores desired, and otherwise loads the
  * quadword into the pair that held expected.
  */
-static inline bool lgrt_s390x_compare_exchange_16(volatile void *ptr, lgrt_u128 *expected, lgrt_u128 desired,
-    int success, int failure) {
+static inline bool lgrt_s390x_compare_exchange_16(
+    volatile void *ptr, lgrt_u128 *expected, lgrt_u128 desired, int success,
+    int failure
+) {
     volatile lgrt_atomic_u128 *p = ptr;
     lgrt_u128 e = *expected;
     int cc;
@@ -2059,31 +2216,46 @@ static inline bool lgrt_s390x_compare_exchange_16(volatile void *ptr, lgrt_u128 
 #define LGRT_S390X_ASM_16 0
 #endif
 
-#if LGRT_HAS_INT128 && defined(__aarch64__) && defined(__clang__) && \
-    (__clang_major__ < 8 || (__clang_major__ < 23 && defined(__AARCH64EB__)))
+#if LGRT_HAS_INT128 && defined(__aarch64__) && defined(__clang__) \
+ && (__clang_major__ < 8 || (__clang_major__ < 23 && defined(__AARCH64EB__)))
 
 /*
- * In 16-byte atomics, Clang before 8 with LSE uses casp on odd registers or
- * gets its success flag wrong, without defining a macro that tells whether LSE
- * is enabled, and Clang before 23 for big-endian AArch64 swaps the halves of the
- * values it stores. There, the 16-byte helpers below use this file's own
- * compare-and-swap routines, defined further on, picking the one whose ordering
- * covers both memory orders: an order acquires unless it is relaxed or release,
- * and releases unless it is relaxed, consume, or acquire.
+ * Workaround: Clang before 8, AArch64 with LSE; Clang before 23, big-endian
+ * AArch64: in 16-byte atomics, the first uses casp on odd registers or gets
+ * its success flag wrong, without defining a macro that tells whether LSE is
+ * enabled, and the second swaps the halves of the values it stores. There, the
+ * 16-byte helpers below use this file's own compare-and-swap routines, defined
+ * further on, picking the one whose ordering covers both memory orders: an
+ * order acquires unless it is relaxed or release, and releases unless it is
+ * relaxed, consume, or acquire.
  */
 #define LGRT_AARCH64_CAS_16 1
 
-lgrt_u128 __aarch64_cas16_relax(lgrt_u128 expected, lgrt_u128 desired, volatile void *ptr);
-lgrt_u128 __aarch64_cas16_acq(lgrt_u128 expected, lgrt_u128 desired, volatile void *ptr);
-lgrt_u128 __aarch64_cas16_rel(lgrt_u128 expected, lgrt_u128 desired, volatile void *ptr);
-lgrt_u128 __aarch64_cas16_acq_rel(lgrt_u128 expected, lgrt_u128 desired, volatile void *ptr);
+lgrt_u128 __aarch64_cas16_relax(
+    lgrt_u128 expected, lgrt_u128 desired, volatile void *ptr
+);
+lgrt_u128 __aarch64_cas16_acq(
+    lgrt_u128 expected, lgrt_u128 desired, volatile void *ptr
+);
+lgrt_u128 __aarch64_cas16_rel(
+    lgrt_u128 expected, lgrt_u128 desired, volatile void *ptr
+);
+lgrt_u128 __aarch64_cas16_acq_rel(
+    lgrt_u128 expected, lgrt_u128 desired, volatile void *ptr
+);
 
-/* Returns the value read, which equals expected exactly when desired was stored. */
-static inline lgrt_u128 lgrt_aarch64_cas_16(volatile void *ptr, lgrt_u128 expected, lgrt_u128 desired, int success,
-    int failure) {
-    bool acquire = (success != __ATOMIC_RELAXED && success != __ATOMIC_RELEASE) ||
-        (failure != __ATOMIC_RELAXED && failure != __ATOMIC_RELEASE);
-    bool release = success != __ATOMIC_RELAXED && success != __ATOMIC_CONSUME && success != __ATOMIC_ACQUIRE;
+/*
+ * Returns the value read, which equals expected exactly when desired was
+ * stored.
+ */
+static inline lgrt_u128 lgrt_aarch64_cas_16(
+    volatile void *ptr, lgrt_u128 expected, lgrt_u128 desired, int success,
+    int failure
+) {
+    bool acquire = (success != __ATOMIC_RELAXED && success != __ATOMIC_RELEASE)
+        || (failure != __ATOMIC_RELAXED && failure != __ATOMIC_RELEASE);
+    bool release = success != __ATOMIC_RELAXED && success != __ATOMIC_CONSUME
+        && success != __ATOMIC_ACQUIRE;
 
     if (acquire && release) {
         return __aarch64_cas16_acq_rel(expected, desired, ptr);
@@ -2102,12 +2274,12 @@ static inline lgrt_u128 lgrt_aarch64_cas_16(volatile void *ptr, lgrt_u128 expect
 #endif
 
 /*
- * Where LGRT_ATOMIC_HELPERS_16 is 1, the 16-byte atomic builtins cannot be used,
- * and lock-free 16-byte objects are accessed with these helpers instead. They
- * take the builtins' memory orders, and lgrt_compare_exchange_16 stores the
- * value it read in expected when it fails. On AArch64, a load is a
- * compare-exchange of 0 with 0, which returns the value and, if it is 0, writes
- * it back unchanged.
+ * Where LGRT_ATOMIC_HELPERS_16 is 1, the 16-byte atomic builtins cannot be
+ * used, and lock-free 16-byte objects are accessed with these helpers instead.
+ * They take the builtins' memory orders, and lgrt_compare_exchange_16 stores
+ * the value it read in expected when it fails. On AArch64, a load is a
+ * compare-exchange of 0 with 0, which returns the value and, if it is 0,
+ * writes it back unchanged.
  */
 #if LGRT_S390X_ASM_16 || LGRT_AARCH64_CAS_16
 #define LGRT_ATOMIC_HELPERS_16 1
@@ -2120,10 +2292,14 @@ static inline lgrt_u128 lgrt_load_16(const volatile void *ptr, int model) {
 #endif
 }
 
-static inline bool lgrt_compare_exchange_16(volatile void *ptr, lgrt_u128 *expected, lgrt_u128 desired, int success,
-    int failure) {
+static inline bool lgrt_compare_exchange_16(
+    volatile void *ptr, lgrt_u128 *expected, lgrt_u128 desired, int success,
+    int failure
+) {
 #if LGRT_S390X_ASM_16
-    return lgrt_s390x_compare_exchange_16(ptr, expected, desired, success, failure);
+    return lgrt_s390x_compare_exchange_16(
+        ptr, expected, desired, success, failure
+    );
 #else
     lgrt_u128 e = *expected;
 
@@ -2132,15 +2308,23 @@ static inline bool lgrt_compare_exchange_16(volatile void *ptr, lgrt_u128 *expec
 #endif
 }
 
-static inline lgrt_u128 lgrt_exchange_16(volatile void *ptr, lgrt_u128 val, int model) {
+static inline lgrt_u128 lgrt_exchange_16(
+    volatile void *ptr, lgrt_u128 val, int model
+) {
     lgrt_u128 old = lgrt_load_16(ptr, __ATOMIC_RELAXED);
+    bool done;
 
-    while (!lgrt_compare_exchange_16(ptr, &old, val, model, __ATOMIC_RELAXED)) {
-    }
+    do {
+        done = lgrt_compare_exchange_16(
+            ptr, &old, val, model, __ATOMIC_RELAXED
+        );
+    } while (!done);
     return old;
 }
 
-static inline void lgrt_store_16(volatile void *ptr, lgrt_u128 val, int model) {
+static inline void lgrt_store_16(
+    volatile void *ptr, lgrt_u128 val, int model
+) {
 #if LGRT_S390X_ASM_16
     lgrt_s390x_store_16(ptr, val, model);
 #else
@@ -2152,8 +2336,9 @@ static inline void lgrt_store_16(volatile void *ptr, lgrt_u128 val, int model) {
 #define LGRT_ATOMIC_HELPERS_16 0
 #endif
 
-bool lgrt_atomic_is_lock_free(size_t size, void *ptr)
-    LGRT_ASM_LABEL(__atomic_is_lock_free);
+bool lgrt_atomic_is_lock_free(
+    size_t size, void *ptr
+) LGRT_ASM_LABEL(__atomic_is_lock_free);
 bool lgrt_atomic_is_lock_free(size_t size, void *ptr) {
     if (LGRT_LOCK_FREE(1)) {
         if (size == 1) {
@@ -2187,65 +2372,91 @@ bool lgrt_atomic_is_lock_free(size_t size, void *ptr) {
 
 /*
  * The generic routines leave lock-free objects to the sized routines, declared
- * here and defined after them. GCC for SuperH cannot allocate registers for the
- * atomic sequences of several sizes in one function, so the sized routines are
- * never inlined.
+ * here and defined after them. GCC for SuperH cannot allocate registers for
+ * the atomic sequences of several sizes in one function, so the sized routines
+ * are never inlined.
  */
 
-uint8_t lgrt_atomic_load_1(const volatile void *ptr, int model)
-    LGRT_ASM_LABEL(__atomic_load_1) __attribute__((__noinline__));
-uint16_t lgrt_atomic_load_2(const volatile void *ptr, int model)
-    LGRT_ASM_LABEL(__atomic_load_2) __attribute__((__noinline__));
-uint32_t lgrt_atomic_load_4(const volatile void *ptr, int model)
-    LGRT_ASM_LABEL(__atomic_load_4) __attribute__((__noinline__));
-uint64_t lgrt_atomic_load_8(const volatile void *ptr, int model)
-    LGRT_ASM_LABEL(__atomic_load_8) __attribute__((__noinline__));
+uint8_t lgrt_atomic_load_1(
+    const volatile void *ptr, int model
+) LGRT_ASM_LABEL(__atomic_load_1) __attribute__((__noinline__));
+uint16_t lgrt_atomic_load_2(
+    const volatile void *ptr, int model
+) LGRT_ASM_LABEL(__atomic_load_2) __attribute__((__noinline__));
+uint32_t lgrt_atomic_load_4(
+    const volatile void *ptr, int model
+) LGRT_ASM_LABEL(__atomic_load_4) __attribute__((__noinline__));
+uint64_t lgrt_atomic_load_8(
+    const volatile void *ptr, int model
+) LGRT_ASM_LABEL(__atomic_load_8) __attribute__((__noinline__));
 #if LGRT_HAS_INT128
-lgrt_u128 lgrt_atomic_load_16(const volatile void *ptr, int model)
-    LGRT_ASM_LABEL(__atomic_load_16) __attribute__((__noinline__));
+lgrt_u128 lgrt_atomic_load_16(
+    const volatile void *ptr, int model
+) LGRT_ASM_LABEL(__atomic_load_16) __attribute__((__noinline__));
 #endif
 
-void lgrt_atomic_store_1(volatile void *ptr, uint8_t val, int model)
-    LGRT_ASM_LABEL(__atomic_store_1) __attribute__((__noinline__));
-void lgrt_atomic_store_2(volatile void *ptr, uint16_t val, int model)
-    LGRT_ASM_LABEL(__atomic_store_2) __attribute__((__noinline__));
-void lgrt_atomic_store_4(volatile void *ptr, uint32_t val, int model)
-    LGRT_ASM_LABEL(__atomic_store_4) __attribute__((__noinline__));
-void lgrt_atomic_store_8(volatile void *ptr, uint64_t val, int model)
-    LGRT_ASM_LABEL(__atomic_store_8) __attribute__((__noinline__));
+void lgrt_atomic_store_1(
+    volatile void *ptr, uint8_t val, int model
+) LGRT_ASM_LABEL(__atomic_store_1) __attribute__((__noinline__));
+void lgrt_atomic_store_2(
+    volatile void *ptr, uint16_t val, int model
+) LGRT_ASM_LABEL(__atomic_store_2) __attribute__((__noinline__));
+void lgrt_atomic_store_4(
+    volatile void *ptr, uint32_t val, int model
+) LGRT_ASM_LABEL(__atomic_store_4) __attribute__((__noinline__));
+void lgrt_atomic_store_8(
+    volatile void *ptr, uint64_t val, int model
+) LGRT_ASM_LABEL(__atomic_store_8) __attribute__((__noinline__));
 #if LGRT_HAS_INT128
-void lgrt_atomic_store_16(volatile void *ptr, lgrt_u128 val, int model)
-    LGRT_ASM_LABEL(__atomic_store_16) __attribute__((__noinline__));
+void lgrt_atomic_store_16(
+    volatile void *ptr, lgrt_u128 val, int model
+) LGRT_ASM_LABEL(__atomic_store_16) __attribute__((__noinline__));
 #endif
 
-uint8_t lgrt_atomic_exchange_1(volatile void *ptr, uint8_t val, int model)
-    LGRT_ASM_LABEL(__atomic_exchange_1) __attribute__((__noinline__));
-uint16_t lgrt_atomic_exchange_2(volatile void *ptr, uint16_t val, int model)
-    LGRT_ASM_LABEL(__atomic_exchange_2) __attribute__((__noinline__));
-uint32_t lgrt_atomic_exchange_4(volatile void *ptr, uint32_t val, int model)
-    LGRT_ASM_LABEL(__atomic_exchange_4) __attribute__((__noinline__));
-uint64_t lgrt_atomic_exchange_8(volatile void *ptr, uint64_t val, int model)
-    LGRT_ASM_LABEL(__atomic_exchange_8) __attribute__((__noinline__));
+uint8_t lgrt_atomic_exchange_1(
+    volatile void *ptr, uint8_t val, int model
+) LGRT_ASM_LABEL(__atomic_exchange_1) __attribute__((__noinline__));
+uint16_t lgrt_atomic_exchange_2(
+    volatile void *ptr, uint16_t val, int model
+) LGRT_ASM_LABEL(__atomic_exchange_2) __attribute__((__noinline__));
+uint32_t lgrt_atomic_exchange_4(
+    volatile void *ptr, uint32_t val, int model
+) LGRT_ASM_LABEL(__atomic_exchange_4) __attribute__((__noinline__));
+uint64_t lgrt_atomic_exchange_8(
+    volatile void *ptr, uint64_t val, int model
+) LGRT_ASM_LABEL(__atomic_exchange_8) __attribute__((__noinline__));
 #if LGRT_HAS_INT128
-lgrt_u128 lgrt_atomic_exchange_16(volatile void *ptr, lgrt_u128 val, int model)
-    LGRT_ASM_LABEL(__atomic_exchange_16) __attribute__((__noinline__));
+lgrt_u128 lgrt_atomic_exchange_16(
+    volatile void *ptr, lgrt_u128 val, int model
+) LGRT_ASM_LABEL(__atomic_exchange_16) __attribute__((__noinline__));
 #endif
 
-bool lgrt_atomic_compare_exchange_1(volatile void *ptr, void *expected, uint8_t desired, int success, int failure)
-    LGRT_ASM_LABEL(__atomic_compare_exchange_1) __attribute__((__noinline__));
-bool lgrt_atomic_compare_exchange_2(volatile void *ptr, void *expected, uint16_t desired, int success, int failure)
-    LGRT_ASM_LABEL(__atomic_compare_exchange_2) __attribute__((__noinline__));
-bool lgrt_atomic_compare_exchange_4(volatile void *ptr, void *expected, uint32_t desired, int success, int failure)
-    LGRT_ASM_LABEL(__atomic_compare_exchange_4) __attribute__((__noinline__));
-bool lgrt_atomic_compare_exchange_8(volatile void *ptr, void *expected, uint64_t desired, int success, int failure)
-    LGRT_ASM_LABEL(__atomic_compare_exchange_8) __attribute__((__noinline__));
+bool lgrt_atomic_compare_exchange_1(
+    volatile void *ptr, void *expected, uint8_t desired, int success,
+    int failure
+) LGRT_ASM_LABEL(__atomic_compare_exchange_1) __attribute__((__noinline__));
+bool lgrt_atomic_compare_exchange_2(
+    volatile void *ptr, void *expected, uint16_t desired, int success,
+    int failure
+) LGRT_ASM_LABEL(__atomic_compare_exchange_2) __attribute__((__noinline__));
+bool lgrt_atomic_compare_exchange_4(
+    volatile void *ptr, void *expected, uint32_t desired, int success,
+    int failure
+) LGRT_ASM_LABEL(__atomic_compare_exchange_4) __attribute__((__noinline__));
+bool lgrt_atomic_compare_exchange_8(
+    volatile void *ptr, void *expected, uint64_t desired, int success,
+    int failure
+) LGRT_ASM_LABEL(__atomic_compare_exchange_8) __attribute__((__noinline__));
 #if LGRT_HAS_INT128
-bool lgrt_atomic_compare_exchange_16(volatile void *ptr, void *expected, lgrt_u128 desired, int success, int failure)
-    LGRT_ASM_LABEL(__atomic_compare_exchange_16) __attribute__((__noinline__));
+bool lgrt_atomic_compare_exchange_16(
+    volatile void *ptr, void *expected, lgrt_u128 desired, int success,
+    int failure
+) LGRT_ASM_LABEL(__atomic_compare_exchange_16) __attribute__((__noinline__));
 #endif
 
-void lgrt_atomic_load(size_t size, void *src, void *dest, int model)
-    LGRT_ASM_LABEL(__atomic_load);
+void lgrt_atomic_load(
+    size_t size, void *src, void *dest, int model
+) LGRT_ASM_LABEL(__atomic_load);
 void lgrt_atomic_load(size_t size, void *src, void *dest, int model) {
     if (LGRT_LOCK_FREE(1)) {
         if (size == 1) {
@@ -2292,8 +2503,9 @@ void lgrt_atomic_load(size_t size, void *src, void *dest, int model) {
     lgrt_locked_load(size, src, dest);
 }
 
-void lgrt_atomic_store(size_t size, void *dest, void *src, int model)
-    LGRT_ASM_LABEL(__atomic_store);
+void lgrt_atomic_store(
+    size_t size, void *dest, void *src, int model
+) LGRT_ASM_LABEL(__atomic_store);
 void lgrt_atomic_store(size_t size, void *dest, void *src, int model) {
     if (LGRT_LOCK_FREE(1)) {
         if (size == 1) {
@@ -2345,9 +2557,12 @@ void lgrt_atomic_store(size_t size, void *dest, void *src, int model) {
     lgrt_locked_store(size, dest, src);
 }
 
-void lgrt_atomic_exchange(size_t size, void *ptr, void *val, void *old, int model)
-    LGRT_ASM_LABEL(__atomic_exchange);
-void lgrt_atomic_exchange(size_t size, void *ptr, void *val, void *old, int model) {
+void lgrt_atomic_exchange(
+    size_t size, void *ptr, void *val, void *old, int model
+) LGRT_ASM_LABEL(__atomic_exchange);
+void lgrt_atomic_exchange(
+    size_t size, void *ptr, void *val, void *old, int model
+) {
     if (LGRT_LOCK_FREE(1)) {
         if (size == 1) {
             uint8_t x;
@@ -2403,16 +2618,26 @@ void lgrt_atomic_exchange(size_t size, void *ptr, void *val, void *old, int mode
     lgrt_locked_exchange(size, ptr, val, old);
 }
 
-/* Compilers drop the weak flag when they call these routines, so they are strong. */
-bool lgrt_atomic_compare_exchange(size_t size, void *ptr, void *expected, void *desired, int success, int failure)
-    LGRT_ASM_LABEL(__atomic_compare_exchange);
-bool lgrt_atomic_compare_exchange(size_t size, void *ptr, void *expected, void *desired, int success, int failure) {
+/*
+ * Compilers drop the weak flag when they call these routines, so they are
+ * strong.
+ */
+bool lgrt_atomic_compare_exchange(
+    size_t size, void *ptr, void *expected, void *desired, int success,
+    int failure
+) LGRT_ASM_LABEL(__atomic_compare_exchange);
+bool lgrt_atomic_compare_exchange(
+    size_t size, void *ptr, void *expected, void *desired, int success,
+    int failure
+) {
     if (LGRT_LOCK_FREE(1)) {
         if (size == 1) {
             uint8_t d;
 
             lgrt_copy(&d, desired, 1);
-            return lgrt_atomic_compare_exchange_1(ptr, expected, d, success, failure);
+            return lgrt_atomic_compare_exchange_1(
+                ptr, expected, d, success, failure
+            );
         }
     }
     if (LGRT_LOCK_FREE(2)) {
@@ -2420,7 +2645,9 @@ bool lgrt_atomic_compare_exchange(size_t size, void *ptr, void *expected, void *
             uint16_t d;
 
             lgrt_copy(&d, desired, 2);
-            return lgrt_atomic_compare_exchange_2(ptr, expected, d, success, failure);
+            return lgrt_atomic_compare_exchange_2(
+                ptr, expected, d, success, failure
+            );
         }
     }
     if (LGRT_LOCK_FREE(4)) {
@@ -2428,7 +2655,9 @@ bool lgrt_atomic_compare_exchange(size_t size, void *ptr, void *expected, void *
             uint32_t d;
 
             lgrt_copy(&d, desired, 4);
-            return lgrt_atomic_compare_exchange_4(ptr, expected, d, success, failure);
+            return lgrt_atomic_compare_exchange_4(
+                ptr, expected, d, success, failure
+            );
         }
     }
     if (LGRT_LOCK_FREE(8)) {
@@ -2436,7 +2665,9 @@ bool lgrt_atomic_compare_exchange(size_t size, void *ptr, void *expected, void *
             uint64_t d;
 
             lgrt_copy(&d, desired, 8);
-            return lgrt_atomic_compare_exchange_8(ptr, expected, d, success, failure);
+            return lgrt_atomic_compare_exchange_8(
+                ptr, expected, d, success, failure
+            );
         }
     }
 #if LGRT_HAS_INT128
@@ -2445,7 +2676,9 @@ bool lgrt_atomic_compare_exchange(size_t size, void *ptr, void *expected, void *
             lgrt_u128 d;
 
             lgrt_copy(&d, desired, 16);
-            return lgrt_atomic_compare_exchange_16(ptr, expected, d, success, failure);
+            return lgrt_atomic_compare_exchange_16(
+                ptr, expected, d, success, failure
+            );
         }
     }
 #endif
@@ -2467,7 +2700,9 @@ uint16_t lgrt_atomic_load_2(const volatile void *ptr, int model) {
 
     if (LGRT_LOCK_FREE(2)) {
         if (lgrt_aligned(ptr, 2)) {
-            return __atomic_load_n((const volatile lgrt_atomic_u16 *)ptr, model);
+            return __atomic_load_n(
+                (const volatile lgrt_atomic_u16 *)ptr, model
+            );
         }
     }
     lgrt_locked_load(2, ptr, &v);
@@ -2479,7 +2714,9 @@ uint32_t lgrt_atomic_load_4(const volatile void *ptr, int model) {
 
     if (LGRT_LOCK_FREE(4)) {
         if (lgrt_aligned(ptr, 4)) {
-            return __atomic_load_n((const volatile lgrt_atomic_u32 *)ptr, model);
+            return __atomic_load_n(
+                (const volatile lgrt_atomic_u32 *)ptr, model
+            );
         }
     }
     lgrt_locked_load(4, ptr, &v);
@@ -2491,7 +2728,9 @@ uint64_t lgrt_atomic_load_8(const volatile void *ptr, int model) {
 
     if (LGRT_LOCK_FREE(8)) {
         if (lgrt_aligned(ptr, 8)) {
-            return __atomic_load_n((const volatile lgrt_atomic_u64 *)ptr, model);
+            return __atomic_load_n(
+                (const volatile lgrt_atomic_u64 *)ptr, model
+            );
         }
     }
     lgrt_locked_load(8, ptr, &v);
@@ -2507,7 +2746,9 @@ lgrt_u128 lgrt_atomic_load_16(const volatile void *ptr, int model) {
 #if LGRT_ATOMIC_HELPERS_16
             return lgrt_load_16(ptr, model);
 #else
-            return __atomic_load_n((const volatile lgrt_atomic_u128 *)ptr, model);
+            return __atomic_load_n(
+                (const volatile lgrt_atomic_u128 *)ptr, model
+            );
 #endif
         }
     }
@@ -2585,7 +2826,9 @@ uint16_t lgrt_atomic_exchange_2(volatile void *ptr, uint16_t val, int model) {
 
     if (LGRT_LOCK_FREE(2)) {
         if (lgrt_aligned(ptr, 2)) {
-            return __atomic_exchange_n((volatile lgrt_atomic_u16 *)ptr, val, model);
+            return __atomic_exchange_n(
+                (volatile lgrt_atomic_u16 *)ptr, val, model
+            );
         }
     }
     lgrt_locked_exchange(2, ptr, &val, &old);
@@ -2597,7 +2840,9 @@ uint32_t lgrt_atomic_exchange_4(volatile void *ptr, uint32_t val, int model) {
 
     if (LGRT_LOCK_FREE(4)) {
         if (lgrt_aligned(ptr, 4)) {
-            return __atomic_exchange_n((volatile lgrt_atomic_u32 *)ptr, val, model);
+            return __atomic_exchange_n(
+                (volatile lgrt_atomic_u32 *)ptr, val, model
+            );
         }
     }
     lgrt_locked_exchange(4, ptr, &val, &old);
@@ -2609,7 +2854,9 @@ uint64_t lgrt_atomic_exchange_8(volatile void *ptr, uint64_t val, int model) {
 
     if (LGRT_LOCK_FREE(8)) {
         if (lgrt_aligned(ptr, 8)) {
-            return __atomic_exchange_n((volatile lgrt_atomic_u64 *)ptr, val, model);
+            return __atomic_exchange_n(
+                (volatile lgrt_atomic_u64 *)ptr, val, model
+            );
         }
     }
     lgrt_locked_exchange(8, ptr, &val, &old);
@@ -2617,7 +2864,9 @@ uint64_t lgrt_atomic_exchange_8(volatile void *ptr, uint64_t val, int model) {
 }
 
 #if LGRT_HAS_INT128
-lgrt_u128 lgrt_atomic_exchange_16(volatile void *ptr, lgrt_u128 val, int model) {
+lgrt_u128 lgrt_atomic_exchange_16(
+    volatile void *ptr, lgrt_u128 val, int model
+) {
     lgrt_u128 old;
 
     if (LGRT_LOCK_FREE(16)) {
@@ -2625,7 +2874,9 @@ lgrt_u128 lgrt_atomic_exchange_16(volatile void *ptr, lgrt_u128 val, int model) 
 #if LGRT_ATOMIC_HELPERS_16
             return lgrt_exchange_16(ptr, val, model);
 #else
-            return __atomic_exchange_n((volatile lgrt_atomic_u128 *)ptr, val, model);
+            return __atomic_exchange_n(
+                (volatile lgrt_atomic_u128 *)ptr, val, model
+            );
 #endif
         }
     }
@@ -2634,13 +2885,20 @@ lgrt_u128 lgrt_atomic_exchange_16(volatile void *ptr, lgrt_u128 val, int model) 
 }
 #endif
 
-bool lgrt_atomic_compare_exchange_1(volatile void *ptr, void *expected, uint8_t desired, int success, int failure) {
+bool lgrt_atomic_compare_exchange_1(
+    volatile void *ptr, void *expected, uint8_t desired, int success,
+    int failure
+) {
     if (LGRT_LOCK_FREE(1)) {
         volatile uint8_t *p = ptr;
         uint8_t e;
+        bool ok;
 
         lgrt_copy(&e, expected, 1);
-        if (__atomic_compare_exchange_n(p, &e, desired, false, success, failure)) {
+        ok = __atomic_compare_exchange_n(
+            p, &e, desired, false, success, failure
+        );
+        if (ok) {
             return true;
         }
         lgrt_copy(expected, &e, 1);
@@ -2649,14 +2907,21 @@ bool lgrt_atomic_compare_exchange_1(volatile void *ptr, void *expected, uint8_t 
     return lgrt_locked_compare_exchange(1, ptr, expected, &desired);
 }
 
-bool lgrt_atomic_compare_exchange_2(volatile void *ptr, void *expected, uint16_t desired, int success, int failure) {
+bool lgrt_atomic_compare_exchange_2(
+    volatile void *ptr, void *expected, uint16_t desired, int success,
+    int failure
+) {
     if (LGRT_LOCK_FREE(2)) {
         if (lgrt_aligned(ptr, 2)) {
             volatile lgrt_atomic_u16 *p = ptr;
             lgrt_atomic_u16 e;
+            bool ok;
 
             lgrt_copy(&e, expected, 2);
-            if (__atomic_compare_exchange_n(p, &e, desired, false, success, failure)) {
+            ok = __atomic_compare_exchange_n(
+                p, &e, desired, false, success, failure
+            );
+            if (ok) {
                 return true;
             }
             lgrt_copy(expected, &e, 2);
@@ -2666,14 +2931,21 @@ bool lgrt_atomic_compare_exchange_2(volatile void *ptr, void *expected, uint16_t
     return lgrt_locked_compare_exchange(2, ptr, expected, &desired);
 }
 
-bool lgrt_atomic_compare_exchange_4(volatile void *ptr, void *expected, uint32_t desired, int success, int failure) {
+bool lgrt_atomic_compare_exchange_4(
+    volatile void *ptr, void *expected, uint32_t desired, int success,
+    int failure
+) {
     if (LGRT_LOCK_FREE(4)) {
         if (lgrt_aligned(ptr, 4)) {
             volatile lgrt_atomic_u32 *p = ptr;
             lgrt_atomic_u32 e;
+            bool ok;
 
             lgrt_copy(&e, expected, 4);
-            if (__atomic_compare_exchange_n(p, &e, desired, false, success, failure)) {
+            ok = __atomic_compare_exchange_n(
+                p, &e, desired, false, success, failure
+            );
+            if (ok) {
                 return true;
             }
             lgrt_copy(expected, &e, 4);
@@ -2683,14 +2955,21 @@ bool lgrt_atomic_compare_exchange_4(volatile void *ptr, void *expected, uint32_t
     return lgrt_locked_compare_exchange(4, ptr, expected, &desired);
 }
 
-bool lgrt_atomic_compare_exchange_8(volatile void *ptr, void *expected, uint64_t desired, int success, int failure) {
+bool lgrt_atomic_compare_exchange_8(
+    volatile void *ptr, void *expected, uint64_t desired, int success,
+    int failure
+) {
     if (LGRT_LOCK_FREE(8)) {
         if (lgrt_aligned(ptr, 8)) {
             volatile lgrt_atomic_u64 *p = ptr;
             lgrt_atomic_u64 e;
+            bool ok;
 
             lgrt_copy(&e, expected, 8);
-            if (__atomic_compare_exchange_n(p, &e, desired, false, success, failure)) {
+            ok = __atomic_compare_exchange_n(
+                p, &e, desired, false, success, failure
+            );
+            if (ok) {
                 return true;
             }
             lgrt_copy(expected, &e, 8);
@@ -2701,7 +2980,10 @@ bool lgrt_atomic_compare_exchange_8(volatile void *ptr, void *expected, uint64_t
 }
 
 #if LGRT_HAS_INT128
-bool lgrt_atomic_compare_exchange_16(volatile void *ptr, void *expected, lgrt_u128 desired, int success, int failure) {
+bool lgrt_atomic_compare_exchange_16(
+    volatile void *ptr, void *expected, lgrt_u128 desired, int success,
+    int failure
+) {
     if (LGRT_LOCK_FREE(16)) {
         if (lgrt_aligned(ptr, 16)) {
             lgrt_atomic_u128 e;
@@ -2711,7 +2993,10 @@ bool lgrt_atomic_compare_exchange_16(volatile void *ptr, void *expected, lgrt_u1
 #if LGRT_ATOMIC_HELPERS_16
             ok = lgrt_compare_exchange_16(ptr, &e, desired, success, failure);
 #else
-            ok = __atomic_compare_exchange_n((volatile lgrt_atomic_u128 *)ptr, &e, desired, false, success, failure);
+            ok = __atomic_compare_exchange_n(
+                (volatile lgrt_atomic_u128 *)ptr, &e, desired, false, success,
+                failure
+            );
 #endif
             if (!ok) {
                 lgrt_copy(expected, &e, 16);
@@ -2730,8 +3015,8 @@ bool lgrt_atomic_compare_exchange_16(volatile void *ptr, void *expected, lgrt_u1
 /*
  * These define __atomic_fetch_OP_N for each OP and N. Under the lock, values
  * narrower than int are operated on as unsigned int, as they would otherwise
- * promote to int, whose arithmetic can compile into overflow-checking calls with
- * -ftrapv.
+ * promote to int, whose arithmetic can compile into overflow-checking calls
+ * with -ftrapv.
  */
 
 #define LGRT_OP_ADD(x, v) ((x) + (v))
@@ -2741,11 +3026,17 @@ bool lgrt_atomic_compare_exchange_16(volatile void *ptr, void *expected, lgrt_u1
 #define LGRT_OP_XOR(x, v) ((x) ^ (v))
 #define LGRT_OP_NAND(x, v) (~((x) & (v)))
 
-/* fetch(op, n) names the builtin, or the function, that the lock-free path calls. */
+/*
+ * fetch(op, n) names the builtin, or the function, that the lock-free path
+ * calls.
+ */
 #define LGRT_FETCH_OP(op, apply, n, type, atomic_type, arith_type, fetch) \
-    type lgrt_atomic_fetch_##op##_##n(volatile void *ptr, type val, int model) \
-        LGRT_ASM_LABEL(__atomic_fetch_##op##_##n); \
-    type lgrt_atomic_fetch_##op##_##n(volatile void *ptr, type val, int model) { \
+    type lgrt_atomic_fetch_##op##_##n( \
+        volatile void *ptr, type val, int model \
+    ) LGRT_ASM_LABEL(__atomic_fetch_##op##_##n); \
+    type lgrt_atomic_fetch_##op##_##n( \
+        volatile void *ptr, type val, int model \
+    ) { \
         lgrt_lock_word *lock; \
         type x; \
         type y; \
@@ -2768,45 +3059,67 @@ bool lgrt_atomic_compare_exchange_16(volatile void *ptr, void *expected, lgrt_u1
 
 #if !defined(__clang__) && __GNUC__ == 16 && defined(__mips__)
 /*
- * When optimising, GCC 16 for MIPS compiles byte and halfword fetch-and-add,
- * -and, -or, and -xor into fetch-nand, so there the lock-free paths of the 1-
- * and 2-byte routines loop on compare-exchanges instead.
+ * Workaround: GCC 16, MIPS: when optimising, it compiles byte and halfword
+ * fetch-and-add, -and, -or, and -xor into fetch-nand, so there the lock-free
+ * paths of the 1- and 2-byte routines loop on compare-exchanges instead.
  */
 #define LGRT_FETCH_CAS(op, n) lgrt_cas_fetch_##op##_##n
 #define LGRT_FETCH_OP_NARROW(op, apply, n, type, atomic_type) \
-    static inline type lgrt_cas_fetch_##op##_##n(volatile atomic_type *p, type val, int model) { \
+    static inline type lgrt_cas_fetch_##op##_##n( \
+        volatile atomic_type *p, type val, int model \
+    ) { \
         atomic_type x = __atomic_load_n(p, __ATOMIC_RELAXED); \
         type y; \
+        bool done; \
         \
         do { \
             y = (type)apply((unsigned int)x, (unsigned int)val); \
-        } while (!__atomic_compare_exchange_n(p, &x, y, false, model, __ATOMIC_RELAXED)); \
+            done = __atomic_compare_exchange_n( \
+                p, &x, y, false, model, __ATOMIC_RELAXED \
+            ); \
+        } while (!done); \
         return x; \
     } \
-    LGRT_FETCH_OP(op, apply, n, type, atomic_type, unsigned int, LGRT_FETCH_CAS)
+    LGRT_FETCH_OP( \
+        op, apply, n, type, atomic_type, unsigned int, LGRT_FETCH_CAS \
+    )
 #else
 #define LGRT_FETCH_OP_NARROW(op, apply, n, type, atomic_type) \
-    LGRT_FETCH_OP(op, apply, n, type, atomic_type, unsigned int, LGRT_FETCH_BUILTIN)
+    LGRT_FETCH_OP( \
+        op, apply, n, type, atomic_type, unsigned int, LGRT_FETCH_BUILTIN \
+    )
 #endif
 
 #if LGRT_ATOMIC_HELPERS_16
 /*
- * Where the 16-byte builtins cannot be used, the lock-free paths of the 16-byte
- * routines loop on lgrt_compare_exchange_16 instead.
+ * Where the 16-byte builtins cannot be used, the lock-free paths of the
+ * 16-byte routines loop on lgrt_compare_exchange_16 instead.
  */
 #define LGRT_FETCH_HELPER(op, n) lgrt_fetch_##op##_##n
 #define LGRT_FETCH_OP_16(op, apply) \
-    static inline lgrt_u128 lgrt_fetch_##op##_16(volatile void *ptr, lgrt_u128 val, int model) { \
+    static inline lgrt_u128 lgrt_fetch_##op##_16( \
+        volatile void *ptr, lgrt_u128 val, int model \
+    ) { \
         lgrt_u128 x = lgrt_load_16(ptr, __ATOMIC_RELAXED); \
+        bool done; \
         \
-        while (!lgrt_compare_exchange_16(ptr, &x, apply(x, val), model, __ATOMIC_RELAXED)) { \
-        } \
+        do { \
+            done = lgrt_compare_exchange_16( \
+                ptr, &x, apply(x, val), model, __ATOMIC_RELAXED \
+            ); \
+        } while (!done); \
         return x; \
     } \
-    LGRT_FETCH_OP(op, apply, 16, lgrt_u128, lgrt_atomic_u128, lgrt_u128, LGRT_FETCH_HELPER)
+    LGRT_FETCH_OP( \
+        op, apply, 16, lgrt_u128, lgrt_atomic_u128, lgrt_u128, \
+        LGRT_FETCH_HELPER \
+    )
 #elif LGRT_HAS_INT128
 #define LGRT_FETCH_OP_16(op, apply) \
-    LGRT_FETCH_OP(op, apply, 16, lgrt_u128, lgrt_atomic_u128, lgrt_u128, LGRT_FETCH_BUILTIN)
+    LGRT_FETCH_OP( \
+        op, apply, 16, lgrt_u128, lgrt_atomic_u128, lgrt_u128, \
+        LGRT_FETCH_BUILTIN \
+    )
 #else
 #define LGRT_FETCH_OP_16(op, apply)
 #endif
@@ -2814,8 +3127,14 @@ bool lgrt_atomic_compare_exchange_16(volatile void *ptr, void *expected, lgrt_u1
 #define LGRT_FETCH_OPS(op, apply) \
     LGRT_FETCH_OP_NARROW(op, apply, 1, uint8_t, uint8_t) \
     LGRT_FETCH_OP_NARROW(op, apply, 2, uint16_t, lgrt_atomic_u16) \
-    LGRT_FETCH_OP(op, apply, 4, uint32_t, lgrt_atomic_u32, uint32_t, LGRT_FETCH_BUILTIN) \
-    LGRT_FETCH_OP(op, apply, 8, uint64_t, lgrt_atomic_u64, uint64_t, LGRT_FETCH_BUILTIN) \
+    LGRT_FETCH_OP( \
+        op, apply, 4, uint32_t, lgrt_atomic_u32, uint32_t, \
+        LGRT_FETCH_BUILTIN \
+    ) \
+    LGRT_FETCH_OP( \
+        op, apply, 8, uint64_t, lgrt_atomic_u64, uint64_t, \
+        LGRT_FETCH_BUILTIN \
+    ) \
     LGRT_FETCH_OP_16(op, apply)
 
 LGRT_FETCH_OPS(add, LGRT_OP_ADD)
@@ -2826,21 +3145,26 @@ LGRT_FETCH_OPS(xor, LGRT_OP_XOR)
 LGRT_FETCH_OPS(nand, LGRT_OP_NAND)
 
 /*
- * GCC for 32-bit ARM without byte compare-and-swap implements a byte
- * test-and-set as a plain load and store, or as a library call.
+ * Workaround: GCC, 32-bit ARM without byte compare-and-swap: it implements a
+ * byte test-and-set as a plain load and store, or as a library call.
  */
-#if !defined(__clang__) && defined(__arm__) && !defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1)
+#if !defined(__clang__) && defined(__arm__) \
+ && !defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1)
 #define LGRT_BROKEN_TEST_AND_SET 1
 #else
 #define LGRT_BROKEN_TEST_AND_SET 0
 #endif
 
-#if __STDC_VERSION__ >= 201112L && !LGRT_BROKEN_TEST_AND_SET && defined(__has_include)
+#if __STDC_VERSION__ >= 201112 && !LGRT_BROKEN_TEST_AND_SET \
+ && defined(__has_include)
 #if __has_include(<stdatomic.h>)
 
 #include <stdatomic.h>
 
-/* <stdatomic.h> defines these as macros, but programs may also call them as functions. */
+/*
+ * <stdatomic.h> defines these as macros, but programs may also call them as
+ * functions.
+ */
 
 #undef atomic_flag_test_and_set
 bool atomic_flag_test_and_set(volatile atomic_flag *object);
@@ -2849,8 +3173,12 @@ bool atomic_flag_test_and_set(volatile atomic_flag *object) {
 }
 
 #undef atomic_flag_test_and_set_explicit
-bool atomic_flag_test_and_set_explicit(volatile atomic_flag *object, memory_order order);
-bool atomic_flag_test_and_set_explicit(volatile atomic_flag *object, memory_order order) {
+bool atomic_flag_test_and_set_explicit(
+    volatile atomic_flag *object, memory_order order
+);
+bool atomic_flag_test_and_set_explicit(
+    volatile atomic_flag *object, memory_order order
+) {
     return __atomic_test_and_set((volatile void *)object, order);
 }
 
@@ -2861,8 +3189,12 @@ void atomic_flag_clear(volatile atomic_flag *object) {
 }
 
 #undef atomic_flag_clear_explicit
-void atomic_flag_clear_explicit(volatile atomic_flag *object, memory_order order);
-void atomic_flag_clear_explicit(volatile atomic_flag *object, memory_order order) {
+void atomic_flag_clear_explicit(
+    volatile atomic_flag *object, memory_order order
+);
+void atomic_flag_clear_explicit(
+    volatile atomic_flag *object, memory_order order
+) {
     __atomic_clear((volatile void *)object, order);
 }
 
@@ -2889,28 +3221,38 @@ void atomic_signal_fence(memory_order order) {
  * Programs set this at startup if the CPU has the Large System Extension, so
  * that the routines below use its instructions instead of exclusive loops.
  */
-extern __attribute__((__visibility__("hidden"))) _Bool __aarch64_have_lse_atomics;
-__attribute__((__visibility__("hidden"))) _Bool __aarch64_have_lse_atomics = 0;
+extern bool __aarch64_have_lse_atomics
+    __attribute__((__visibility__("hidden")));
+bool __aarch64_have_lse_atomics = false;
 
 /*
  * With outline atomics, atomic builtins compile into calls to the routines
  * below, so these use inline assembly instead. Older assemblers lack the LSE
- * mnemonics, so those instructions are encoded with .inst, on the registers the
- * arguments arrive in, bound with register variables. In hex, they are
+ * mnemonics, so those instructions are encoded with .inst, on the registers
+ * the arguments arrive in, bound with register variables. In hex, they are
  *
  *     CAS:            S8A0Rc41, with Rs = 0, Rt = 1, and Rn = 2
  *     CASP:           48A0Rc82, with Rs = 0, Rt = 2, and Rn = 4
  *     LD<op> and SWP: S8A0O020, with Rs = Rt = 0 and Rn = 1
  *
  * where S encodes the size, A and R the ordering, and O the operation. Each
- * order's row below gives A (and R), the stems of the exclusive load and store,
- * and the barrier that follows the exclusive loop.
+ * order's row below gives A (and R), the stems of the exclusive load and
+ * store, and the barrier that follows the exclusive loop.
  */
 
-/* Callers may leave garbage above narrow arguments, so the loop compares a zero-extended copy. */
-#define LGRT_AARCH64_CAS(n, type, wide, reg, sfx, size, order, lse_a, lse_r, ldx, stx, fence) \
-    type __aarch64_cas##n##_##order(type expected, type desired, volatile void *ptr); \
-    type __aarch64_cas##n##_##order(type expected, type desired, volatile void *ptr) { \
+/*
+ * Callers may leave garbage above narrow arguments, so the loop compares a
+ * zero-extended copy.
+ */
+#define LGRT_AARCH64_CAS( \
+    n, type, wide, reg, sfx, size, order, lse_a, lse_r, ldx, stx, fence \
+) \
+    type __aarch64_cas##n##_##order( \
+        type expected, type desired, volatile void *ptr \
+    ); \
+    type __aarch64_cas##n##_##order( \
+        type expected, type desired, volatile void *ptr \
+    ) { \
         uint64_t addr = (uintptr_t)ptr; \
         \
         if (__aarch64_have_lse_atomics) { \
@@ -2948,11 +3290,22 @@ __attribute__((__visibility__("hidden"))) _Bool __aarch64_have_lse_atomics = 0;
     }
 
 #define LGRT_AARCH64_CAS_ORDERS(n, type, wide, reg, sfx, size) \
-    LGRT_AARCH64_CAS(n, type, wide, reg, sfx, size, relax, "a", "7", "ldx", "stx", "") \
-    LGRT_AARCH64_CAS(n, type, wide, reg, sfx, size, acq, "e", "7", "ldax", "stx", "") \
-    LGRT_AARCH64_CAS(n, type, wide, reg, sfx, size, rel, "a", "f", "ldx", "stlx", "") \
-    LGRT_AARCH64_CAS(n, type, wide, reg, sfx, size, acq_rel, "e", "f", "ldax", "stlx", "") \
-    LGRT_AARCH64_CAS(n, type, wide, reg, sfx, size, sync, "e", "f", "ldx", "stlx", "dmb ish\n")
+    LGRT_AARCH64_CAS( \
+        n, type, wide, reg, sfx, size, relax, "a", "7", "ldx", "stx", "" \
+    ) \
+    LGRT_AARCH64_CAS( \
+        n, type, wide, reg, sfx, size, acq, "e", "7", "ldax", "stx", "" \
+    ) \
+    LGRT_AARCH64_CAS( \
+        n, type, wide, reg, sfx, size, rel, "a", "f", "ldx", "stlx", "" \
+    ) \
+    LGRT_AARCH64_CAS( \
+        n, type, wide, reg, sfx, size, acq_rel, "e", "f", "ldax", "stlx", "" \
+    ) \
+    LGRT_AARCH64_CAS( \
+        n, type, wide, reg, sfx, size, sync, "e", "f", "ldx", "stlx", \
+        "dmb ish\n" \
+    )
 
 LGRT_AARCH64_CAS_ORDERS(1, uint8_t, uint32_t, "w", "b", "0")
 LGRT_AARCH64_CAS_ORDERS(2, uint16_t, uint32_t, "w", "h", "4")
@@ -2963,8 +3316,8 @@ LGRT_AARCH64_CAS_ORDERS(8, uint64_t, uint64_t, "x", "", "c")
 
 /*
  * casp and the exclusive pair instructions hold the doubleword at the lower
- * address in the first register of a pair, which is the high half on big-endian
- * targets.
+ * address in the first register of a pair, which is the high half on
+ * big-endian targets.
  */
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
 #define LGRT_AARCH64_FIRST_SHIFT 64
@@ -2983,7 +3336,8 @@ static inline uint64_t lgrt_aarch64_second(lgrt_u128 x) {
 }
 
 static inline lgrt_u128 lgrt_aarch64_pair(uint64_t first, uint64_t second) {
-    return ((lgrt_u128)first << LGRT_AARCH64_FIRST_SHIFT) | ((lgrt_u128)second << LGRT_AARCH64_SECOND_SHIFT);
+    return ((lgrt_u128)first << LGRT_AARCH64_FIRST_SHIFT)
+        | ((lgrt_u128)second << LGRT_AARCH64_SECOND_SHIFT);
 }
 
 /*
@@ -2991,8 +3345,12 @@ static inline lgrt_u128 lgrt_aarch64_pair(uint64_t first, uint64_t second) {
  * after it succeeds, so on a mismatch the loop stores the loaded pair back.
  */
 #define LGRT_AARCH64_CAS16(order, lse_a, lse_r, ldx, stx, fence) \
-    lgrt_u128 __aarch64_cas16_##order(lgrt_u128 expected, lgrt_u128 desired, volatile void *ptr); \
-    lgrt_u128 __aarch64_cas16_##order(lgrt_u128 expected, lgrt_u128 desired, volatile void *ptr) { \
+    lgrt_u128 __aarch64_cas16_##order( \
+        lgrt_u128 expected, lgrt_u128 desired, volatile void *ptr \
+    ); \
+    lgrt_u128 __aarch64_cas16_##order( \
+        lgrt_u128 expected, lgrt_u128 desired, volatile void *ptr \
+    ) { \
         uint64_t addr = (uintptr_t)ptr; \
         uint64_t e0 = lgrt_aarch64_first(expected); \
         uint64_t e1 = lgrt_aarch64_second(expected); \
@@ -3030,8 +3388,10 @@ static inline lgrt_u128 lgrt_aarch64_pair(uint64_t first, uint64_t second) {
                 stx "p %w[status], %[n0], %[n1], [%[addr]]\n" \
                 "cbnz %w[status], 1b\n" \
                 fence \
-                : [o0] "=&r"(o0), [o1] "=&r"(o1), [n0] "=&r"(n0), [n1] "=&r"(n1), [status] "=&r"(status) \
-                : [e0] "r"(e0), [e1] "r"(e1), [d0] "r"(d0), [d1] "r"(d1), [addr] "r"(addr) \
+                : [o0] "=&r"(o0), [o1] "=&r"(o1), [n0] "=&r"(n0), \
+                    [n1] "=&r"(n1), [status] "=&r"(status) \
+                : [e0] "r"(e0), [e1] "r"(e1), [d0] "r"(d0), [d1] "r"(d1), \
+                    [addr] "r"(addr) \
                 : "cc", "memory" \
             ); \
             return lgrt_aarch64_pair(o0, o1); \
@@ -3046,7 +3406,9 @@ LGRT_AARCH64_CAS16(sync, "6", "f", "ldx", "stlx", "dmb ish\n")
 
 #endif
 
-#define LGRT_AARCH64_SWP(n, type, reg, sfx, size, order, lse_a, ldx, stx, fence) \
+#define LGRT_AARCH64_SWP( \
+    n, type, reg, sfx, size, order, lse_a, ldx, stx, fence \
+) \
     type __aarch64_swp##n##_##order(type val, volatile void *ptr); \
     type __aarch64_swp##n##_##order(type val, volatile void *ptr) { \
         uint64_t addr = (uintptr_t)ptr; \
@@ -3085,15 +3447,21 @@ LGRT_AARCH64_CAS16(sync, "6", "f", "ldx", "stlx", "dmb ish\n")
     LGRT_AARCH64_SWP(n, type, reg, sfx, size, relax, "2", "ldx", "stx", "") \
     LGRT_AARCH64_SWP(n, type, reg, sfx, size, acq, "a", "ldax", "stx", "") \
     LGRT_AARCH64_SWP(n, type, reg, sfx, size, rel, "6", "ldx", "stlx", "") \
-    LGRT_AARCH64_SWP(n, type, reg, sfx, size, acq_rel, "e", "ldax", "stlx", "") \
-    LGRT_AARCH64_SWP(n, type, reg, sfx, size, sync, "a", "ldx", "stx", "dmb ish\n")
+    LGRT_AARCH64_SWP( \
+        n, type, reg, sfx, size, acq_rel, "e", "ldax", "stlx", "" \
+    ) \
+    LGRT_AARCH64_SWP( \
+        n, type, reg, sfx, size, sync, "a", "ldx", "stx", "dmb ish\n" \
+    )
 
 LGRT_AARCH64_SWP_ORDERS(1, uint8_t, "w", "b", "3")
 LGRT_AARCH64_SWP_ORDERS(2, uint16_t, "w", "h", "7")
 LGRT_AARCH64_SWP_ORDERS(4, uint32_t, "w", "", "b")
 LGRT_AARCH64_SWP_ORDERS(8, uint64_t, "x", "", "f")
 
-#define LGRT_AARCH64_LDOP(op, opc, insn, n, type, reg, sfx, size, order, lse_a, ldx, stx, fence) \
+#define LGRT_AARCH64_LDOP( \
+    op, opc, insn, n, type, reg, sfx, size, order, lse_a, ldx, stx, fence \
+) \
     type __aarch64_##op##n##_##order(type val, volatile void *ptr); \
     type __aarch64_##op##n##_##order(type val, volatile void *ptr) { \
         uint64_t addr = (uintptr_t)ptr; \
@@ -3121,7 +3489,8 @@ LGRT_AARCH64_SWP_ORDERS(8, uint64_t, "x", "", "f")
                 stx "r" sfx " %w[status], %" reg "[next], [%[addr]]\n" \
                 "cbnz %w[status], 1b\n" \
                 fence \
-                : [old] "=&r"(old), [next] "=&r"(next), [status] "=&r"(status) \
+                : [old] "=&r"(old), [next] "=&r"(next), \
+                    [status] "=&r"(status) \
                 : [val] "r"(val), [addr] "r"(addr) \
                 : "memory" \
             ); \
@@ -3130,11 +3499,23 @@ LGRT_AARCH64_SWP_ORDERS(8, uint64_t, "x", "", "f")
     }
 
 #define LGRT_AARCH64_LDOP_ORDERS(op, opc, insn, n, type, reg, sfx, size) \
-    LGRT_AARCH64_LDOP(op, opc, insn, n, type, reg, sfx, size, relax, "2", "ldx", "stx", "") \
-    LGRT_AARCH64_LDOP(op, opc, insn, n, type, reg, sfx, size, acq, "a", "ldax", "stx", "") \
-    LGRT_AARCH64_LDOP(op, opc, insn, n, type, reg, sfx, size, rel, "6", "ldx", "stlx", "") \
-    LGRT_AARCH64_LDOP(op, opc, insn, n, type, reg, sfx, size, acq_rel, "e", "ldax", "stlx", "") \
-    LGRT_AARCH64_LDOP(op, opc, insn, n, type, reg, sfx, size, sync, "e", "ldx", "stlx", "dmb ish\n")
+    LGRT_AARCH64_LDOP( \
+        op, opc, insn, n, type, reg, sfx, size, relax, "2", "ldx", "stx", "" \
+    ) \
+    LGRT_AARCH64_LDOP( \
+        op, opc, insn, n, type, reg, sfx, size, acq, "a", "ldax", "stx", "" \
+    ) \
+    LGRT_AARCH64_LDOP( \
+        op, opc, insn, n, type, reg, sfx, size, rel, "6", "ldx", "stlx", "" \
+    ) \
+    LGRT_AARCH64_LDOP( \
+        op, opc, insn, n, type, reg, sfx, size, acq_rel, "e", "ldax", "stlx", \
+        "" \
+    ) \
+    LGRT_AARCH64_LDOP( \
+        op, opc, insn, n, type, reg, sfx, size, sync, "e", "ldx", "stlx", \
+        "dmb ish\n" \
+    )
 
 #define LGRT_AARCH64_LDOP_SIZES(op, opc, insn) \
     LGRT_AARCH64_LDOP_ORDERS(op, opc, insn, 1, uint8_t, "w", "b", "3") \
@@ -3149,16 +3530,18 @@ LGRT_AARCH64_LDOP_SIZES(ldset, "3", "orr")
 
 #endif
 
-#if defined(__riscv) && defined(__riscv_xlen) && (__riscv_xlen == 32 || __riscv_xlen == 64)
+#if defined(__riscv) && defined(__riscv_xlen) \
+ && (__riscv_xlen == 32 || __riscv_xlen == 64)
 
 /*
- * With -msave-restore, prologues call __riscv_save_N with the return address in
- * t0, and epilogues jump to __riscv_restore_N, to save and restore ra and s0 to
- * s(N - 1). The frame is laid out as the compilers' unwind information and frame
- * accesses expect: N + 1 words, rounded up to 16 bytes except with the E ABIs,
- * with ra in the top word and the s registers in order below it. Entry points
- * whose frames have the same size share code that fills the whole frame, as the
- * compilers leave the extra slots alone and the extra registers unchanged.
+ * With -msave-restore, prologues call __riscv_save_N with the return address
+ * in t0, and epilogues jump to __riscv_restore_N, to save and restore ra and
+ * s0 to s(N - 1). The frame is laid out as the compilers' unwind information
+ * and frame accesses expect: N + 1 words, rounded up to 16 bytes except with
+ * the E ABIs, with ra in the top word and the s registers in order below it.
+ * Entry points whose frames have the same size share code that fills the whole
+ * frame, as the compilers leave the extra slots alone and the extra registers
+ * unchanged.
  */
 
 #if __riscv_xlen == 64
@@ -3171,21 +3554,49 @@ LGRT_AARCH64_LDOP_SIZES(ldset, "3", "orr")
 #define LGRT_RISCV_LOAD "lw"
 #endif
 
-/* LGRT_RISCV_REGSn applies op to ra and s0 to s(n - 2), in the top n words of an f-byte frame. */
-#define LGRT_RISCV_SLOT(op, reg, f, k) op " " reg ", " #f "-" #k "*" LGRT_RISCV_WORD "(sp)\n"
+/*
+ * LGRT_RISCV_REGSn applies op to ra and s0 to s(n - 2), in the top n words of
+ * an f-byte frame.
+ */
+#define LGRT_RISCV_SLOT(op, reg, f, k) \
+    op " " reg ", " #f "-" #k "*" LGRT_RISCV_WORD "(sp)\n"
 #define LGRT_RISCV_REGS1(op, f) LGRT_RISCV_SLOT(op, "ra", f, 1)
-#define LGRT_RISCV_REGS2(op, f) LGRT_RISCV_REGS1(op, f) LGRT_RISCV_SLOT(op, "s0", f, 2)
-#define LGRT_RISCV_REGS3(op, f) LGRT_RISCV_REGS2(op, f) LGRT_RISCV_SLOT(op, "s1", f, 3)
-#define LGRT_RISCV_REGS4(op, f) LGRT_RISCV_REGS3(op, f) LGRT_RISCV_SLOT(op, "s2", f, 4)
-#define LGRT_RISCV_REGS5(op, f) LGRT_RISCV_REGS4(op, f) LGRT_RISCV_SLOT(op, "s3", f, 5)
-#define LGRT_RISCV_REGS6(op, f) LGRT_RISCV_REGS5(op, f) LGRT_RISCV_SLOT(op, "s4", f, 6)
-#define LGRT_RISCV_REGS7(op, f) LGRT_RISCV_REGS6(op, f) LGRT_RISCV_SLOT(op, "s5", f, 7)
-#define LGRT_RISCV_REGS8(op, f) LGRT_RISCV_REGS7(op, f) LGRT_RISCV_SLOT(op, "s6", f, 8)
-#define LGRT_RISCV_REGS9(op, f) LGRT_RISCV_REGS8(op, f) LGRT_RISCV_SLOT(op, "s7", f, 9)
-#define LGRT_RISCV_REGS10(op, f) LGRT_RISCV_REGS9(op, f) LGRT_RISCV_SLOT(op, "s8", f, 10)
-#define LGRT_RISCV_REGS11(op, f) LGRT_RISCV_REGS10(op, f) LGRT_RISCV_SLOT(op, "s9", f, 11)
-#define LGRT_RISCV_REGS12(op, f) LGRT_RISCV_REGS11(op, f) LGRT_RISCV_SLOT(op, "s10", f, 12)
-#define LGRT_RISCV_REGS13(op, f) LGRT_RISCV_REGS12(op, f) LGRT_RISCV_SLOT(op, "s11", f, 13)
+#define LGRT_RISCV_REGS2(op, f) \
+    LGRT_RISCV_REGS1(op, f) \
+    LGRT_RISCV_SLOT(op, "s0", f, 2)
+#define LGRT_RISCV_REGS3(op, f) \
+    LGRT_RISCV_REGS2(op, f) \
+    LGRT_RISCV_SLOT(op, "s1", f, 3)
+#define LGRT_RISCV_REGS4(op, f) \
+    LGRT_RISCV_REGS3(op, f) \
+    LGRT_RISCV_SLOT(op, "s2", f, 4)
+#define LGRT_RISCV_REGS5(op, f) \
+    LGRT_RISCV_REGS4(op, f) \
+    LGRT_RISCV_SLOT(op, "s3", f, 5)
+#define LGRT_RISCV_REGS6(op, f) \
+    LGRT_RISCV_REGS5(op, f) \
+    LGRT_RISCV_SLOT(op, "s4", f, 6)
+#define LGRT_RISCV_REGS7(op, f) \
+    LGRT_RISCV_REGS6(op, f) \
+    LGRT_RISCV_SLOT(op, "s5", f, 7)
+#define LGRT_RISCV_REGS8(op, f) \
+    LGRT_RISCV_REGS7(op, f) \
+    LGRT_RISCV_SLOT(op, "s6", f, 8)
+#define LGRT_RISCV_REGS9(op, f) \
+    LGRT_RISCV_REGS8(op, f) \
+    LGRT_RISCV_SLOT(op, "s7", f, 9)
+#define LGRT_RISCV_REGS10(op, f) \
+    LGRT_RISCV_REGS9(op, f) \
+    LGRT_RISCV_SLOT(op, "s8", f, 10)
+#define LGRT_RISCV_REGS11(op, f) \
+    LGRT_RISCV_REGS10(op, f) \
+    LGRT_RISCV_SLOT(op, "s9", f, 11)
+#define LGRT_RISCV_REGS12(op, f) \
+    LGRT_RISCV_REGS11(op, f) \
+    LGRT_RISCV_SLOT(op, "s10", f, 12)
+#define LGRT_RISCV_REGS13(op, f) \
+    LGRT_RISCV_REGS12(op, f) \
+    LGRT_RISCV_SLOT(op, "s11", f, 13)
 
 /* An entry point's code ends where the code for its frame size does. */
 #define LGRT_RISCV_ENTRY(kind, n, f) \
@@ -3193,7 +3604,8 @@ LGRT_AARCH64_LDOP_SIZES(ldset, "3", "orr")
     ".hidden __riscv_" #kind "_" #n "\n" \
     ".type __riscv_" #kind "_" #n ", @function\n" \
     "__riscv_" #kind "_" #n ":\n" \
-    ".size __riscv_" #kind "_" #n ", .Llgrt_riscv_" #kind "_" #f " - __riscv_" #kind "_" #n "\n"
+    ".size __riscv_" #kind "_" #n ", " \
+    ".Llgrt_riscv_" #kind "_" #f " - __riscv_" #kind "_" #n "\n"
 
 #define LGRT_RISCV_SAVE(f, n) \
     "addi sp, sp, -" #f "\n" \
@@ -3207,7 +3619,10 @@ LGRT_AARCH64_LDOP_SIZES(ldset, "3", "orr")
     "ret\n" \
     ".Llgrt_riscv_restore_" #f ":\n"
 
-/* Instructions need 2-byte alignment with the C extension, and 4-byte alignment without. */
+/*
+ * Instructions need 2-byte alignment with the C extension, and 4-byte
+ * alignment without.
+ */
 #if defined(__riscv_compressed)
 #define LGRT_RISCV_ALIGN ".p2align 1\n"
 #else
@@ -3215,9 +3630,10 @@ LGRT_AARCH64_LDOP_SIZES(ldset, "3", "orr")
 #endif
 
 /*
- * Each group of entry points that share code(f, n), for an f-byte frame holding
- * n registers, is a statement of its own, in a section named after its first
- * entry point, so that linking with --gc-sections drops the unused groups.
+ * Each group of entry points that share code(f, n), for an f-byte frame
+ * holding n registers, is a statement of its own, in a section named after its
+ * first entry point, so that linking with --gc-sections drops the unused
+ * groups.
  */
 #define LGRT_RISCV_GROUP(kind, first, text) \
     __asm__ ( \
@@ -3231,11 +3647,18 @@ LGRT_AARCH64_LDOP_SIZES(ldset, "3", "orr")
     LGRT_RISCV_GROUP(kind, a, LGRT_RISCV_ENTRY(kind, a, f) code(f, n))
 
 #define LGRT_RISCV_GROUP2(kind, code, a, b, f, n) \
-    LGRT_RISCV_GROUP(kind, a, LGRT_RISCV_ENTRY(kind, a, f) LGRT_RISCV_ENTRY(kind, b, f) code(f, n))
+    LGRT_RISCV_GROUP( \
+        kind, a, \
+        LGRT_RISCV_ENTRY(kind, a, f) LGRT_RISCV_ENTRY(kind, b, f) code(f, n) \
+    )
 
 #define LGRT_RISCV_GROUP4(kind, code, a, b, c, d, f, n) \
-    LGRT_RISCV_GROUP(kind, a, LGRT_RISCV_ENTRY(kind, a, f) LGRT_RISCV_ENTRY(kind, b, f) \
-        LGRT_RISCV_ENTRY(kind, c, f) LGRT_RISCV_ENTRY(kind, d, f) code(f, n))
+    LGRT_RISCV_GROUP( \
+        kind, a, \
+        LGRT_RISCV_ENTRY(kind, a, f) LGRT_RISCV_ENTRY(kind, b, f) \
+            LGRT_RISCV_ENTRY(kind, c, f) LGRT_RISCV_ENTRY(kind, d, f) \
+            code(f, n) \
+    )
 
 #if defined(__riscv_abi_rve) && __riscv_xlen == 32
 #define LGRT_RISCV_ROUTINES(kind, code) \
@@ -3271,24 +3694,32 @@ LGRT_RISCV_ROUTINES(restore, LGRT_RISCV_RESTORE)
 
 /*
  * The C23 bit utilities. Those that count or skip ones work on the complement.
- * The builtins are undefined for zero, which is handled first, and narrow types
- * promote to unsigned int, whose extra width the leading counts subtract.
+ * The builtins are undefined for zero, which is handled first, and narrow
+ * types promote to unsigned int, whose extra width the leading counts
+ * subtract.
  */
 
 #define LGRT_STDC_BITS(type) ((unsigned int)(sizeof(type) * __CHAR_BIT__))
 
-/* Expands f for each type, with the type it promotes to and that type's builtins. */
+/*
+ * Expands f for each type, with the type it promotes to and that type's
+ * builtins.
+ */
 #define LGRT_STDC_TYPES(f) \
     f(uc, unsigned char, unsigned int, __builtin_clz, __builtin_ctz) \
     f(us, unsigned short, unsigned int, __builtin_clz, __builtin_ctz) \
     f(ui, unsigned int, unsigned int, __builtin_clz, __builtin_ctz) \
     f(ul, unsigned long, unsigned long, __builtin_clzl, __builtin_ctzl) \
-    f(ull, unsigned long long, unsigned long long, __builtin_clzll, __builtin_ctzll)
+    f( \
+        ull, unsigned long long, unsigned long long, __builtin_clzll, \
+        __builtin_ctzll \
+    )
 
 /* These count the leading and trailing zeros of nonzero values. */
 #define LGRT_STDC_COUNTS(sfx, type, wide, clz, ctz) \
     static inline unsigned int lgrt_stdc_clz_##sfx(type x) { \
-        return (unsigned int)clz((wide)x) - (LGRT_STDC_BITS(wide) - LGRT_STDC_BITS(type)); \
+        return (unsigned int)clz((wide)x) \
+            - (LGRT_STDC_BITS(wide) - LGRT_STDC_BITS(type)); \
     } \
     \
     static inline unsigned int lgrt_stdc_ctz_##sfx(type x) { \
@@ -3300,7 +3731,8 @@ LGRT_STDC_TYPES(LGRT_STDC_COUNTS)
 #define LGRT_STDC_LEADING_ZEROS(sfx, type, wide, clz, ctz) \
     unsigned int stdc_leading_zeros_##sfx(type value); \
     unsigned int stdc_leading_zeros_##sfx(type value) { \
-        return value == 0 ? LGRT_STDC_BITS(type) : lgrt_stdc_clz_##sfx(value); \
+        return value == 0 ? LGRT_STDC_BITS(type) \
+            : lgrt_stdc_clz_##sfx(value); \
     }
 
 LGRT_STDC_TYPES(LGRT_STDC_LEADING_ZEROS)
@@ -3318,7 +3750,8 @@ LGRT_STDC_TYPES(LGRT_STDC_LEADING_ONES)
 #define LGRT_STDC_TRAILING_ZEROS(sfx, type, wide, clz, ctz) \
     unsigned int stdc_trailing_zeros_##sfx(type value); \
     unsigned int stdc_trailing_zeros_##sfx(type value) { \
-        return value == 0 ? LGRT_STDC_BITS(type) : lgrt_stdc_ctz_##sfx(value); \
+        return value == 0 ? LGRT_STDC_BITS(type) \
+            : lgrt_stdc_ctz_##sfx(value); \
     }
 
 LGRT_STDC_TYPES(LGRT_STDC_TRAILING_ZEROS)
@@ -3338,7 +3771,7 @@ LGRT_STDC_TYPES(LGRT_STDC_TRAILING_ONES)
     unsigned int stdc_first_leading_zero_##sfx(type value) { \
         type x = (type)~(wide)value; \
         \
-        return x == 0 ? 0u : lgrt_stdc_clz_##sfx(x) + 1u; \
+        return x == 0 ? 0 : lgrt_stdc_clz_##sfx(x) + 1; \
     }
 
 LGRT_STDC_TYPES(LGRT_STDC_FIRST_LEADING_ZERO)
@@ -3346,7 +3779,7 @@ LGRT_STDC_TYPES(LGRT_STDC_FIRST_LEADING_ZERO)
 #define LGRT_STDC_FIRST_LEADING_ONE(sfx, type, wide, clz, ctz) \
     unsigned int stdc_first_leading_one_##sfx(type value); \
     unsigned int stdc_first_leading_one_##sfx(type value) { \
-        return value == 0 ? 0u : lgrt_stdc_clz_##sfx(value) + 1u; \
+        return value == 0 ? 0 : lgrt_stdc_clz_##sfx(value) + 1; \
     }
 
 LGRT_STDC_TYPES(LGRT_STDC_FIRST_LEADING_ONE)
@@ -3356,7 +3789,7 @@ LGRT_STDC_TYPES(LGRT_STDC_FIRST_LEADING_ONE)
     unsigned int stdc_first_trailing_zero_##sfx(type value) { \
         type x = (type)~(wide)value; \
         \
-        return x == 0 ? 0u : lgrt_stdc_ctz_##sfx(x) + 1u; \
+        return x == 0 ? 0 : lgrt_stdc_ctz_##sfx(x) + 1; \
     }
 
 LGRT_STDC_TYPES(LGRT_STDC_FIRST_TRAILING_ZERO)
@@ -3364,14 +3797,15 @@ LGRT_STDC_TYPES(LGRT_STDC_FIRST_TRAILING_ZERO)
 #define LGRT_STDC_FIRST_TRAILING_ONE(sfx, type, wide, clz, ctz) \
     unsigned int stdc_first_trailing_one_##sfx(type value); \
     unsigned int stdc_first_trailing_one_##sfx(type value) { \
-        return value == 0 ? 0u : lgrt_stdc_ctz_##sfx(value) + 1u; \
+        return value == 0 ? 0 : lgrt_stdc_ctz_##sfx(value) + 1; \
     }
 
 LGRT_STDC_TYPES(LGRT_STDC_FIRST_TRAILING_ONE)
 
-#include <stdbool.h>
-
-/* Expands f for each type, with the type it promotes to and that type's popcount builtin. */
+/*
+ * Expands f for each type, with the type it promotes to and that type's
+ * popcount builtin.
+ */
 #define LGRT_STDC_POPCOUNT_TYPES(f) \
     f(uc, unsigned char, unsigned int, __builtin_popcount) \
     f(us, unsigned short, unsigned int, __builtin_popcount) \
@@ -3389,7 +3823,7 @@ LGRT_STDC_POPCOUNT_TYPES(LGRT_STDC_POPCOUNT)
 /* These give the index of the most significant one of nonzero values. */
 #define LGRT_STDC_MSB(sfx, type, wide, clz, ctz) \
     static inline unsigned int lgrt_stdc_msb_##sfx(type x) { \
-        return LGRT_STDC_BITS(wide) - 1u - (unsigned int)clz((wide)x); \
+        return LGRT_STDC_BITS(wide) - 1 - (unsigned int)clz((wide)x); \
     }
 
 LGRT_STDC_TYPES(LGRT_STDC_MSB)
@@ -3413,7 +3847,7 @@ LGRT_STDC_TYPES(LGRT_STDC_COUNT_ONES)
 #define LGRT_STDC_HAS_SINGLE_BIT(sfx, type, wide, clz, ctz) \
     bool stdc_has_single_bit_##sfx(type value); \
     bool stdc_has_single_bit_##sfx(type value) { \
-        return value != 0 && ((wide)value & ((wide)value - 1u)) == 0; \
+        return value != 0 && ((wide)value & ((wide)value - 1)) == 0; \
     }
 
 LGRT_STDC_TYPES(LGRT_STDC_HAS_SINGLE_BIT)
@@ -3421,7 +3855,7 @@ LGRT_STDC_TYPES(LGRT_STDC_HAS_SINGLE_BIT)
 #define LGRT_STDC_BIT_WIDTH(sfx, type, wide, clz, ctz) \
     unsigned int stdc_bit_width_##sfx(type value); \
     unsigned int stdc_bit_width_##sfx(type value) { \
-        return value == 0 ? 0u : lgrt_stdc_msb_##sfx(value) + 1u; \
+        return value == 0 ? 0 : lgrt_stdc_msb_##sfx(value) + 1; \
     }
 
 LGRT_STDC_TYPES(LGRT_STDC_BIT_WIDTH)
@@ -3429,19 +3863,21 @@ LGRT_STDC_TYPES(LGRT_STDC_BIT_WIDTH)
 #define LGRT_STDC_BIT_FLOOR(sfx, type, wide, clz, ctz) \
     type stdc_bit_floor_##sfx(type value); \
     type stdc_bit_floor_##sfx(type value) { \
-        return value == 0 ? 0 : (type)((wide)1 << lgrt_stdc_msb_##sfx(value)); \
+        return value == 0 ? 0 \
+            : (type)((wide)1 << lgrt_stdc_msb_##sfx(value)); \
     }
 
 LGRT_STDC_TYPES(LGRT_STDC_BIT_FLOOR)
 
 /*
- * Above 1, the result is twice the highest power of two in value - 1. Shifting 2
- * keeps the count below the width, and an unrepresentable result wraps to 0.
+ * Above 1, the result is twice the highest power of two in value - 1. Shifting
+ * 2 keeps the count below the width, and an unrepresentable result wraps to 0.
  */
 #define LGRT_STDC_BIT_CEIL(sfx, type, wide, clz, ctz) \
     type stdc_bit_ceil_##sfx(type value); \
     type stdc_bit_ceil_##sfx(type value) { \
-        return value <= 1 ? 1 : (type)((wide)2 << lgrt_stdc_msb_##sfx((type)(value - 1u))); \
+        return value <= 1 ? 1 \
+            : (type)((wide)2 << lgrt_stdc_msb_##sfx((type)(value - 1))); \
     }
 
 LGRT_STDC_TYPES(LGRT_STDC_BIT_CEIL)
@@ -3452,8 +3888,8 @@ LGRT_STDC_TYPES(LGRT_STDC_BIT_CEIL)
  * When optimising for size, Clang saves and restores the callee-saved pairs
  * r17:16 to rR:R-1 with these routines, in that order downwards from fp - 8.
  * Prologues call the save routines in the packet of their allocframe, so fp
- * already points to the new frame. Each entry point handles its highest pair and
- * falls through to the entry point for the next lower one.
+ * already points to the new frame. Each entry point handles its highest pair
+ * and falls through to the entry point for the next lower one.
  */
 
 #define LGRT_HEXAGON_ENTRY(name, end) \
@@ -3468,8 +3904,8 @@ LGRT_STDC_TYPES(LGRT_STDC_BIT_CEIL)
 
 /*
  * Defines the entry points prefix R suffix, for R from 27 down to 17, all
- * extending to end. Those above 17 apply op to their highest pair; the code for
- * r17:16 and the label end follow.
+ * extending to end. Those above 17 apply op to their highest pair; the code
+ * for r17:16 and the label end follow.
  */
 #define LGRT_HEXAGON_ENTRIES(prefix, suffix, end, op) \
     LGRT_HEXAGON_ENTRY(prefix "27" suffix, end) \
@@ -3487,17 +3923,23 @@ LGRT_STDC_TYPES(LGRT_STDC_BIT_CEIL)
 __asm__ (
     ".pushsection .text.__save_r16_through_r27,\"ax\",@progbits\n"
     ".p2align 2\n"
-    LGRT_HEXAGON_ENTRIES("__save_r16_through_r", "", ".Llgrt_hexagon_save_end", LGRT_HEXAGON_STORE)
+    LGRT_HEXAGON_ENTRIES(
+        "__save_r16_through_r", "", ".Llgrt_hexagon_save_end",
+        LGRT_HEXAGON_STORE
+    )
     "{ " LGRT_HEXAGON_STORE("r17:16", "8") "; jumpr r31 }\n"
     ".Llgrt_hexagon_save_end:\n"
     ".popsection\n"
 );
 
 __asm__ (
-    ".pushsection .text.__restore_r16_through_r27_and_deallocframe,\"ax\",@progbits\n"
+    ".pushsection "
+    ".text.__restore_r16_through_r27_and_deallocframe,\"ax\",@progbits\n"
     ".p2align 2\n"
-    LGRT_HEXAGON_ENTRIES("__restore_r16_through_r", "_and_deallocframe", ".Llgrt_hexagon_restore_end",
-        LGRT_HEXAGON_LOAD)
+    LGRT_HEXAGON_ENTRIES(
+        "__restore_r16_through_r", "_and_deallocframe",
+        ".Llgrt_hexagon_restore_end", LGRT_HEXAGON_LOAD
+    )
     "{ " LGRT_HEXAGON_LOAD("r17:16", "8") "; dealloc_return }\n"
     ".Llgrt_hexagon_restore_end:\n"
     ".popsection\n"
@@ -3505,10 +3947,14 @@ __asm__ (
 
 /* deallocframe reloads lr, so the return address waits in r28. */
 __asm__ (
-    ".pushsection .text.__restore_r16_through_r27_and_deallocframe_before_tailcall,\"ax\",@progbits\n"
+    ".pushsection "
+    ".text.__restore_r16_through_r27_and_deallocframe_before_tailcall,"
+    "\"ax\",@progbits\n"
     ".p2align 2\n"
-    LGRT_HEXAGON_ENTRIES("__restore_r16_through_r", "_and_deallocframe_before_tailcall",
-        ".Llgrt_hexagon_restore_before_tailcall_end", LGRT_HEXAGON_LOAD)
+    LGRT_HEXAGON_ENTRIES(
+        "__restore_r16_through_r", "_and_deallocframe_before_tailcall",
+        ".Llgrt_hexagon_restore_before_tailcall_end", LGRT_HEXAGON_LOAD
+    )
     "{ " LGRT_HEXAGON_LOAD("r17:16", "8") "; r28 = r31 }\n"
     "{ deallocframe; jumpr r28 }\n"
     ".Llgrt_hexagon_restore_before_tailcall_end:\n"
@@ -3593,7 +4039,9 @@ __asm__ (
 __asm__ (
     ".pushsection .text._savegpr_14,\"ax\",@progbits\n"
     ".p2align 2\n"
-    LGRT_PPC_ENTRIES("_savegpr_", "", ".Llgrt_ppc_savegpr_end", LGRT_PPC_SAVE_GPR)
+    LGRT_PPC_ENTRIES(
+        "_savegpr_", "", ".Llgrt_ppc_savegpr_end", LGRT_PPC_SAVE_GPR
+    )
     "blr\n"
     ".Llgrt_ppc_savegpr_end:\n"
     ".popsection\n"
@@ -3602,7 +4050,9 @@ __asm__ (
 __asm__ (
     ".pushsection .text._restgpr_14,\"ax\",@progbits\n"
     ".p2align 2\n"
-    LGRT_PPC_ENTRIES("_restgpr_", "", ".Llgrt_ppc_restgpr_end", LGRT_PPC_REST_GPR)
+    LGRT_PPC_ENTRIES(
+        "_restgpr_", "", ".Llgrt_ppc_restgpr_end", LGRT_PPC_REST_GPR
+    )
     "blr\n"
     ".Llgrt_ppc_restgpr_end:\n"
     ".popsection\n"
@@ -3611,7 +4061,9 @@ __asm__ (
 __asm__ (
     ".pushsection .text._restgpr_14_x,\"ax\",@progbits\n"
     ".p2align 2\n"
-    LGRT_PPC_ENTRIES("_restgpr_", "_x", ".Llgrt_ppc_restgpr_x_end", LGRT_PPC_REST_GPR)
+    LGRT_PPC_ENTRIES(
+        "_restgpr_", "_x", ".Llgrt_ppc_restgpr_x_end", LGRT_PPC_REST_GPR
+    )
     LGRT_PPC_EXIT
     ".Llgrt_ppc_restgpr_x_end:\n"
     ".popsection\n"
@@ -3625,7 +4077,9 @@ __asm__ (
 __asm__ (
     ".pushsection .text._savefpr_14,\"ax\",@progbits\n"
     ".p2align 2\n"
-    LGRT_PPC_ENTRIES("_savefpr_", "", ".Llgrt_ppc_savefpr_end", LGRT_PPC_SAVE_FPR)
+    LGRT_PPC_ENTRIES(
+        "_savefpr_", "", ".Llgrt_ppc_savefpr_end", LGRT_PPC_SAVE_FPR
+    )
     "blr\n"
     ".Llgrt_ppc_savefpr_end:\n"
     ".popsection\n"
@@ -3634,7 +4088,9 @@ __asm__ (
 __asm__ (
     ".pushsection .text._restfpr_14,\"ax\",@progbits\n"
     ".p2align 2\n"
-    LGRT_PPC_ENTRIES("_restfpr_", "", ".Llgrt_ppc_restfpr_end", LGRT_PPC_REST_FPR)
+    LGRT_PPC_ENTRIES(
+        "_restfpr_", "", ".Llgrt_ppc_restfpr_end", LGRT_PPC_REST_FPR
+    )
     "blr\n"
     ".Llgrt_ppc_restfpr_end:\n"
     ".popsection\n"
@@ -3643,7 +4099,9 @@ __asm__ (
 __asm__ (
     ".pushsection .text._restfpr_14_x,\"ax\",@progbits\n"
     ".p2align 2\n"
-    LGRT_PPC_ENTRIES("_restfpr_", "_x", ".Llgrt_ppc_restfpr_x_end", LGRT_PPC_REST_FPR)
+    LGRT_PPC_ENTRIES(
+        "_restfpr_", "_x", ".Llgrt_ppc_restfpr_x_end", LGRT_PPC_REST_FPR
+    )
     LGRT_PPC_EXIT
     ".Llgrt_ppc_restfpr_x_end:\n"
     ".popsection\n"
@@ -3654,8 +4112,8 @@ __asm__ (
 #if defined(__ALTIVEC__)
 
 /*
- * Defines the entry points prefix N, for N from 20 to 31, all extending to end,
- * each followed by op(N, v), where the slot of vN is v bytes below r0.
+ * Defines the entry points prefix N, for N from 20 to 31, all extending to
+ * end, each followed by op(N, v), where the slot of vN is v bytes below r0.
  */
 #define LGRT_PPC_VR_ENTRIES(prefix, end, op) \
     LGRT_PPC_ENTRY(prefix "20", end) \
@@ -3687,8 +4145,12 @@ __asm__ (
  * The vector loads and stores read r0 as zero in their first address operand,
  * so that operand is the offset, in r11.
  */
-#define LGRT_PPC_SAVE_VR(n, v) "li %r11, -" v "\n" "stvx %v" n ", %r11, %r0\n"
-#define LGRT_PPC_REST_VR(n, v) "li %r11, -" v "\n" "lvx %v" n ", %r11, %r0\n"
+#define LGRT_PPC_SAVE_VR(n, v) \
+    "li %r11, -" v "\n" \
+    "stvx %v" n ", %r11, %r0\n"
+#define LGRT_PPC_REST_VR(n, v) \
+    "li %r11, -" v "\n" \
+    "lvx %v" n ", %r11, %r0\n"
 
 __asm__ (
     ".pushsection .text._savevr_20,\"ax\",@progbits\n"
@@ -3713,11 +4175,11 @@ __asm__ (
 #endif
 
 /*
- * Except for the Hexagon names, these have special calling conventions, so they
- * are assembly, each changing only the registers its convention allows and
- * saving any others on the stack. The most negative value negates to itself,
- * its magnitude as an unsigned value, so the signed routines need no special
- * case for it.
+ * Except for the Hexagon names, these have special calling conventions, so
+ * they are assembly, each changing only the registers its convention allows
+ * and saving any others on the stack. The most negative value negates to
+ * itself, its magnitude as an unsigned value, so the signed routines need no
+ * special case for it.
  */
 
 #if defined(__hexagon__)
@@ -3725,36 +4187,52 @@ __asm__ (
 /* Clang calls these, with the normal calling convention, for division. */
 
 uint32_t __hexagon_udivsi3(uint32_t a, uint32_t b);
-uint32_t __hexagon_udivsi3(uint32_t a, uint32_t b) __attribute__((__alias__("__udivsi3")));
+uint32_t __hexagon_udivsi3(
+    uint32_t a, uint32_t b
+) __attribute__((__alias__("__udivsi3")));
 
 int32_t __hexagon_divsi3(int32_t a, int32_t b);
-int32_t __hexagon_divsi3(int32_t a, int32_t b) __attribute__((__alias__("__divsi3")));
+int32_t __hexagon_divsi3(
+    int32_t a, int32_t b
+) __attribute__((__alias__("__divsi3")));
 
 uint32_t __hexagon_umodsi3(uint32_t a, uint32_t b);
-uint32_t __hexagon_umodsi3(uint32_t a, uint32_t b) __attribute__((__alias__("__umodsi3")));
+uint32_t __hexagon_umodsi3(
+    uint32_t a, uint32_t b
+) __attribute__((__alias__("__umodsi3")));
 
 int32_t __hexagon_modsi3(int32_t a, int32_t b);
-int32_t __hexagon_modsi3(int32_t a, int32_t b) __attribute__((__alias__("__modsi3")));
+int32_t __hexagon_modsi3(
+    int32_t a, int32_t b
+) __attribute__((__alias__("__modsi3")));
 
 uint64_t __hexagon_udivdi3(uint64_t a, uint64_t b);
-uint64_t __hexagon_udivdi3(uint64_t a, uint64_t b) __attribute__((__alias__("__udivdi3")));
+uint64_t __hexagon_udivdi3(
+    uint64_t a, uint64_t b
+) __attribute__((__alias__("__udivdi3")));
 
 int64_t __hexagon_divdi3(int64_t a, int64_t b);
-int64_t __hexagon_divdi3(int64_t a, int64_t b) __attribute__((__alias__("__divdi3")));
+int64_t __hexagon_divdi3(
+    int64_t a, int64_t b
+) __attribute__((__alias__("__divdi3")));
 
 uint64_t __hexagon_umoddi3(uint64_t a, uint64_t b);
-uint64_t __hexagon_umoddi3(uint64_t a, uint64_t b) __attribute__((__alias__("__umoddi3")));
+uint64_t __hexagon_umoddi3(
+    uint64_t a, uint64_t b
+) __attribute__((__alias__("__umoddi3")));
 
 int64_t __hexagon_moddi3(int64_t a, int64_t b);
-int64_t __hexagon_moddi3(int64_t a, int64_t b) __attribute__((__alias__("__moddi3")));
+int64_t __hexagon_moddi3(
+    int64_t a, int64_t b
+) __attribute__((__alias__("__moddi3")));
 
 #endif
 
 #if defined(__sh__)
 
 /*
- * Called with jsr, with the dividend in r4 and the divisor in r5, returning the
- * quotient in r0, or in FPUL for the FPU variants.
+ * Called with jsr, with the dividend in r4 and the divisor in r5, returning
+ * the quotient in r0, or in FPUL for the FPU variants.
  */
 
 #define LGRT_SH_STEP(q, r, d) \
@@ -3767,8 +4245,8 @@ int64_t __hexagon_moddi3(int64_t a, int64_t b) __attribute__((__alias__("__moddi
     "1:\n"
 
 /*
- * The default strategy. These may change only r0, r1, T, PR, MACH, and MACL, so
- * __sdivsi3_i4i saves r2 on the stack.
+ * The default strategy. These may change only r0, r1, T, PR, MACH, and MACL,
+ * so __sdivsi3_i4i saves r2 on the stack.
  */
 
 __asm__ (
@@ -3828,8 +4306,8 @@ __asm__ (
 
 /*
  * For -mdiv=call-fp. __udivsi3_i4 may change r0, r1, r4, and r5. __sdivsi3_i4,
- * called through r1, must preserve r0 to r7 and T, so it saves those it uses, T
- * included. Both must keep the FPSCR mode bits, so neither touches FPSCR.
+ * called through r1, must preserve r0 to r7 and T, so it saves those it uses,
+ * T included. Both must keep the FPSCR mode bits, so neither touches FPSCR.
  */
 
 __asm__ (
@@ -3898,9 +4376,9 @@ __asm__ (
 #endif
 
 /*
- * For -mdiv=call-div1 and older CPUs. These keep the normal argument and result
- * registers, so C callers may call them too. __udivsi3 may change only r0, r1,
- * r4, T, and PR, and __sdivsi3 only r0 to r3, T, and PR.
+ * For -mdiv=call-div1 and older CPUs. These keep the normal argument and
+ * result registers, so C callers may call them too. __udivsi3 may change only
+ * r0, r1, r4, T, and PR, and __sdivsi3 only r0 to r3, T, and PR.
  */
 
 __asm__ (
@@ -3978,9 +4456,9 @@ __asm__ (
 #if defined(__hppa__) && !defined(__LP64__)
 
 /*
- * Millicode, called with bl ...,%r31, with the dividend in %r26 and the divisor
- * in %r25. These return the result in %r29 through bv %r0(%r31) and may change
- * only %r1, %r25, %r26, %r29, %r31, and the carry bits.
+ * Millicode, called with bl ...,%r31, with the dividend in %r26 and the
+ * divisor in %r25. These return the result in %r29 through bv %r0(%r31) and
+ * may change only %r1, %r25, %r26, %r29, %r31, and the carry bits.
  */
 
 #define LGRT_HPPA_STEP \
@@ -4074,12 +4552,12 @@ __asm__ (
 #undef LGRT_HPPA_STEP
 
 /*
- * Compilers call this for calls through function pointers, with
- * bl $$dyncall,%r31, the pointer in %r22, and the return address already in
- * %r2, so it branches to the function instead of returning. A pointer with bit
- * 30 set addresses, with its low two bits cleared, a descriptor holding the code
- * address and the value for %r19. It may change only %r1, %r19, %r22, and %r31,
- * and must not touch the stack.
+ * Compilers call this for calls through function pointers, with bl
+ * $$dyncall,%r31, the pointer in %r22, and the return address already in %r2,
+ * so it branches to the function instead of returning. A pointer with bit 30
+ * set addresses, with its low two bits cleared, a descriptor holding the code
+ * address and the value for %r19. It may change only %r1, %r19, %r22, and
+ * %r31, and must not touch the stack.
  */
 
 __asm__ (
@@ -4111,10 +4589,10 @@ __asm__ (
  * Called with jsr $23,($27),name, with the dividend in $24 and the divisor in
  * $25, these return the result in $27 through ret $31,($23),1 and may change
  * only $23, $27, and $28, so they save their working registers on the stack,
- * allocating the space first, as nothing below $30 is safe. The 32-bit routines
- * get sign-extended operands, of which the unsigned ones use only the low
- * halves, and return sign-extended results. They move the dividend to the high
- * half so that the 64-bit step applies.
+ * allocating the space first, as nothing below $30 is safe. The 32-bit
+ * routines get sign-extended operands, of which the unsigned ones use only the
+ * low halves, and return sign-extended results. They move the dividend to the
+ * high half so that the 64-bit step applies.
  */
 
 #define LGRT_ALPHA_PROLOGUE(name) \
@@ -4289,19 +4767,20 @@ __asm__ (
 /*
  * GCC dispatches Thumb-1 jump tables through these, calling them with bl just
  * before the table and with the case index in r0. bl does not change state on
- * ARMv4T, so they are Thumb code for that architecture, whatever state the rest
- * of the file is in. They may change only ip, lr, and the flags, so r1 waits in
- * ip while they use it.
+ * ARMv4T, so they are Thumb code for that architecture, whatever state the
+ * rest of the file is in. They may change only ip, lr, and the flags, so r1
+ * waits in ip while they use it.
  */
 
 /*
  * Each helper has a section of its own, so that linkers can drop it if unused,
- * and switches to Thumb state and unified syntax for its code, then back to the
- * file's own state and syntax. File-scope assembly starts in unified syntax with
- * Clang, in Thumb-2 state, and where GCC says so, and in divided syntax
- * otherwise.
+ * and switches to Thumb state and unified syntax for its code, then back to
+ * the file's own state and syntax. File-scope assembly starts in unified
+ * syntax with Clang, in Thumb-2 state, and where GCC says so, and in divided
+ * syntax otherwise.
  */
-#if defined(__clang__) || defined(__thumb2__) || defined(__ARM_ASM_SYNTAX_UNIFIED__)
+#if defined(__clang__) || defined(__thumb2__) \
+ || defined(__ARM_ASM_SYNTAX_UNIFIED__)
 #define LGRT_THUMB1_SYNTAX ""
 #else
 #define LGRT_THUMB1_SYNTAX ".syntax divided\n"
@@ -4330,10 +4809,10 @@ __asm__ (
     ".popsection\n"
 
 /*
- * The byte and halfword tables start at lr - 1 and hold halved distances to the
- * targets, which, doubled and added to lr, keep its Thumb bit. The signed loads
- * take only register offsets, so base points r1 where [r1, r0] addresses entry
- * r0: at the table start for bytes, and r0 bytes further for halfwords.
+ * The byte and halfword tables start at lr - 1 and hold halved distances to
+ * the targets, which, doubled and added to lr, keep its Thumb bit. The signed
+ * loads take only register offsets, so base points r1 where [r1, r0] addresses
+ * entry r0: at the table start for bytes, and r0 bytes further for halfwords.
  */
 #define LGRT_THUMB1_CASE(name, base, load) \
     LGRT_THUMB1_BEGIN(name) \
@@ -4346,8 +4825,12 @@ __asm__ (
     "bx lr\n" \
     LGRT_THUMB1_END(name)
 
-#define LGRT_THUMB1_BYTE_BASE "mov r1, lr\n" "subs r1, #1\n"
-#define LGRT_THUMB1_HALF_BASE "subs r1, r0, #1\n" "add r1, lr\n"
+#define LGRT_THUMB1_BYTE_BASE \
+    "mov r1, lr\n" \
+    "subs r1, #1\n"
+#define LGRT_THUMB1_HALF_BASE \
+    "subs r1, r0, #1\n" \
+    "add r1, lr\n"
 
 __asm__ (
     LGRT_THUMB1_CASE("__gnu_thumb1_case_uqi", LGRT_THUMB1_BYTE_BASE, "ldrb")
@@ -4367,8 +4850,8 @@ __asm__ (
 
 /*
  * The word table starts at (lr + 2) & ~3, the first word boundary at or after
- * lr - 1, and holds distances in bytes, whose sums with its start lack the Thumb
- * bit, so mov, which keeps the state, branches to them instead of bx.
+ * lr - 1, and holds distances in bytes, whose sums with its start lack the
+ * Thumb bit, so mov, which keeps the state, branches to them instead of bx.
  */
 __asm__ (
     LGRT_THUMB1_BEGIN("__gnu_thumb1_case_si")
@@ -4393,8 +4876,8 @@ __asm__ (
 
 /*
  * When optimising for size, GCC saves and restores r13 to rN in prologues and
- * epilogues with calls to these, finding r13 at sp and each further register in
- * the next word up. Each entry point handles its highest register and falls
+ * epilogues with calls to these, finding r13 at sp and each further register
+ * in the next word up. Each entry point handles its highest register and falls
  * through to the one for the next lower register. None changes the flags.
  */
 
@@ -4406,11 +4889,11 @@ __asm__ (
     ".size " name ", " end " - " name "\n"
 
 /*
- * Defines the entry points prefix N suffix, for N from LGRT_ARC_FIRST down to 14,
- * all extending to end, each followed by op(rN, d), where the slot of rN is d
- * bytes above sp. LGRT_ARC_FIRST is 25, or 15 with the reduced register file,
- * which lacks r16 to r25: the assembler would otherwise mark the object as using
- * the full register file.
+ * Defines the entry points prefix N suffix, for N from LGRT_ARC_FIRST down to
+ * 14, all extending to end, each followed by op(rN, d), where the slot of rN
+ * is d bytes above sp. LGRT_ARC_FIRST is 25, or 15 with the reduced register
+ * file, which lacks r16 to r25: the assembler would otherwise mark the object
+ * as using the full register file.
  */
 #if defined(__ARC_RF16__)
 #define LGRT_ARC_FIRST "15"
@@ -4477,14 +4960,16 @@ __asm__ (
 );
 
 /*
- * Epilogues end by jumping to these, with r12 holding the size of the frame area
- * below the saved blink, to also pop that area and blink and return to the
- * function's caller. blink is loaded before sp moves, so that the jump waits
- * less for it.
+ * Epilogues end by jumping to these, with r12 holding the size of the frame
+ * area below the saved blink, to also pop that area and blink and return to
+ * the function's caller. blink is loaded before sp moves, so that the jump
+ * waits less for it.
  */
 __asm__ (
     LGRT_ARC_SECTION("__ld_r13_to_r", "_ret")
-    LGRT_ARC_ENTRIES("__ld_r13_to_r", "_ret", ".Llgrt_arc_ld_ret_end", LGRT_ARC_LOAD)
+    LGRT_ARC_ENTRIES(
+        "__ld_r13_to_r", "_ret", ".Llgrt_arc_ld_ret_end", LGRT_ARC_LOAD
+    )
     "ld blink, [sp, r12]\n"
     LGRT_ARC_LOAD("r13", "0")
     "add sp, sp, r12\n"
