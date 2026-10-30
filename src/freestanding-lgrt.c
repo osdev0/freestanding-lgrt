@@ -16,6 +16,10 @@
 
 #if !defined(__GNUC__) && !defined(__clang__)
 #error "freestanding-lgrt requires GCC or Clang"
+#elif (defined(__clang__) && __clang_major__ < 6) \
+   || (!defined(__clang__) \
+    && (__GNUC__ < 4 || (__GNUC__ == 4 && __GNUC_MINOR__ < 8)))
+#error "freestanding-lgrt requires GCC 4.8 or later, or Clang 6 or later"
 #endif
 
 /*
@@ -45,10 +49,10 @@ __extension__ typedef unsigned __int128 lgrt_u128;
 #endif
 
 /*
- * Workaround: Clang before 10, RISC-V; Clang before 9, Hexagon; GCC, SuperH;
- * GCC 4.8, AArch64 and ARM: __builtin_trap() becomes a call to abort or an
- * instruction that does not trap, so these execute one that traps instead,
- * and spin in case it does not.
+ * Workaround: Clang before 10, RISC-V; Clang before 9, Hexagon; GCC, SuperH,
+ * OpenRISC, MicroBlaze, and Xtensa; GCC 4.8, AArch64 and ARM: __builtin_trap()
+ * becomes a call to abort or an instruction that does not trap, so these
+ * execute one that traps instead, and spin in case it does not.
  */
 #if defined(__clang__)
 #if defined(__riscv) && __clang_major__ < 10
@@ -74,7 +78,33 @@ __extension__ typedef unsigned __int128 lgrt_u128;
         for (;;) { \
         } \
     } while (0)
-#elif __GNUC__ < 4 || (__GNUC__ == 4 && __GNUC_MINOR__ < 9)
+#elif defined(__or1k__)
+/* A misaligned load from an unmapped address, as QEMU stops on l.trap. */
+#define LGRT_TRAP() \
+    do { \
+        __asm__ volatile ("l.lwz r13, -0x1012(r0)" : : : "r13"); \
+        for (;;) { \
+        } \
+    } while (0)
+#elif defined(__MICROBLAZE__)
+/*
+ * A load from an unmapped address, as the illegal instruction exception is an
+ * option of the cores.
+ */
+#define LGRT_TRAP() \
+    do { \
+        __asm__ volatile ("lwi r3, r0, -0x1012" : : : "r3"); \
+        for (;;) { \
+        } \
+    } while (0)
+#elif defined(__XTENSA__)
+#define LGRT_TRAP() \
+    do { \
+        __asm__ volatile ("ill"); \
+        for (;;) { \
+        } \
+    } while (0)
+#elif __GNUC__ == 4 && __GNUC_MINOR__ == 8
 #if defined(__aarch64__)
 #define LGRT_TRAP() \
     do { \
@@ -354,7 +384,18 @@ LGRT_AAPCS int __parityti2(lgrt_i128 a) {
 #endif
 
 static inline uint32_t lgrt_bswap32(uint32_t x) {
-    x = ((x >> 8) & 0x00ff00ff) | ((x & 0x00ff00ff) << 8);
+    uint32_t y = x;
+
+#if !defined(__clang__) && defined(__XTENSA__) && __GNUC__ >= 13
+    /*
+     * Workaround: GCC 13 to 16, Xtensa: optimising for size, it recognises the
+     * swap and calls __bswapsi2 for it, which this is part of, so the swap
+     * takes its bytes from two copies of the value, which it cannot tell are
+     * equal.
+     */
+    __asm__ ("" : "+r"(y));
+#endif
+    x = ((x >> 8) & 0x00ff00ff) | ((y & 0x00ff00ff) << 8);
     return (x >> 16) | (x << 16);
 }
 
@@ -662,6 +703,17 @@ LGRT_AAPCS int64_t __muldi3(int64_t a, int64_t b) {
     /* The cross terms only reach the high half. */
     return (int64_t)(lgrt_wide_mul32(xl, yl) + ((uint64_t)cross << 32));
 }
+
+#if defined(__XTENSA__)
+/*
+ * GCC for Xtensa calls this for the 64-bit products of 32-bit operands where
+ * the core has no instruction for their high half.
+ */
+uint64_t __umulsidi3(uint32_t a, uint32_t b);
+uint64_t __umulsidi3(uint32_t a, uint32_t b) {
+    return lgrt_wide_mul32(a, b);
+}
+#endif
 
 #endif
 
@@ -1671,11 +1723,10 @@ LGRT_AAPCS uint64_t __aeabi_idivmod(int a, int b) {
 
 /*
  * Workaround: GCC, ARM: it warns that the parameters of naked functions are
- * unused and, in older versions, that they return no value.
+ * unused.
  */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
-#pragma GCC diagnostic ignored "-Wreturn-type"
 
 LGRT_AAPCS uint64_t __aeabi_uldivmod(uint64_t a, uint64_t b);
 LGRT_AAPCS __attribute__((__naked__)) uint64_t __aeabi_uldivmod(
@@ -1769,9 +1820,9 @@ LGRT_AAPCS int64_t __aeabi_lasr(
 #define LGRT_ASM_TAIL_CALL(f) "b " f "\n"
 #endif
 
+/* Workaround: GCC, ARM: as for the division routines. */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
-#pragma GCC diagnostic ignored "-Wreturn-type"
 
 LGRT_AAPCS void __aeabi_memcpy(void *dest, const void *src, size_t n);
 LGRT_AAPCS __attribute__((__naked__)) void __aeabi_memcpy(
@@ -1959,8 +2010,7 @@ LGRT_AAPCS int __aeabi_memcmp8(
 #define LGRT_BROKEN_ATOMICS 0
 #endif
 
-#if (defined(__clang__) || __GNUC__ >= 5) \
- && defined(__GCC_ATOMIC_POINTER_LOCK_FREE) \
+#if defined(__GCC_ATOMIC_POINTER_LOCK_FREE) \
  && __GCC_ATOMIC_POINTER_LOCK_FREE == 2 && !LGRT_BROKEN_ATOMICS
 #define LGRT_HAS_ATOMICS 1
 #else
@@ -2010,11 +2060,62 @@ static inline lgrt_lock_word *lgrt_lock_of(const volatile void *ptr) {
     return &lgrt_locks[h & (LGRT_LOCK_COUNT - 1)];
 }
 
+/*
+ * Workaround: GCC before 14.4, and 15.1 and 15.2, MicroBlaze: its 4-byte
+ * compare-exchange gives back the comparison it makes, which is 0 where it
+ * succeeds, for its result, so the exchanges, the other read-modify-write
+ * operations, and test-and-set it builds on it, and those of 1 and 2 bytes,
+ * get wrong values. Those of up to 4 bytes, and the locks, are
+ * compare-exchanges of words with lwx and swx here instead.
+ */
+#if !defined(__clang__) && defined(__MICROBLAZE__) \
+ && (__GNUC__ < 14 || (__GNUC__ == 14 && __GNUC_MINOR__ < 4) \
+  || (__GNUC__ == 15 && __GNUC_MINOR__ < 3))
+#define LGRT_MICROBLAZE_CAS 1
+#else
+#define LGRT_MICROBLAZE_CAS 0
+#endif
+
+#if LGRT_MICROBLAZE_CAS
+/* The compare-exchange of an aligned word, which gives back what it found. */
+static inline uint32_t lgrt_mb_cas(
+    volatile uint32_t *word, uint32_t expected, uint32_t desired
+) {
+    uint32_t found;
+    uint32_t c;
+
+    __asm__ volatile (
+        "addc r0, r0, r0\n"
+        "1:\n"
+        "lwx %0, %2, r0\n"
+        "addic %1, r0, 0\n"
+        "bnei %1, 1b\n"
+        "cmp %1, %0, %3\n"
+        "bnei %1, 2f\n"
+        "swx %4, %2, r0\n"
+        "addic %1, r0, 0\n"
+        "bnei %1, 1b\n"
+        "2:"
+        : "=&r"(found), "=&r"(c)
+        : "r"(word), "r"(expected), "r"(desired)
+        : "cc", "memory"
+    );
+    return found;
+}
+#endif
+
 static inline void lgrt_lock(lgrt_lock_word *lock) {
+#if LGRT_MICROBLAZE_CAS
+    while (lgrt_mb_cas((volatile uint32_t *)lock, 0, 1) != 0) {
+        while (__atomic_load_n(lock, __ATOMIC_RELAXED) != 0) {
+        }
+    }
+#else
     while (__atomic_exchange_n(lock, 1, __ATOMIC_ACQUIRE) != 0) {
         while (__atomic_load_n(lock, __ATOMIC_RELAXED) != 0) {
         }
     }
+#endif
 }
 
 static inline void lgrt_unlock(lgrt_lock_word *lock) {
@@ -2063,9 +2164,78 @@ static inline void lgrt_copy(void *dest, const volatile void *src, size_t n) {
         d[i] = s[i];
     }
 }
+#elif !defined(__clang__) && defined(__sparc__) && !defined(__arch64__)
+/*
+ * GCC for 32-bit SPARC has the 8-byte loads and stores inline, as one
+ * instruction each, without the lock, so those under the lock are one
+ * instruction too, for the others not to see a value partly written.
+ */
+#define LGRT_COPY_WHOLE_8 1
+static inline void lgrt_copy(void *dest, const volatile void *src, size_t n) {
+    if (n == 8) {
+        uint64_t v;
+
+        if (lgrt_aligned(src, 8)) {
+            v = *(const volatile lgrt_atomic_u64 *)src;
+        } else {
+            __builtin_memcpy(&v, (const void *)src, 8);
+        }
+        if (lgrt_aligned(dest, 8)) {
+            *(volatile lgrt_atomic_u64 *)dest = v;
+        } else {
+            __builtin_memcpy(dest, &v, 8);
+        }
+        return;
+    }
+    __builtin_memcpy(dest, (const void *)src, n);
+}
 #else
 static inline void lgrt_copy(void *dest, const volatile void *src, size_t n) {
     __builtin_memcpy(dest, (const void *)src, n);
+}
+#endif
+
+#if LGRT_MICROBLAZE_CAS
+/*
+ * The compare-exchange of the n bytes at ptr, of up to 4, on the aligned word
+ * they are in, which writes what it found to expected where it fails.
+ */
+static inline bool lgrt_mb_compare_exchange(
+    volatile void *ptr, size_t n, void *expected, const void *desired
+) {
+    uintptr_t at = (uintptr_t)ptr & 3;
+    volatile uint32_t *word = (volatile uint32_t *)((uintptr_t)ptr - at);
+    uint32_t found = *word;
+
+    for (;;) {
+        uint32_t want = found;
+        uint32_t next = found;
+        uint32_t seen;
+
+        lgrt_copy((unsigned char *)&want + at, expected, n);
+        if (want != found) {
+            lgrt_copy(expected, (unsigned char *)&found + at, n);
+            return false;
+        }
+        lgrt_copy((unsigned char *)&next + at, desired, n);
+        seen = lgrt_mb_cas(word, found, next);
+        if (seen == found) {
+            return true;
+        }
+        found = seen;
+    }
+}
+
+/*
+ * The exchange of the n bytes at ptr, of up to 4, which writes what it found
+ * to old.
+ */
+static inline void lgrt_mb_exchange(
+    volatile void *ptr, size_t n, const void *val, void *old
+) {
+    lgrt_copy(old, ptr, n);
+    while (!lgrt_mb_compare_exchange(ptr, n, old, val)) {
+    }
 }
 #endif
 
@@ -2102,6 +2272,14 @@ static inline void lgrt_locked_exchange(
     if (val != old) {
         lgrt_copy(old, ptr, size);
         lgrt_copy((void *)ptr, val, size);
+#if defined(LGRT_COPY_WHOLE_8)
+    } else if (size == 8) {
+        uint64_t t;
+
+        lgrt_copy(&t, ptr, 8);
+        lgrt_copy((void *)ptr, val, 8);
+        lgrt_copy(old, &t, 8);
+#endif
     } else {
         unsigned char *p = (unsigned char *)ptr;
         unsigned char *o = old;
@@ -2372,86 +2550,93 @@ bool lgrt_atomic_is_lock_free(size_t size, void *ptr) {
 
 /*
  * The generic routines leave lock-free objects to the sized routines, declared
- * here and defined after them. GCC for SuperH cannot allocate registers for
- * the atomic sequences of several sizes in one function, so the sized routines
- * are never inlined.
+ * here and defined after them.
+ *
+ * Workaround: GCC 5 to 7, SuperH: at -O3, it cannot allocate registers for the
+ * atomic sequences of several sizes in one function, so the sized routines are
+ * not inlined there.
  */
+#if !defined(__clang__) && defined(__sh__) && __GNUC__ >= 5 && __GNUC__ <= 7
+#define LGRT_SIZED_NOINLINE __attribute__((__noinline__))
+#else
+#define LGRT_SIZED_NOINLINE
+#endif
 
 uint8_t lgrt_atomic_load_1(
     const volatile void *ptr, int model
-) LGRT_ASM_LABEL(__atomic_load_1) __attribute__((__noinline__));
+) LGRT_ASM_LABEL(__atomic_load_1) LGRT_SIZED_NOINLINE;
 uint16_t lgrt_atomic_load_2(
     const volatile void *ptr, int model
-) LGRT_ASM_LABEL(__atomic_load_2) __attribute__((__noinline__));
+) LGRT_ASM_LABEL(__atomic_load_2) LGRT_SIZED_NOINLINE;
 uint32_t lgrt_atomic_load_4(
     const volatile void *ptr, int model
-) LGRT_ASM_LABEL(__atomic_load_4) __attribute__((__noinline__));
+) LGRT_ASM_LABEL(__atomic_load_4) LGRT_SIZED_NOINLINE;
 uint64_t lgrt_atomic_load_8(
     const volatile void *ptr, int model
-) LGRT_ASM_LABEL(__atomic_load_8) __attribute__((__noinline__));
+) LGRT_ASM_LABEL(__atomic_load_8) LGRT_SIZED_NOINLINE;
 #if LGRT_HAS_INT128
 lgrt_u128 lgrt_atomic_load_16(
     const volatile void *ptr, int model
-) LGRT_ASM_LABEL(__atomic_load_16) __attribute__((__noinline__));
+) LGRT_ASM_LABEL(__atomic_load_16) LGRT_SIZED_NOINLINE;
 #endif
 
 void lgrt_atomic_store_1(
     volatile void *ptr, uint8_t val, int model
-) LGRT_ASM_LABEL(__atomic_store_1) __attribute__((__noinline__));
+) LGRT_ASM_LABEL(__atomic_store_1) LGRT_SIZED_NOINLINE;
 void lgrt_atomic_store_2(
     volatile void *ptr, uint16_t val, int model
-) LGRT_ASM_LABEL(__atomic_store_2) __attribute__((__noinline__));
+) LGRT_ASM_LABEL(__atomic_store_2) LGRT_SIZED_NOINLINE;
 void lgrt_atomic_store_4(
     volatile void *ptr, uint32_t val, int model
-) LGRT_ASM_LABEL(__atomic_store_4) __attribute__((__noinline__));
+) LGRT_ASM_LABEL(__atomic_store_4) LGRT_SIZED_NOINLINE;
 void lgrt_atomic_store_8(
     volatile void *ptr, uint64_t val, int model
-) LGRT_ASM_LABEL(__atomic_store_8) __attribute__((__noinline__));
+) LGRT_ASM_LABEL(__atomic_store_8) LGRT_SIZED_NOINLINE;
 #if LGRT_HAS_INT128
 void lgrt_atomic_store_16(
     volatile void *ptr, lgrt_u128 val, int model
-) LGRT_ASM_LABEL(__atomic_store_16) __attribute__((__noinline__));
+) LGRT_ASM_LABEL(__atomic_store_16) LGRT_SIZED_NOINLINE;
 #endif
 
 uint8_t lgrt_atomic_exchange_1(
     volatile void *ptr, uint8_t val, int model
-) LGRT_ASM_LABEL(__atomic_exchange_1) __attribute__((__noinline__));
+) LGRT_ASM_LABEL(__atomic_exchange_1) LGRT_SIZED_NOINLINE;
 uint16_t lgrt_atomic_exchange_2(
     volatile void *ptr, uint16_t val, int model
-) LGRT_ASM_LABEL(__atomic_exchange_2) __attribute__((__noinline__));
+) LGRT_ASM_LABEL(__atomic_exchange_2) LGRT_SIZED_NOINLINE;
 uint32_t lgrt_atomic_exchange_4(
     volatile void *ptr, uint32_t val, int model
-) LGRT_ASM_LABEL(__atomic_exchange_4) __attribute__((__noinline__));
+) LGRT_ASM_LABEL(__atomic_exchange_4) LGRT_SIZED_NOINLINE;
 uint64_t lgrt_atomic_exchange_8(
     volatile void *ptr, uint64_t val, int model
-) LGRT_ASM_LABEL(__atomic_exchange_8) __attribute__((__noinline__));
+) LGRT_ASM_LABEL(__atomic_exchange_8) LGRT_SIZED_NOINLINE;
 #if LGRT_HAS_INT128
 lgrt_u128 lgrt_atomic_exchange_16(
     volatile void *ptr, lgrt_u128 val, int model
-) LGRT_ASM_LABEL(__atomic_exchange_16) __attribute__((__noinline__));
+) LGRT_ASM_LABEL(__atomic_exchange_16) LGRT_SIZED_NOINLINE;
 #endif
 
 bool lgrt_atomic_compare_exchange_1(
     volatile void *ptr, void *expected, uint8_t desired, int success,
     int failure
-) LGRT_ASM_LABEL(__atomic_compare_exchange_1) __attribute__((__noinline__));
+) LGRT_ASM_LABEL(__atomic_compare_exchange_1) LGRT_SIZED_NOINLINE;
 bool lgrt_atomic_compare_exchange_2(
     volatile void *ptr, void *expected, uint16_t desired, int success,
     int failure
-) LGRT_ASM_LABEL(__atomic_compare_exchange_2) __attribute__((__noinline__));
+) LGRT_ASM_LABEL(__atomic_compare_exchange_2) LGRT_SIZED_NOINLINE;
 bool lgrt_atomic_compare_exchange_4(
     volatile void *ptr, void *expected, uint32_t desired, int success,
     int failure
-) LGRT_ASM_LABEL(__atomic_compare_exchange_4) __attribute__((__noinline__));
+) LGRT_ASM_LABEL(__atomic_compare_exchange_4) LGRT_SIZED_NOINLINE;
 bool lgrt_atomic_compare_exchange_8(
     volatile void *ptr, void *expected, uint64_t desired, int success,
     int failure
-) LGRT_ASM_LABEL(__atomic_compare_exchange_8) __attribute__((__noinline__));
+) LGRT_ASM_LABEL(__atomic_compare_exchange_8) LGRT_SIZED_NOINLINE;
 #if LGRT_HAS_INT128
 bool lgrt_atomic_compare_exchange_16(
     volatile void *ptr, void *expected, lgrt_u128 desired, int success,
     int failure
-) LGRT_ASM_LABEL(__atomic_compare_exchange_16) __attribute__((__noinline__));
+) LGRT_ASM_LABEL(__atomic_compare_exchange_16) LGRT_SIZED_NOINLINE;
 #endif
 
 void lgrt_atomic_load(
@@ -2723,14 +2908,45 @@ uint32_t lgrt_atomic_load_4(const volatile void *ptr, int model) {
     return v;
 }
 
+#if defined(__clang__) && __clang_major__ < 9 && defined(__i386__) \
+ && !defined(_SOFT_FLOAT)
+/*
+ * Workaround: Clang before 9, IA-32: it loads 8 bytes with cmpxchg8b, which
+ * writes, and so faults where the object is read-only, so there 8 bytes are
+ * loaded through the x87 instead, whose 8-byte loads are atomic, and exact for
+ * integers.
+ */
+#define LGRT_X87_LOAD_8 1
+
+static inline uint64_t lgrt_x87_load_8(const volatile void *ptr) {
+    uint64_t v;
+
+    __asm__ volatile (
+        "fildll %1\n"
+        "fistpll %0"
+        : "=m"(v)
+        : "m"(*(const volatile lgrt_atomic_u64 *)ptr)
+        : "memory"
+    );
+    return v;
+}
+#else
+#define LGRT_X87_LOAD_8 0
+#endif
+
 uint64_t lgrt_atomic_load_8(const volatile void *ptr, int model) {
     uint64_t v;
 
     if (LGRT_LOCK_FREE(8)) {
         if (lgrt_aligned(ptr, 8)) {
+#if LGRT_X87_LOAD_8
+            (void)model;
+            return lgrt_x87_load_8(ptr);
+#else
             return __atomic_load_n(
                 (const volatile lgrt_atomic_u64 *)ptr, model
             );
+#endif
         }
     }
     lgrt_locked_load(8, ptr, &v);
@@ -2815,7 +3031,13 @@ uint8_t lgrt_atomic_exchange_1(volatile void *ptr, uint8_t val, int model) {
     uint8_t old;
 
     if (LGRT_LOCK_FREE(1)) {
+#if LGRT_MICROBLAZE_CAS
+        (void)model;
+        lgrt_mb_exchange(ptr, 1, &val, &old);
+        return old;
+#else
         return __atomic_exchange_n((volatile uint8_t *)ptr, val, model);
+#endif
     }
     lgrt_locked_exchange(1, ptr, &val, &old);
     return old;
@@ -2826,9 +3048,15 @@ uint16_t lgrt_atomic_exchange_2(volatile void *ptr, uint16_t val, int model) {
 
     if (LGRT_LOCK_FREE(2)) {
         if (lgrt_aligned(ptr, 2)) {
+#if LGRT_MICROBLAZE_CAS
+            (void)model;
+            lgrt_mb_exchange(ptr, 2, &val, &old);
+            return old;
+#else
             return __atomic_exchange_n(
                 (volatile lgrt_atomic_u16 *)ptr, val, model
             );
+#endif
         }
     }
     lgrt_locked_exchange(2, ptr, &val, &old);
@@ -2840,9 +3068,15 @@ uint32_t lgrt_atomic_exchange_4(volatile void *ptr, uint32_t val, int model) {
 
     if (LGRT_LOCK_FREE(4)) {
         if (lgrt_aligned(ptr, 4)) {
+#if LGRT_MICROBLAZE_CAS
+            (void)model;
+            lgrt_mb_exchange(ptr, 4, &val, &old);
+            return old;
+#else
             return __atomic_exchange_n(
                 (volatile lgrt_atomic_u32 *)ptr, val, model
             );
+#endif
         }
     }
     lgrt_locked_exchange(4, ptr, &val, &old);
@@ -2890,6 +3124,11 @@ bool lgrt_atomic_compare_exchange_1(
     int failure
 ) {
     if (LGRT_LOCK_FREE(1)) {
+#if LGRT_MICROBLAZE_CAS
+        (void)success;
+        (void)failure;
+        return lgrt_mb_compare_exchange(ptr, 1, expected, &desired);
+#else
         volatile uint8_t *p = ptr;
         uint8_t e;
         bool ok;
@@ -2903,6 +3142,7 @@ bool lgrt_atomic_compare_exchange_1(
         }
         lgrt_copy(expected, &e, 1);
         return false;
+#endif
     }
     return lgrt_locked_compare_exchange(1, ptr, expected, &desired);
 }
@@ -2913,6 +3153,11 @@ bool lgrt_atomic_compare_exchange_2(
 ) {
     if (LGRT_LOCK_FREE(2)) {
         if (lgrt_aligned(ptr, 2)) {
+#if LGRT_MICROBLAZE_CAS
+            (void)success;
+            (void)failure;
+            return lgrt_mb_compare_exchange(ptr, 2, expected, &desired);
+#else
             volatile lgrt_atomic_u16 *p = ptr;
             lgrt_atomic_u16 e;
             bool ok;
@@ -2926,6 +3171,7 @@ bool lgrt_atomic_compare_exchange_2(
             }
             lgrt_copy(expected, &e, 2);
             return false;
+#endif
         }
     }
     return lgrt_locked_compare_exchange(2, ptr, expected, &desired);
@@ -2937,6 +3183,11 @@ bool lgrt_atomic_compare_exchange_4(
 ) {
     if (LGRT_LOCK_FREE(4)) {
         if (lgrt_aligned(ptr, 4)) {
+#if LGRT_MICROBLAZE_CAS
+            (void)success;
+            (void)failure;
+            return lgrt_mb_compare_exchange(ptr, 4, expected, &desired);
+#else
             volatile lgrt_atomic_u32 *p = ptr;
             lgrt_atomic_u32 e;
             bool ok;
@@ -2950,6 +3201,7 @@ bool lgrt_atomic_compare_exchange_4(
             }
             lgrt_copy(expected, &e, 4);
             return false;
+#endif
         }
     }
     return lgrt_locked_compare_exchange(4, ptr, expected, &desired);
@@ -3057,9 +3309,37 @@ bool lgrt_atomic_compare_exchange_16(
 
 #define LGRT_FETCH_BUILTIN(op, n) __atomic_fetch_##op
 
-#if !defined(__clang__) && __GNUC__ == 16 && defined(__mips__)
+#if LGRT_MICROBLAZE_CAS
 /*
- * Workaround: GCC 16, MIPS: when optimising, it compiles byte and halfword
+ * The lock-free paths of the routines of up to 4 bytes loop on
+ * lgrt_mb_compare_exchange instead.
+ */
+#define LGRT_FETCH_MB(op, n) lgrt_mb_fetch_##op##_##n
+#define LGRT_FETCH_OP_MB(op, apply, n, type, atomic_type) \
+    static inline type lgrt_mb_fetch_##op##_##n( \
+        volatile atomic_type *p, type val, int model \
+    ) { \
+        type x; \
+        type y; \
+        \
+        (void)model; \
+        lgrt_copy(&x, p, n); \
+        do { \
+            y = (type)apply((uint32_t)x, (uint32_t)val); \
+        } while (!lgrt_mb_compare_exchange(p, n, &x, &y)); \
+        return x; \
+    } \
+    LGRT_FETCH_OP( \
+        op, apply, n, type, atomic_type, uint32_t, LGRT_FETCH_MB \
+    )
+#define LGRT_FETCH_OP_NARROW(op, apply, n, type, atomic_type) \
+    LGRT_FETCH_OP_MB(op, apply, n, type, atomic_type)
+#define LGRT_FETCH_OP_4(op, apply) \
+    LGRT_FETCH_OP_MB(op, apply, 4, uint32_t, lgrt_atomic_u32)
+#elif !defined(__clang__) && __GNUC__ == 16 && __GNUC_MINOR__ == 1 \
+ && defined(__mips__)
+/*
+ * Workaround: GCC 16.1, MIPS: when optimising, it compiles byte and halfword
  * fetch-and-add, -and, -or, and -xor into fetch-nand, so there the lock-free
  * paths of the 1- and 2-byte routines loop on compare-exchanges instead.
  */
@@ -3087,6 +3367,14 @@ bool lgrt_atomic_compare_exchange_16(
 #define LGRT_FETCH_OP_NARROW(op, apply, n, type, atomic_type) \
     LGRT_FETCH_OP( \
         op, apply, n, type, atomic_type, unsigned int, LGRT_FETCH_BUILTIN \
+    )
+#endif
+
+#if !defined(LGRT_FETCH_OP_4)
+#define LGRT_FETCH_OP_4(op, apply) \
+    LGRT_FETCH_OP( \
+        op, apply, 4, uint32_t, lgrt_atomic_u32, uint32_t, \
+        LGRT_FETCH_BUILTIN \
     )
 #endif
 
@@ -3127,10 +3415,7 @@ bool lgrt_atomic_compare_exchange_16(
 #define LGRT_FETCH_OPS(op, apply) \
     LGRT_FETCH_OP_NARROW(op, apply, 1, uint8_t, uint8_t) \
     LGRT_FETCH_OP_NARROW(op, apply, 2, uint16_t, lgrt_atomic_u16) \
-    LGRT_FETCH_OP( \
-        op, apply, 4, uint32_t, lgrt_atomic_u32, uint32_t, \
-        LGRT_FETCH_BUILTIN \
-    ) \
+    LGRT_FETCH_OP_4(op, apply) \
     LGRT_FETCH_OP( \
         op, apply, 8, uint64_t, lgrt_atomic_u64, uint64_t, \
         LGRT_FETCH_BUILTIN \
@@ -3169,7 +3454,14 @@ LGRT_FETCH_OPS(nand, LGRT_OP_NAND)
 #undef atomic_flag_test_and_set
 bool atomic_flag_test_and_set(volatile atomic_flag *object);
 bool atomic_flag_test_and_set(volatile atomic_flag *object) {
+#if LGRT_MICROBLAZE_CAS
+    return lgrt_atomic_exchange_1(
+        (volatile void *)object, __GCC_ATOMIC_TEST_AND_SET_TRUEVAL,
+        __ATOMIC_SEQ_CST
+    ) != 0;
+#else
     return __atomic_test_and_set((volatile void *)object, __ATOMIC_SEQ_CST);
+#endif
 }
 
 #undef atomic_flag_test_and_set_explicit
@@ -3179,7 +3471,13 @@ bool atomic_flag_test_and_set_explicit(
 bool atomic_flag_test_and_set_explicit(
     volatile atomic_flag *object, memory_order order
 ) {
+#if LGRT_MICROBLAZE_CAS
+    return lgrt_atomic_exchange_1(
+        (volatile void *)object, __GCC_ATOMIC_TEST_AND_SET_TRUEVAL, order
+    ) != 0;
+#else
     return __atomic_test_and_set((volatile void *)object, order);
+#endif
 }
 
 #undef atomic_flag_clear
@@ -4068,6 +4366,93 @@ __asm__ (
     ".Llgrt_ppc_restgpr_x_end:\n"
     ".popsection\n"
 );
+
+#if defined(__SPE__)
+
+/*
+ * GCC for SPE calls these instead: the 32-bit ones save the low halves of the
+ * registers as those above do, and the 64-bit ones the whole registers, where
+ * the hardware holds doubles in them. The offsets of evstdd and evldd cannot
+ * be negative, so r11 holds the address of the slot of r14 there, 144 bytes
+ * below the top of the frame, whatever register the routine starts at.
+ */
+
+#define LGRT_PPC_SAVE_EV(n, w, d) "evstdd %r" n ", 144-" d "(%r11)\n"
+#define LGRT_PPC_REST_EV(n, w, d) "evldd %r" n ", 144-" d "(%r11)\n"
+
+#define LGRT_PPC_EXIT_EV \
+    "lwz %r0, 148(%r11)\n" \
+    "addi %r1, %r11, 144\n" \
+    "mtlr %r0\n" \
+    "blr\n"
+
+__asm__ (
+    ".pushsection .text._save32gpr_14,\"ax\",@progbits\n"
+    ".p2align 2\n"
+    LGRT_PPC_ENTRIES(
+        "_save32gpr_", "", ".Llgrt_ppc_save32gpr_end", LGRT_PPC_SAVE_GPR
+    )
+    "blr\n"
+    ".Llgrt_ppc_save32gpr_end:\n"
+    ".popsection\n"
+);
+
+__asm__ (
+    ".pushsection .text._rest32gpr_14,\"ax\",@progbits\n"
+    ".p2align 2\n"
+    LGRT_PPC_ENTRIES(
+        "_rest32gpr_", "", ".Llgrt_ppc_rest32gpr_end", LGRT_PPC_REST_GPR
+    )
+    "blr\n"
+    ".Llgrt_ppc_rest32gpr_end:\n"
+    ".popsection\n"
+);
+
+__asm__ (
+    ".pushsection .text._rest32gpr_14_x,\"ax\",@progbits\n"
+    ".p2align 2\n"
+    LGRT_PPC_ENTRIES(
+        "_rest32gpr_", "_x", ".Llgrt_ppc_rest32gpr_x_end", LGRT_PPC_REST_GPR
+    )
+    LGRT_PPC_EXIT
+    ".Llgrt_ppc_rest32gpr_x_end:\n"
+    ".popsection\n"
+);
+
+__asm__ (
+    ".pushsection .text._save64gpr_14,\"ax\",@progbits\n"
+    ".p2align 2\n"
+    LGRT_PPC_ENTRIES(
+        "_save64gpr_", "", ".Llgrt_ppc_save64gpr_end", LGRT_PPC_SAVE_EV
+    )
+    "blr\n"
+    ".Llgrt_ppc_save64gpr_end:\n"
+    ".popsection\n"
+);
+
+__asm__ (
+    ".pushsection .text._rest64gpr_14,\"ax\",@progbits\n"
+    ".p2align 2\n"
+    LGRT_PPC_ENTRIES(
+        "_rest64gpr_", "", ".Llgrt_ppc_rest64gpr_end", LGRT_PPC_REST_EV
+    )
+    "blr\n"
+    ".Llgrt_ppc_rest64gpr_end:\n"
+    ".popsection\n"
+);
+
+__asm__ (
+    ".pushsection .text._rest64gpr_14_x,\"ax\",@progbits\n"
+    ".p2align 2\n"
+    LGRT_PPC_ENTRIES(
+        "_rest64gpr_", "_x", ".Llgrt_ppc_rest64gpr_x_end", LGRT_PPC_REST_EV
+    )
+    LGRT_PPC_EXIT_EV
+    ".Llgrt_ppc_rest64gpr_x_end:\n"
+    ".popsection\n"
+);
+
+#endif
 
 #if !defined(_SOFT_FLOAT) && !defined(__NO_FPRS__)
 
