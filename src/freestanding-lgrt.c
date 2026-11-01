@@ -2937,6 +2937,12 @@ LGRT_FP_FROM_INT(
 #define LGRT_QUAD_OWN_NAMES 1
 typedef long double lgrt_quad_value;
 #elif !LGRT_SOFT_FLOAT
+/*
+ * Workaround: GCC 9 to 16, 64-bit MIPS, -msingle-float: it moves long double
+ * with instructions that the assembler rejects, so nothing can use the type.
+ */
+#elif defined(__mips_single_float) && __LDBL_MANT_DIG__ == 113 \
+ && !defined(__clang__) && __GNUC__ >= 9
 #elif defined(__powerpc__)
 #if defined(__FLOAT128__)
 #define LGRT_SOFT_QUAD 1
@@ -4108,10 +4114,16 @@ static inline lgrt_tf_registers lgrt_tf_to_registers(struct lgrt_wide bits) {
 
 #elif LGRT_64BIT && !defined(_SOFT_FLOAT) && !defined(SOFT_FLOAT)
 
+/*
+ * Workaround: Clang 6 to 23, SPARC64: the temporaries that it passes to these
+ * routines are aligned to 8, where long double has 16.
+ */
+typedef lgrt_quad_value lgrt_quad_place __attribute__((__aligned__(8)));
+
 #define LGRT_TF_BINARY(name, value) \
     void name( \
-        lgrt_quad_value *r, const lgrt_quad_value *a, \
-        const lgrt_quad_value *b \
+        lgrt_quad_place *r, const lgrt_quad_place *a, \
+        const lgrt_quad_place *b \
     ) { \
         struct lgrt_wide x = lgrt_tf_to_bits(*a); \
         struct lgrt_wide y = lgrt_tf_to_bits(*b); \
@@ -4120,7 +4132,7 @@ static inline lgrt_tf_registers lgrt_tf_to_registers(struct lgrt_wide bits) {
     }
 
 #define LGRT_TF_RELATION(name, value) \
-    lgrt_fp_cmp name(const lgrt_quad_value *a, const lgrt_quad_value *b) { \
+    lgrt_fp_cmp name(const lgrt_quad_place *a, const lgrt_quad_place *b) { \
         struct lgrt_wide x = lgrt_tf_to_bits(*a); \
         struct lgrt_wide y = lgrt_tf_to_bits(*b); \
         \
@@ -4128,12 +4140,12 @@ static inline lgrt_tf_registers lgrt_tf_to_registers(struct lgrt_wide bits) {
     }
 
 #define LGRT_TF_FROM(name, P, value) \
-    void name(lgrt_quad_value *r, P i) { \
+    void name(lgrt_quad_place *r, P i) { \
         *r = lgrt_tf_from_bits(value); \
     }
 
 #define LGRT_TF_TO(name, R, value) \
-    R name(const lgrt_quad_value *a) { \
+    R name(const lgrt_quad_place *a) { \
         struct lgrt_wide x = lgrt_tf_to_bits(*a); \
         \
         return value; \
@@ -4331,7 +4343,7 @@ LGRT_TF_TO(_Qp_qtoui, uint32_t, lgrt_tf_wrap_si(x))
 LGRT_TF_TO(_Qp_qtox, int64_t, lgrt_tf_to_di(x))
 LGRT_TF_TO(_Qp_qtoux, uint64_t, lgrt_tf_wrap_di(x))
 
-void _Qp_sqrt(lgrt_quad_value *r, const lgrt_quad_value *a) {
+void _Qp_sqrt(lgrt_quad_place *r, const lgrt_quad_place *a) {
     *r = lgrt_tf_from_bits(lgrt_tf_sqrt(lgrt_tf_to_bits(*a)));
 }
 
@@ -6813,6 +6825,11 @@ LGRT_HC_ROUTINE(
  * out is the default one.
  */
 
+/* Workaround: GCC 7, SPE: at -O0, a parameter of this type comes out wrong. */
+#if defined(__SPE__) && __GNUC__ == 7 && !defined(__OPTIMIZE__)
+#pragma GCC optimize("O1")
+#endif
+
 #define LGRT_IBM_HELPER static inline __attribute__((__unused__))
 #define LGRT_IBM_SIGN LGRT_FP_SIGN(uint64_t, 11, 52)
 #define LGRT_IBM_INF LGRT_FP_INF(uint64_t, 11, 52)
@@ -6837,6 +6854,10 @@ LGRT_IBM_HELPER struct lgrt_ibm_bits lgrt_ibm_make(
 LGRT_IBM_HELPER struct lgrt_ibm_bits lgrt_ibm_to_bits(lgrt_ibm_value value) {
     struct lgrt_ibm_bits bits;
 
+#if defined(__SPE__) && __GNUC__ == 7
+    /* Workaround: GCC 7, SPE: crashes on the halves of a register value. */
+    __asm__ ("" : "+m"(value));
+#endif
     __builtin_memcpy(&bits, &value, sizeof(struct lgrt_ibm_bits));
     __asm__ ("" : "+g"(bits.high), "+g"(bits.low));
     return bits;
@@ -7022,18 +7043,31 @@ LGRT_IBM_HELPER bool lgrt_ibm_cx_less(
 
 /*
  * Adds k to the exponent of a finite value. One that reaches the subnormal
- * range of double rounds once, into the first double.
+ * range of double rounds once, into the first double: the second stands for a
+ * bit below all of those of the first, on its own side of it. What that leaves
+ * is at most half of the least double, which rounds to zero.
  */
 LGRT_IBM_HELPER struct lgrt_ibm_bits lgrt_ibm_cx_scale(
     struct lgrt_ibm_bits x, unsigned int k
 ) {
-    unsigned int field = (unsigned int)(
-        (x.high & (LGRT_IBM_SIGN - 1)) >> 52
-    );
+    uint64_t sign = x.high & LGRT_IBM_SIGN;
+    uint64_t magnitude = x.high - sign;
+    unsigned int field = (unsigned int)(magnitude >> 52);
     uint64_t high;
 
     if ((int)(field + k) <= 0) {
-        return lgrt_ibm_make(lgrt_df_cx_scale(lgrt_ibm_sticky(x), k), 0);
+        bool opposite = ((x.high ^ x.low) & LGRT_IBM_SIGN) != 0;
+        uint64_t sig;
+
+        if ((x.low & (LGRT_IBM_SIGN - 1)) == 0) {
+            return lgrt_ibm_make(lgrt_df_cx_scale(x.high, k), 0);
+        }
+        if (magnitude == 0) {
+            return lgrt_ibm_make(lgrt_df_cx_scale(x.low, k), 0);
+        }
+        sig = lgrt_df_normalise(magnitude, &field) << 3;
+        sig = opposite ? sig - 1 : sig + 1;
+        return lgrt_ibm_make(lgrt_df_round_pack(sign, field + k, sig), 0);
     }
     high = lgrt_df_cx_scale(x.high, k);
     if ((high & (LGRT_IBM_SIGN - 1)) == LGRT_IBM_INF) {
@@ -9205,6 +9239,1488 @@ lgrt_ibm_value __floattitf(LGRT_TI_PARAMETER(a)) {
 
 #endif
 
+#endif
+
+#endif
+
+/*
+ * Fixed-point arithmetic, of ISO/IEC TR 18037, where GCC has its types. Clang
+ * has them only with -ffixed-point, and then calls none of these. Each routine
+ * works on the bits of its operands, zero-extended into a word of type L, of N
+ * bits, at least as wide as int so as not to promote. w is the width of the
+ * type and f the number of its fractional bits, as the compiler defines them.
+ *
+ * Where TR 18037 leaves it open: products round to the nearest value, with
+ * ties up, and quotients toward zero; overflow without saturation wraps; a
+ * shift count that is negative, or no less than w, shifts out every bit; and a
+ * zero divisor gives the limit of the type with the sign of the dividend.
+ */
+#if !defined(__clang__) && defined(__QQ_FBIT__)
+
+#if defined(__ARM_EABI__)
+#define LGRT_FX_NAME(name) __gnu_##name
+#else
+#define LGRT_FX_NAME(name) __##name
+#endif
+
+/* Strict modes have no _Fract or _Accum, but do have constants of those. */
+__extension__ typedef __typeof__(0.5r) lgrt_fract;
+__extension__ typedef __typeof__(0.5ur) lgrt_ufract;
+__extension__ typedef __typeof__(0.5k) lgrt_accum;
+__extension__ typedef __typeof__(0.5uk) lgrt_uaccum;
+
+/* Constant operands make a conversion a few instructions, when optimising. */
+#if defined(__OPTIMIZE__)
+#define LGRT_FX_INLINE static inline __attribute__((__always_inline__))
+#else
+#define LGRT_FX_INLINE static inline
+#endif
+
+/* The number of the highest bit set in a value that is not zero. */
+#if defined(__AVR__)
+
+#define LGRT_FX_TOP_OF(N, L) \
+    static inline unsigned int lgrt_fx_top##N(L x) { \
+        unsigned int top = 0; \
+        \
+        while ((x >>= 1) != 0) { \
+            top++; \
+        } \
+        return top; \
+    }
+
+LGRT_FX_TOP_OF(16, uint16_t)
+LGRT_FX_TOP_OF(32, uint32_t)
+LGRT_FX_TOP_OF(64, uint64_t)
+
+#define LGRT_FX_TOP(N, x) lgrt_fx_top##N(x)
+
+#else
+#define LGRT_FX_TOP(N, x) (N - 1 - lgrt_clz##N(x))
+#endif
+
+/*
+ * lgrt_fx_umulN gives the high w bits of the product of two w-bit values, and
+ * its low w bits in *low. Without a type for that product, it comes from
+ * pieces of half a word each, whose products do fit, for a w that is N, the
+ * one w there is for an N above 32. Neither middle sum can overflow, as
+ * (2^(N/2) - 1)^2 + 2^(N/2) - 1 < 2^N.
+ */
+static inline uint32_t lgrt_fx_umul32(
+    uint32_t a, uint32_t b, unsigned int w, uint32_t *low
+) {
+    uint32_t mask = ~(uint32_t)0 >> (32 - w);
+    uint64_t product;
+
+    if (w <= 16) {
+        uint32_t narrow = a * b;
+
+        *low = narrow & mask;
+        return narrow >> w;
+    }
+    product = (uint64_t)a * b;
+    *low = (uint32_t)product & mask;
+    return (uint32_t)(product >> w);
+}
+
+#define LGRT_FX_UMUL_PIECES(N, L) \
+    static inline L lgrt_fx_umul##N(L a, L b, unsigned int w, L *low) { \
+        L half = ~(L)0 >> (N / 2); \
+        L a0 = a & half; \
+        L a1 = a >> (N / 2); \
+        L b0 = b & half; \
+        L b1 = b >> (N / 2); \
+        L p00 = a0 * b0; \
+        L m1 = a1 * b0 + (p00 >> (N / 2)); \
+        L m2 = a0 * b1 + (m1 & half); \
+        \
+        (void)w; \
+        *low = (m2 << (N / 2)) | (p00 & half); \
+        return a1 * b1 + (m1 >> (N / 2)) + (m2 >> (N / 2)); \
+    }
+
+#if LGRT_HAS_INT128
+static inline uint64_t lgrt_fx_umul64(
+    uint64_t a, uint64_t b, unsigned int w, uint64_t *low
+) {
+    lgrt_u128 product = (lgrt_u128)a * b;
+
+    (void)w;
+    *low = (uint64_t)product;
+    return (uint64_t)(product >> 64);
+}
+
+LGRT_FX_UMUL_PIECES(128, lgrt_u128)
+#else
+LGRT_FX_UMUL_PIECES(64, uint64_t)
+#endif
+
+/*
+ * lgrt_fx_udivN gives the low w bits of n * 2^f / d, rounded down, for a d
+ * that is not zero, and tells in *overflow whether the quotient has more bits
+ * than that. Without a type for that dividend, the bits below the integer part
+ * of the quotient come one at a time, from a remainder always below d, which
+ * goes above N bits only to go back by subtracting d.
+ */
+#if defined(__AVR__)
+
+/*
+ * Without room to spare, bit by bit, for size: the dividend leaves q at the
+ * top as the bits of the quotient enter at the bottom, for w steps, and then f
+ * zeros follow it, while q overflows. The remainder stays below d, but on its
+ * way there.
+ */
+#define LGRT_FX_UDIV_SERIAL(N, L) \
+    static inline L lgrt_fx_udiv##N( \
+        L n, L d, unsigned int w, unsigned int f, bool *overflow \
+    ) { \
+        L mask = ~(L)0 >> (N - w); \
+        L q = n << (N - w); \
+        L r = 0; \
+        bool lost = false; \
+        \
+        for (unsigned int i = w + f; i != 0; i--) { \
+            bool top = (q >> (N - 1)) != 0; \
+            bool carry = (r >> (N - 1)) != 0; \
+            \
+            q <<= 1; \
+            r <<= 1; \
+            if (i <= f) { \
+                lost = lost || top; \
+            } else if (top) { \
+                r |= 1; \
+            } \
+            if (carry || r >= d) { \
+                r -= d; \
+                q |= 1; \
+            } \
+        } \
+        *overflow = lost || (q & ~mask) != 0; \
+        return q & mask; \
+    }
+
+LGRT_FX_UDIV_SERIAL(16, uint16_t)
+LGRT_FX_UDIV_SERIAL(32, uint32_t)
+LGRT_FX_UDIV_SERIAL(64, uint64_t)
+
+#else
+
+static inline uint32_t lgrt_fx_udiv32(
+    uint32_t n, uint32_t d, unsigned int w, unsigned int f, bool *overflow
+) {
+    uint32_t mask = ~(uint32_t)0 >> (32 - w);
+    uint64_t q;
+
+    if (w + f <= 32) {
+        uint32_t narrow = (n << f) / d;
+
+        *overflow = (narrow >> w) != 0;
+        return narrow & mask;
+    }
+    q = ((uint64_t)n << f) / d;
+    *overflow = (q >> w) != 0;
+    return (uint32_t)q & mask;
+}
+
+#define LGRT_FX_UDIV_BITS(N, L) \
+    static inline L lgrt_fx_udiv##N( \
+        L n, L d, unsigned int w, unsigned int f, bool *overflow \
+    ) { \
+        L q = n / d; \
+        L r = n - q * d; \
+        \
+        (void)w; \
+        *overflow = false; \
+        for (size_t i = 0; i < f; i++) { \
+            bool carry = (r >> (N - 1)) != 0; \
+            \
+            *overflow = *overflow || (q >> (N - 1)) != 0; \
+            q <<= 1; \
+            r <<= 1; \
+            if (carry || r >= d) { \
+                r -= d; \
+                q |= 1; \
+            } \
+        } \
+        return q; \
+    }
+
+#if LGRT_HAS_INT128
+static inline uint64_t lgrt_fx_udiv64(
+    uint64_t n, uint64_t d, unsigned int w, unsigned int f, bool *overflow
+) {
+    lgrt_u128 q = ((lgrt_u128)n << f) / d;
+
+    (void)w;
+    *overflow = (uint64_t)(q >> 64) != 0;
+    return (uint64_t)q;
+}
+
+LGRT_FX_UDIV_BITS(128, lgrt_u128)
+#else
+LGRT_FX_UDIV_BITS(64, uint64_t)
+#endif
+
+#endif
+
+#define LGRT_FX_BASICS(N, L) \
+    static inline L lgrt_fx_mask##N(unsigned int w) { \
+        return ~(L)0 >> (N - w); \
+    } \
+    \
+    static inline bool lgrt_fx_sign##N(L x, unsigned int w) { \
+        return (x >> (w - 1)) != 0; \
+    } \
+    \
+    /* The bits of the most negative value, or of the most positive one. */ \
+    static inline L lgrt_fx_limit##N(bool negative, unsigned int w) { \
+        return (lgrt_fx_mask##N(w) >> 1) + (L)negative; \
+    } \
+    \
+    /* With the sign bits inverted, unsigned order is the signed order. */ \
+    static inline int lgrt_fx_cmp##N( \
+        L a, L b, unsigned int w, bool is_signed \
+    ) { \
+        L flip = is_signed ? lgrt_fx_limit##N(true, w) : 0; \
+        L x = a ^ flip; \
+        L y = b ^ flip; \
+        \
+        return x < y ? 0 : x > y ? 2 : 1; \
+    }
+
+#define LGRT_FX_ADDITION(N, L) \
+    static inline L lgrt_fx_add##N(L a, L b, unsigned int w) { \
+        return (a + b) & lgrt_fx_mask##N(w); \
+    } \
+    \
+    /* A sum that overflows has the sign that neither operand has. */ \
+    static inline L lgrt_fx_ssadd##N(L a, L b, unsigned int w) { \
+        L r = lgrt_fx_add##N(a, b, w); \
+        \
+        if (lgrt_fx_sign##N((a ^ r) & (b ^ r), w)) { \
+            return lgrt_fx_limit##N(lgrt_fx_sign##N(a, w), w); \
+        } \
+        return r; \
+    } \
+    \
+    static inline L lgrt_fx_usadd##N(L a, L b, unsigned int w) { \
+        L r = lgrt_fx_add##N(a, b, w); \
+        \
+        return r < a ? lgrt_fx_mask##N(w) : r; \
+    } \
+    \
+    static inline L lgrt_fx_sub##N(L a, L b, unsigned int w) { \
+        return (a - b) & lgrt_fx_mask##N(w); \
+    } \
+    \
+    /* A difference that overflows comes from opposite signs, and has b's. */ \
+    static inline L lgrt_fx_sssub##N(L a, L b, unsigned int w) { \
+        L r = lgrt_fx_sub##N(a, b, w); \
+        \
+        if (lgrt_fx_sign##N((a ^ b) & (a ^ r), w)) { \
+            return lgrt_fx_limit##N(lgrt_fx_sign##N(a, w), w); \
+        } \
+        return r; \
+    } \
+    \
+    static inline L lgrt_fx_ussub##N(L a, L b) { \
+        return a < b ? 0 : a - b; \
+    } \
+    \
+    static inline L lgrt_fx_neg##N(L a, unsigned int w) { \
+        return ((L)0 - a) & lgrt_fx_mask##N(w); \
+    } \
+    \
+    static inline L lgrt_fx_ssneg##N(L a, unsigned int w) { \
+        if (a == lgrt_fx_limit##N(true, w)) { \
+            return lgrt_fx_limit##N(false, w); \
+        } \
+        return lgrt_fx_neg##N(a, w); \
+    } \
+    \
+    /* The negation of an unsigned value is never above zero. */ \
+    static inline L lgrt_fx_usneg##N(L a) { \
+        (void)a; \
+        return 0; \
+    }
+
+/*
+ * A count as uint32_t puts a negative one out of range. A saturating shift has
+ * overflowed where shifting back does not give the operand.
+ */
+#define LGRT_FX_SHIFTS(N, L) \
+    static inline L lgrt_fx_ashl##N(L a, uint32_t count, unsigned int w) { \
+        return count >= w ? 0 : (a << count) & lgrt_fx_mask##N(w); \
+    } \
+    \
+    static inline L lgrt_fx_lshr##N(L a, uint32_t count, unsigned int w) { \
+        return count >= w ? 0 : a >> count; \
+    } \
+    \
+    static inline L lgrt_fx_ashr##N(L a, uint32_t count, unsigned int w) { \
+        L mask = lgrt_fx_mask##N(w); \
+        L fill = lgrt_fx_sign##N(a, w) ? mask : 0; \
+        \
+        return count >= w ? fill : (a >> count) | (fill & ~(mask >> count)); \
+    } \
+    \
+    static inline L lgrt_fx_ssashl##N(L a, uint32_t count, unsigned int w) { \
+        L r = lgrt_fx_ashl##N(a, count, w); \
+        \
+        if (lgrt_fx_ashr##N(r, count, w) != a) { \
+            return lgrt_fx_limit##N(lgrt_fx_sign##N(a, w), w); \
+        } \
+        return r; \
+    } \
+    \
+    static inline L lgrt_fx_usashl##N(L a, uint32_t count, unsigned int w) { \
+        L r = lgrt_fx_ashl##N(a, count, w); \
+        \
+        return lgrt_fx_lshr##N(r, count, w) != a ? lgrt_fx_mask##N(w) : r; \
+    }
+
+/*
+ * The high half of a signed product is that of the unsigned one, less each
+ * operand whose counterpart is negative. Adding half of the last place of the
+ * result rounds to the nearest value, with ties up. The carry out of the low
+ * half goes into the high one, and none comes out of that, as
+ * (2^w - 1)^2 + 2^(w - 1) < 2^(2w). A signed sum stays below 2^(2w - 1), so
+ * that its top bit is its sign. The result is the w bits from bit f up. A
+ * signed one has overflowed unless all above it, and its own top bit, are
+ * copies of that sign.
+ */
+#define LGRT_FX_MULTIPLICATION(N, L) \
+    static inline L lgrt_fx_mul##N( \
+        L a, L b, unsigned int w, unsigned int f, bool is_signed, \
+        bool saturating \
+    ) { \
+        L mask = lgrt_fx_mask##N(w); \
+        L half = (L)1 << (f - 1); \
+        L low; \
+        L high = lgrt_fx_umul##N(a, b, w, &low); \
+        L r; \
+        L above; \
+        bool negative; \
+        \
+        if (is_signed) { \
+            if (lgrt_fx_sign##N(a, w)) { \
+                high -= b; \
+            } \
+            if (lgrt_fx_sign##N(b, w)) { \
+                high -= a; \
+            } \
+        } \
+        low = (low + half) & mask; \
+        high = (high + (L)(low < half)) & mask; \
+        r = f == w ? high : ((high << (w - f)) | (low >> f)) & mask; \
+        if (!saturating) { \
+            return r; \
+        } \
+        above = f == w ? 0 : high >> f; \
+        if (!is_signed) { \
+            return above != 0 ? mask : r; \
+        } \
+        negative = lgrt_fx_sign##N(high, w); \
+        if (above != (negative ? mask >> f : 0) \
+         || lgrt_fx_sign##N(r, w) != negative) { \
+            return lgrt_fx_limit##N(negative, w); \
+        } \
+        return r; \
+    }
+
+/*
+ * On magnitudes, which all fit in w bits, so that a quotient rounds toward
+ * zero. The bits of the most negative value are its magnitude too, so that the
+ * limit of either sign compares with the magnitude of a quotient.
+ */
+#if defined(__AVR__)
+#define LGRT_FX_DIVISION_INLINE LGRT_FX_INLINE
+#else
+#define LGRT_FX_DIVISION_INLINE static inline
+#endif
+
+#define LGRT_FX_DIVISION(N, L) \
+    LGRT_FX_DIVISION_INLINE L lgrt_fx_div##N( \
+        L a, L b, unsigned int w, unsigned int f, bool is_signed, \
+        bool saturating \
+    ) { \
+        bool negative_a = is_signed && lgrt_fx_sign##N(a, w); \
+        bool negative_b = is_signed && lgrt_fx_sign##N(b, w); \
+        bool negative = negative_a != negative_b; \
+        L n = negative_a ? lgrt_fx_neg##N(a, w) : a; \
+        L d = negative_b ? lgrt_fx_neg##N(b, w) : b; \
+        L limit; \
+        L q; \
+        bool overflow; \
+        \
+        if (d == 0) { \
+            return is_signed ? lgrt_fx_limit##N(negative_a, w) \
+                : lgrt_fx_mask##N(w); \
+        } \
+        q = lgrt_fx_udiv##N(n, d, w, f, &overflow); \
+        if (!is_signed) { \
+            return saturating && overflow ? lgrt_fx_mask##N(w) : q; \
+        } \
+        limit = lgrt_fx_limit##N(negative, w); \
+        if (saturating && (overflow || q > limit)) { \
+            return limit; \
+        } \
+        return negative ? lgrt_fx_neg##N(q, w) : q; \
+    }
+
+#define LGRT_FX_CORE(N, L) \
+    LGRT_FX_BASICS(N, L) \
+    LGRT_FX_ADDITION(N, L) \
+    LGRT_FX_SHIFTS(N, L) \
+    LGRT_FX_MULTIPLICATION(N, L) \
+    LGRT_FX_DIVISION(N, L)
+
+#if defined(__AVR__)
+
+/*
+ * On AVR, words of 16 and 32 bits have a type for their products, which goes
+ * by magnitudes, for size. The lower half of the last place of the result goes
+ * to the nearest value, with ties up, on the magnitude of a negative value too
+ * but for the tie itself. The product and that half fit in the wider type, as
+ * (2^w - 1)^2 + 2^(w - 1) < 2^(2w).
+ */
+#define LGRT_FX_DOUBLE_WORD_PRODUCTS(N, L, D) \
+    LGRT_FX_INLINE L lgrt_fx_mul##N( \
+        L a, L b, unsigned int w, unsigned int f, bool is_signed, \
+        bool saturating \
+    ) { \
+        bool negative_a = is_signed && lgrt_fx_sign##N(a, w); \
+        bool negative_b = is_signed && lgrt_fx_sign##N(b, w); \
+        bool negative = negative_a != negative_b; \
+        L x = negative_a ? lgrt_fx_neg##N(a, w) : a; \
+        L y = negative_b ? lgrt_fx_neg##N(b, w) : b; \
+        L mask = lgrt_fx_mask##N(w); \
+        L limit = is_signed ? lgrt_fx_limit##N(negative, w) : mask; \
+        D r = (D)x * y + ((D)1 << (f - 1)) - (D)negative; \
+        \
+        r >>= f; \
+        if (saturating && r > limit) { \
+            return limit; \
+        } \
+        return (negative ? (L)0 - (L)r : (L)r) & mask; \
+    }
+
+#define LGRT_FX_SMALL_CORE(N, L, D) \
+    LGRT_FX_BASICS(N, L) \
+    LGRT_FX_ADDITION(N, L) \
+    LGRT_FX_SHIFTS(N, L) \
+    LGRT_FX_DOUBLE_WORD_PRODUCTS(N, L, D) \
+    LGRT_FX_DIVISION(N, L)
+
+LGRT_FX_SMALL_CORE(16, uint16_t, uint32_t)
+LGRT_FX_SMALL_CORE(32, uint32_t, uint64_t)
+#else
+LGRT_FX_CORE(32, uint32_t)
+#endif
+LGRT_FX_CORE(64, uint64_t)
+#if LGRT_HAS_INT128
+LGRT_FX_CORE(128, lgrt_u128)
+#endif
+
+/* The modes name the types, as not all of them have a name in C. */
+#define LGRT_FX_TYPE(m, M, base, U, N, L, W) \
+    typedef base lgrt_fx_##m __attribute__((__mode__(__##M##__))); \
+    \
+    static inline L lgrt_fx_bits_##m(lgrt_fx_##m x) { \
+        union { \
+            lgrt_fx_##m value; \
+            U bits; \
+        } pun; \
+        \
+        pun.value = x; \
+        return pun.bits & lgrt_fx_mask##N(W); \
+    } \
+    \
+    static inline lgrt_fx_##m lgrt_fx_value_##m(L x) { \
+        union { \
+            lgrt_fx_##m value; \
+            U bits; \
+        } pun; \
+        \
+        pun.bits = (U)x; \
+        return pun.value; \
+    }
+
+/* The expression of each is over x and y, or count, for the operands. */
+#define LGRT_FX_BINARY(op, m, L, expression) \
+    lgrt_fx_##m LGRT_FX_NAME(op##m##3)(lgrt_fx_##m a, lgrt_fx_##m b) { \
+        L x = lgrt_fx_bits_##m(a); \
+        L y = lgrt_fx_bits_##m(b); \
+        \
+        return lgrt_fx_value_##m(expression); \
+    }
+
+#define LGRT_FX_UNARY(op, m, L, expression) \
+    lgrt_fx_##m LGRT_FX_NAME(op##m##2)(lgrt_fx_##m a) { \
+        L x = lgrt_fx_bits_##m(a); \
+        \
+        return lgrt_fx_value_##m(expression); \
+    }
+
+/* AVR's count is the byte that the word mode there makes it. */
+#if defined(__AVR__)
+#define LGRT_FX_COUNT uint8_t
+#else
+#define LGRT_FX_COUNT int
+#endif
+
+#define LGRT_FX_SHIFT(op, m, L, expression) \
+    lgrt_fx_##m LGRT_FX_NAME(op##m##3)(lgrt_fx_##m a, LGRT_FX_COUNT b) { \
+        L x = lgrt_fx_bits_##m(a); \
+        uint32_t count = (uint32_t)b; \
+        \
+        return lgrt_fx_value_##m(expression); \
+    }
+
+/* 0 if a is below b, 2 if above, and 1 if they are equal. */
+#define LGRT_FX_COMPARE(m, N, L, W, is_signed) \
+    int LGRT_FX_NAME(cmp##m##2)(lgrt_fx_##m a, lgrt_fx_##m b) { \
+        L x = lgrt_fx_bits_##m(a); \
+        L y = lgrt_fx_bits_##m(b); \
+        \
+        return lgrt_fx_cmp##N(x, y, W, is_signed); \
+    }
+
+#define LGRT_FX_COMMON(m, N, L, W, F, is_signed) \
+    LGRT_FX_BINARY(add, m, L, lgrt_fx_add##N(x, y, W)) \
+    LGRT_FX_BINARY(sub, m, L, lgrt_fx_sub##N(x, y, W)) \
+    LGRT_FX_UNARY(neg, m, L, lgrt_fx_neg##N(x, W)) \
+    LGRT_FX_BINARY(mul, m, L, lgrt_fx_mul##N(x, y, W, F, is_signed, false)) \
+    LGRT_FX_SHIFT(ashl, m, L, lgrt_fx_ashl##N(x, count, W)) \
+    LGRT_FX_COMPARE(m, N, L, W, is_signed)
+
+#define LGRT_FX_SIGNED_ROUTINES(m, N, L, W, F) \
+    LGRT_FX_COMMON(m, N, L, W, F, true) \
+    LGRT_FX_BINARY(ssadd, m, L, lgrt_fx_ssadd##N(x, y, W)) \
+    LGRT_FX_BINARY(sssub, m, L, lgrt_fx_sssub##N(x, y, W)) \
+    LGRT_FX_UNARY(ssneg, m, L, lgrt_fx_ssneg##N(x, W)) \
+    LGRT_FX_BINARY(ssmul, m, L, lgrt_fx_mul##N(x, y, W, F, true, true)) \
+    LGRT_FX_BINARY(div, m, L, lgrt_fx_div##N(x, y, W, F, true, false)) \
+    LGRT_FX_BINARY(ssdiv, m, L, lgrt_fx_div##N(x, y, W, F, true, true)) \
+    LGRT_FX_SHIFT(ashr, m, L, lgrt_fx_ashr##N(x, count, W)) \
+    LGRT_FX_SHIFT(ssashl, m, L, lgrt_fx_ssashl##N(x, count, W))
+
+#define LGRT_FX_UNSIGNED_ROUTINES(m, N, L, W, F) \
+    LGRT_FX_COMMON(m, N, L, W, F, false) \
+    LGRT_FX_BINARY(usadd, m, L, lgrt_fx_usadd##N(x, y, W)) \
+    LGRT_FX_BINARY(ussub, m, L, lgrt_fx_ussub##N(x, y)) \
+    LGRT_FX_UNARY(usneg, m, L, lgrt_fx_usneg##N(x)) \
+    LGRT_FX_BINARY(usmul, m, L, lgrt_fx_mul##N(x, y, W, F, false, true)) \
+    LGRT_FX_BINARY(udiv, m, L, lgrt_fx_div##N(x, y, W, F, false, false)) \
+    LGRT_FX_BINARY(usdiv, m, L, lgrt_fx_div##N(x, y, W, F, false, true)) \
+    LGRT_FX_SHIFT(lshr, m, L, lgrt_fx_lshr##N(x, count, W)) \
+    LGRT_FX_SHIFT(usashl, m, L, lgrt_fx_usashl##N(x, count, W))
+
+#define LGRT_FX_SIGNED(m, M, base, U, N, L) \
+    LGRT_FX_TYPE(m, M, base, U, N, L, (__##M##_IBIT__ + __##M##_FBIT__ + 1)) \
+    LGRT_FX_SIGNED_ROUTINES( \
+        m, N, L, (__##M##_IBIT__ + __##M##_FBIT__ + 1), __##M##_FBIT__ \
+    )
+
+#define LGRT_FX_UNSIGNED(m, M, base, U, N, L) \
+    LGRT_FX_TYPE(m, M, base, U, N, L, (__##M##_IBIT__ + __##M##_FBIT__)) \
+    LGRT_FX_UNSIGNED_ROUTINES( \
+        m, N, L, (__##M##_IBIT__ + __##M##_FBIT__), __##M##_FBIT__ \
+    )
+
+#if defined(__AVR__)
+
+/*
+ * AVR passes these types as it does integers of their sizes, and has compilers
+ * call only some of their routines, with registers of their own for some. So
+ * its types are those integers, and all that tells them apart is packed in a
+ * word that takes one register pair, for routines to share their cores: the
+ * width, which leaves the low bit for signed, the fractional bits above that,
+ * and the top bit for saturating.
+ */
+#define LGRT_FX_PACK(W, F, is_signed, saturating) \
+    ((uint16_t)((W) + (uint16_t)(is_signed) + ((uint16_t)(F) << 8) \
+        + ((uint16_t)(saturating) << 15)))
+#define LGRT_FX_PACKED_W(p) ((unsigned int)(p) & 0xfe)
+#define LGRT_FX_PACKED_F(p) (((unsigned int)(p) >> 8) & 0x7f)
+#define LGRT_FX_PACKED_SIGNED(p) (((p) & 1) != 0)
+#define LGRT_FX_PACKED_SATURATING(p) (((p) >> 15) != 0)
+
+#define LGRT_FX_SHARED static __attribute__((__noinline__, __unused__))
+
+/* Types of W bits, in the word of N bits, share these. */
+#define LGRT_FX_SHARED_CORE(W, N, L) \
+    LGRT_FX_SHARED L lgrt_fx_shared_mul##W(L a, L b, uint16_t p) { \
+        return lgrt_fx_mul##N( \
+            a, b, W, LGRT_FX_PACKED_F(p), LGRT_FX_PACKED_SIGNED(p), \
+            LGRT_FX_PACKED_SATURATING(p) \
+        ); \
+    } \
+    \
+    LGRT_FX_SHARED L lgrt_fx_shared_div##W(L a, L b, uint16_t p) { \
+        return lgrt_fx_div##N( \
+            a, b, W, LGRT_FX_PACKED_F(p), LGRT_FX_PACKED_SIGNED(p), \
+            LGRT_FX_PACKED_SATURATING(p) \
+        ); \
+    } \
+    \
+    LGRT_FX_SHARED L lgrt_fx_shared_ssashl##W(L a, uint8_t n) { \
+        return lgrt_fx_ssashl##N(a, n, W); \
+    } \
+    \
+    LGRT_FX_SHARED L lgrt_fx_shared_usashl##W(L a, uint8_t n) { \
+        return lgrt_fx_usashl##N(a, n, W); \
+    }
+
+LGRT_FX_SHARED_CORE(8, 16, uint16_t)
+LGRT_FX_SHARED_CORE(16, 16, uint16_t)
+LGRT_FX_SHARED_CORE(32, 32, uint32_t)
+LGRT_FX_SHARED_CORE(64, 64, uint64_t)
+
+#define LGRT_FX_TYPE_OF(m, U, L) \
+    typedef U lgrt_fx_##m; \
+    \
+    static inline L lgrt_fx_bits_##m(U x) { \
+        return x; \
+    } \
+    \
+    static inline U lgrt_fx_value_##m(L x) { \
+        return (U)x; \
+    }
+
+/* The product or quotient of two values, by the width W of their type. */
+#define LGRT_FX_PACKED_BINARY( \
+    op, core, m, L, W, F, is_signed, saturating \
+) \
+    LGRT_FX_BINARY( \
+        op, m, L, \
+        lgrt_fx_shared_##core##W( \
+            x, y, LGRT_FX_PACK(W, F, is_signed, saturating) \
+        ) \
+    )
+
+#define LGRT_FX_SIGNED_OF(m, M, U, W, L) \
+    LGRT_FX_TYPE_OF(m, U, L) \
+    LGRT_FX_PACKED_BINARY(ssmul, mul, m, L, W, __##M##_FBIT__, true, true) \
+    LGRT_FX_PACKED_BINARY(ssdiv, div, m, L, W, __##M##_FBIT__, true, true) \
+    LGRT_FX_SHIFT(ssashl, m, L, lgrt_fx_shared_ssashl##W(x, (uint8_t)count))
+
+#define LGRT_FX_UNSIGNED_OF(m, M, U, W, L) \
+    LGRT_FX_TYPE_OF(m, U, L) \
+    LGRT_FX_PACKED_BINARY(usmul, mul, m, L, W, __##M##_FBIT__, false, true) \
+    LGRT_FX_PACKED_BINARY(usdiv, div, m, L, W, __##M##_FBIT__, false, true) \
+    LGRT_FX_SHIFT(usashl, m, L, lgrt_fx_shared_usashl##W(x, (uint8_t)count))
+
+LGRT_FX_SIGNED_OF(qq, QQ, uint8_t, 8, uint16_t)
+LGRT_FX_SIGNED_OF(hq, HQ, uint16_t, 16, uint16_t)
+LGRT_FX_SIGNED_OF(sq, SQ, uint32_t, 32, uint32_t)
+LGRT_FX_SIGNED_OF(dq, DQ, uint64_t, 64, uint64_t)
+LGRT_FX_UNSIGNED_OF(uqq, UQQ, uint8_t, 8, uint16_t)
+LGRT_FX_UNSIGNED_OF(uhq, UHQ, uint16_t, 16, uint16_t)
+LGRT_FX_UNSIGNED_OF(usq, USQ, uint32_t, 32, uint32_t)
+LGRT_FX_UNSIGNED_OF(udq, UDQ, uint64_t, 64, uint64_t)
+LGRT_FX_SIGNED_OF(ha, HA, uint16_t, 16, uint16_t)
+LGRT_FX_SIGNED_OF(sa, SA, uint32_t, 32, uint32_t)
+LGRT_FX_SIGNED_OF(da, DA, uint64_t, 64, uint64_t)
+LGRT_FX_SIGNED_OF(ta, TA, uint64_t, 64, uint64_t)
+LGRT_FX_UNSIGNED_OF(uha, UHA, uint16_t, 16, uint16_t)
+LGRT_FX_UNSIGNED_OF(usa, USA, uint32_t, 32, uint32_t)
+LGRT_FX_UNSIGNED_OF(uda, UDA, uint64_t, 64, uint64_t)
+LGRT_FX_UNSIGNED_OF(uta, UTA, uint64_t, 64, uint64_t)
+
+/* The rest of the products and quotients that have the convention of C. */
+#define LGRT_FX_PLAIN_MUL(m, M, W, L, is_signed) \
+    LGRT_FX_PACKED_BINARY(mul, mul, m, L, W, __##M##_FBIT__, is_signed, false)
+
+#define LGRT_FX_PLAIN_DIV(op, m, M, W, L, is_signed) \
+    LGRT_FX_PACKED_BINARY(op, div, m, L, W, __##M##_FBIT__, is_signed, false)
+
+#define LGRT_FX_PLAIN_MUL_DIV(op, m, M, W, L, is_signed) \
+    LGRT_FX_PLAIN_MUL(m, M, W, L, is_signed) \
+    LGRT_FX_PLAIN_DIV(op, m, M, W, L, is_signed)
+
+LGRT_FX_PLAIN_MUL_DIV(div, sq, SQ, 32, uint32_t, true)
+LGRT_FX_PLAIN_MUL_DIV(div, dq, DQ, 64, uint64_t, true)
+LGRT_FX_PLAIN_MUL_DIV(div, da, DA, 64, uint64_t, true)
+LGRT_FX_PLAIN_MUL_DIV(div, ta, TA, 64, uint64_t, true)
+LGRT_FX_PLAIN_MUL_DIV(udiv, usq, USQ, 32, uint32_t, false)
+LGRT_FX_PLAIN_MUL_DIV(udiv, udq, UDQ, 64, uint64_t, false)
+LGRT_FX_PLAIN_MUL_DIV(udiv, uda, UDA, 64, uint64_t, false)
+LGRT_FX_PLAIN_MUL_DIV(udiv, uta, UTA, 64, uint64_t, false)
+
+#if !defined(__AVR_HAVE_MUL__)
+LGRT_FX_PLAIN_MUL(hq, HQ, 16, uint16_t, true)
+LGRT_FX_PLAIN_MUL(ha, HA, 16, uint16_t, true)
+LGRT_FX_PLAIN_MUL(sa, SA, 32, uint32_t, true)
+LGRT_FX_PLAIN_MUL(uhq, UHQ, 16, uint16_t, false)
+LGRT_FX_PLAIN_MUL(uha, UHA, 16, uint16_t, false)
+LGRT_FX_PLAIN_MUL(usa, USA, 32, uint32_t, false)
+#endif
+
+/*
+ * What stdfix.h asks of the compiler. A count at or above the fractional bits
+ * leaves all of them, as a constant count does, and one that leaves no bit of
+ * value gives 0. Adding half of the last place left rounds to the nearest
+ * value, with ties up, and only overflows upwards, to the limit of the type,
+ * whose fractional bits stay. Otherwise the bits below that place go.
+ */
+#define LGRT_FX_ROUNDING(N, L) \
+    LGRT_FX_INLINE L lgrt_fx_round##N( \
+        L x, int n, unsigned int w, unsigned int f, bool is_signed \
+    ) { \
+        unsigned int count = f - (unsigned int)n; \
+        L half; \
+        L r; \
+        \
+        if (n >= (int)f) { \
+            return x; \
+        } \
+        if (count >= w - (unsigned int)is_signed) { \
+            return 0; \
+        } \
+        half = (L)1 << (count - 1); \
+        r = lgrt_fx_add##N(x, half, w); \
+        if (is_signed ? lgrt_fx_sign##N(r & ~x, w) : r < x) { \
+            return is_signed ? lgrt_fx_limit##N(false, w) \
+                : lgrt_fx_mask##N(w); \
+        } \
+        return r & ~(half + (half - 1)); \
+    }
+
+LGRT_FX_ROUNDING(16, uint16_t)
+LGRT_FX_ROUNDING(32, uint32_t)
+LGRT_FX_ROUNDING(64, uint64_t)
+
+#define LGRT_FX_SHARED_ROUND(W, N, L) \
+    LGRT_FX_SHARED L lgrt_fx_shared_round##W(L x, int n, uint16_t p) { \
+        return lgrt_fx_round##N( \
+            x, n, W, LGRT_FX_PACKED_F(p), LGRT_FX_PACKED_SIGNED(p) \
+        ); \
+    }
+
+LGRT_FX_SHARED_ROUND(8, 16, uint16_t)
+LGRT_FX_SHARED_ROUND(16, 16, uint16_t)
+LGRT_FX_SHARED_ROUND(32, 32, uint32_t)
+LGRT_FX_SHARED_ROUND(64, 64, uint64_t)
+
+#define LGRT_FX_ROUND_ROUTINE(m, M, is_signed) \
+    lgrt_fx_##m __round##m##3(lgrt_fx_##m a, int n) { \
+        return lgrt_fx_shared_round64( \
+            a, n, LGRT_FX_PACK(64, __##M##_FBIT__, is_signed, false) \
+        ); \
+    }
+
+LGRT_FX_ROUND_ROUTINE(dq, DQ, true)
+LGRT_FX_ROUND_ROUTINE(da, DA, true)
+LGRT_FX_ROUND_ROUTINE(ta, TA, true)
+LGRT_FX_ROUND_ROUTINE(udq, UDQ, false)
+LGRT_FX_ROUND_ROUTINE(uda, UDA, false)
+LGRT_FX_ROUND_ROUTINE(uta, UTA, false)
+
+/*
+ * Copies of the sign, past the first, count what a value can shift left by,
+ * and leading zeros in an unsigned value. Zero has all its bits of value.
+ */
+#define LGRT_FX_COUNTING(W, N, L) \
+    LGRT_FX_SHARED int lgrt_fx_shared_countls##W(L x, bool is_signed) { \
+        unsigned int n = W; \
+        \
+        if (is_signed && lgrt_fx_sign##N(x, W)) { \
+            x = ~x & lgrt_fx_mask##N(W); \
+        } \
+        if (x != 0) { \
+            n -= lgrt_fx_top##N(x) + 1; \
+        } \
+        return (int)(n - (unsigned int)is_signed); \
+    }
+
+LGRT_FX_COUNTING(8, 16, uint16_t)
+LGRT_FX_COUNTING(16, 16, uint16_t)
+LGRT_FX_COUNTING(32, 32, uint32_t)
+LGRT_FX_COUNTING(64, 64, uint64_t)
+
+#define LGRT_FX_COUNT_ROUTINES(mode, U, W) \
+    int __countls##mode##2(U x) { \
+        return lgrt_fx_shared_countls##W(x, true); \
+    } \
+    \
+    int __countlsu##mode##2(U x) { \
+        return lgrt_fx_shared_countls##W(x, false); \
+    }
+
+LGRT_FX_COUNT_ROUTINES(qi, uint8_t, 8)
+LGRT_FX_COUNT_ROUTINES(hi, uint16_t, 16)
+LGRT_FX_COUNT_ROUTINES(si, uint32_t, 32)
+LGRT_FX_COUNT_ROUTINES(di, uint64_t, 64)
+
+/* Values of 8 bytes, whose operations are alike in all their types. */
+#define LGRT_FX_8_BYTES_SIGNED(m) \
+    LGRT_FX_UNARY(ssneg, m, uint64_t, lgrt_fx_ssneg64(x, 64)) \
+    lgrt_fx_##m __ssabs##m##2(lgrt_fx_##m a) { \
+        return lgrt_fx_sign64(a, 64) ? lgrt_fx_ssneg64(a, 64) : a; \
+    }
+
+#define LGRT_FX_8_BYTES_UNSIGNED(m) \
+    LGRT_FX_UNARY(usneg, m, uint64_t, lgrt_fx_usneg64(x))
+
+LGRT_FX_8_BYTES_SIGNED(dq)
+LGRT_FX_8_BYTES_SIGNED(da)
+LGRT_FX_8_BYTES_SIGNED(ta)
+LGRT_FX_8_BYTES_UNSIGNED(udq)
+LGRT_FX_8_BYTES_UNSIGNED(uda)
+LGRT_FX_8_BYTES_UNSIGNED(uta)
+
+/*
+ * Reduced cores pass these in memory, and have calls with the convention of C
+ * for what the others have inline, or in registers of its own.
+ */
+#if defined(__AVR_TINY__)
+
+#define LGRT_FX_8_BYTES_COMMON(m) \
+    LGRT_FX_BINARY(add, m, uint64_t, lgrt_fx_add64(x, y, 64)) \
+    LGRT_FX_BINARY(sub, m, uint64_t, lgrt_fx_sub64(x, y, 64)) \
+    LGRT_FX_UNARY(neg, m, uint64_t, lgrt_fx_neg64(x, 64)) \
+    LGRT_FX_SHIFT(ashl, m, uint64_t, lgrt_fx_ashl64(x, count, 64))
+
+#define LGRT_FX_TINY_SIGNED(m) \
+    LGRT_FX_8_BYTES_COMMON(m) \
+    LGRT_FX_COMPARE(m, 64, uint64_t, 64, true) \
+    LGRT_FX_BINARY(ssadd, m, uint64_t, lgrt_fx_ssadd64(x, y, 64)) \
+    LGRT_FX_BINARY(sssub, m, uint64_t, lgrt_fx_sssub64(x, y, 64)) \
+    LGRT_FX_SHIFT(ashr, m, uint64_t, lgrt_fx_ashr64(x, count, 64))
+
+#define LGRT_FX_TINY_UNSIGNED(m) \
+    LGRT_FX_8_BYTES_COMMON(m) \
+    LGRT_FX_COMPARE(m, 64, uint64_t, 64, false) \
+    LGRT_FX_BINARY(usadd, m, uint64_t, lgrt_fx_usadd64(x, y, 64)) \
+    LGRT_FX_BINARY(ussub, m, uint64_t, lgrt_fx_ussub64(x, y)) \
+    LGRT_FX_SHIFT(lshr, m, uint64_t, lgrt_fx_lshr64(x, count, 64))
+
+LGRT_FX_TINY_SIGNED(dq)
+LGRT_FX_TINY_SIGNED(da)
+LGRT_FX_TINY_SIGNED(ta)
+LGRT_FX_TINY_UNSIGNED(udq)
+LGRT_FX_TINY_UNSIGNED(uda)
+LGRT_FX_TINY_UNSIGNED(uta)
+
+#endif
+
+#else
+
+LGRT_FX_SIGNED(qq, QQ, lgrt_fract, uint8_t, 32, uint32_t)
+LGRT_FX_SIGNED(hq, HQ, lgrt_fract, uint16_t, 32, uint32_t)
+LGRT_FX_SIGNED(sq, SQ, lgrt_fract, uint32_t, 32, uint32_t)
+LGRT_FX_SIGNED(dq, DQ, lgrt_fract, uint64_t, 64, uint64_t)
+LGRT_FX_UNSIGNED(uqq, UQQ, lgrt_ufract, uint8_t, 32, uint32_t)
+LGRT_FX_UNSIGNED(uhq, UHQ, lgrt_ufract, uint16_t, 32, uint32_t)
+LGRT_FX_UNSIGNED(usq, USQ, lgrt_ufract, uint32_t, 32, uint32_t)
+LGRT_FX_UNSIGNED(udq, UDQ, lgrt_ufract, uint64_t, 64, uint64_t)
+LGRT_FX_SIGNED(ha, HA, lgrt_accum, uint16_t, 32, uint32_t)
+LGRT_FX_SIGNED(sa, SA, lgrt_accum, uint32_t, 32, uint32_t)
+LGRT_FX_SIGNED(da, DA, lgrt_accum, uint64_t, 64, uint64_t)
+LGRT_FX_UNSIGNED(uha, UHA, lgrt_uaccum, uint16_t, 32, uint32_t)
+LGRT_FX_UNSIGNED(usa, USA, lgrt_uaccum, uint32_t, 32, uint32_t)
+LGRT_FX_UNSIGNED(uda, UDA, lgrt_uaccum, uint64_t, 64, uint64_t)
+#if LGRT_HAS_INT128
+LGRT_FX_SIGNED(tq, TQ, lgrt_fract, lgrt_u128, 128, lgrt_u128)
+LGRT_FX_SIGNED(ta, TA, lgrt_accum, lgrt_u128, 128, lgrt_u128)
+LGRT_FX_UNSIGNED(utq, UTQ, lgrt_ufract, lgrt_u128, 128, lgrt_u128)
+LGRT_FX_UNSIGNED(uta, UTA, lgrt_uaccum, lgrt_u128, 128, lgrt_u128)
+#endif
+
+#endif
+
+/*
+ * A conversion works on the magnitude of the operand, of width ws with fs
+ * fractional bits, in a word that holds both types. Only integers have no
+ * fractional bits, and those round toward zero, as TR 18037 requires. The rest
+ * round down, so that a negative magnitude rounds up. The bits of a limit are
+ * also its magnitude, and shifted right they are the most a magnitude can be
+ * before the shift left. Without saturation, the result wraps.
+ */
+#define LGRT_FX_CONVERSION(N, L) \
+    static inline L lgrt_fx_right##N(L x, unsigned int count) { \
+        return count >= N ? 0 : x >> count; \
+    } \
+    \
+    LGRT_FX_INLINE L lgrt_fx_convert##N( \
+        L x, unsigned int ws, unsigned int fs, bool from_signed, \
+        unsigned int wd, unsigned int fd, bool to_signed, bool saturating \
+    ) { \
+        L bits = x & lgrt_fx_mask##N(ws); \
+        L mask = lgrt_fx_mask##N(wd); \
+        bool negative = from_signed && lgrt_fx_sign##N(bits, ws); \
+        L magnitude = negative ? lgrt_fx_neg##N(bits, ws) : bits; \
+        L limit = negative ? 0 : mask; \
+        unsigned int right = fs > fd ? fs - fd : 0; \
+        unsigned int left = fd > fs ? fd - fs : 0; \
+        \
+        if (to_signed) { \
+            limit = lgrt_fx_limit##N(negative, wd); \
+        } \
+        if (negative && fd != 0) { \
+            magnitude = lgrt_fx_right##N(magnitude - 1, right) + 1; \
+        } else { \
+            magnitude = lgrt_fx_right##N(magnitude, right); \
+        } \
+        if (saturating && magnitude > lgrt_fx_right##N(limit, left)) { \
+            return limit; \
+        } \
+        magnitude = left >= N ? 0 : magnitude << left; \
+        return (negative ? (L)0 - magnitude : magnitude) & mask; \
+    }
+
+#if defined(__AVR__)
+LGRT_FX_CONVERSION(16, uint16_t)
+#endif
+LGRT_FX_CONVERSION(32, uint32_t)
+LGRT_FX_CONVERSION(64, uint64_t)
+#if LGRT_HAS_INT128
+LGRT_FX_CONVERSION(128, lgrt_u128)
+#endif
+
+#define LGRT_FX_WIDER_16_16 16
+#define LGRT_FX_WIDER_16_32 32
+#define LGRT_FX_WIDER_16_64 64
+#define LGRT_FX_WIDER_32_16 32
+#define LGRT_FX_WIDER_64_16 64
+#define LGRT_FX_WIDER_32_32 32
+#define LGRT_FX_WIDER_32_64 64
+#define LGRT_FX_WIDER_32_128 128
+#define LGRT_FX_WIDER_64_32 64
+#define LGRT_FX_WIDER_64_64 64
+#define LGRT_FX_WIDER_64_128 128
+#define LGRT_FX_WIDER_128_32 128
+#define LGRT_FX_WIDER_128_64 128
+#define LGRT_FX_WIDER_128_128 128
+
+/* Between types of the same class, the names end in a 2. */
+#define LGRT_FX_SUFFIX_fract_fract 2
+#define LGRT_FX_SUFFIX_fract_accum
+#define LGRT_FX_SUFFIX_fract_ufract
+#define LGRT_FX_SUFFIX_fract_uaccum
+#define LGRT_FX_SUFFIX_accum_fract
+#define LGRT_FX_SUFFIX_accum_accum 2
+#define LGRT_FX_SUFFIX_accum_ufract
+#define LGRT_FX_SUFFIX_accum_uaccum
+#define LGRT_FX_SUFFIX_ufract_fract
+#define LGRT_FX_SUFFIX_ufract_accum
+#define LGRT_FX_SUFFIX_ufract_ufract 2
+#define LGRT_FX_SUFFIX_ufract_uaccum
+#define LGRT_FX_SUFFIX_uaccum_fract
+#define LGRT_FX_SUFFIX_uaccum_accum
+#define LGRT_FX_SUFFIX_uaccum_ufract
+#define LGRT_FX_SUFFIX_uaccum_uaccum 2
+
+#define LGRT_FX_PASTE4(a, b, c, d) a##b##c##d
+#define LGRT_FX_NAME_OF(name) LGRT_FX_NAME(name)
+#if defined(__AVR__)
+
+#define LGRT_FX_SHARED_CONVERT(N, L) \
+    LGRT_FX_SHARED L lgrt_fx_shared_convert##N(L x, uint16_t a, uint16_t b) { \
+        return lgrt_fx_convert##N( \
+            x, LGRT_FX_PACKED_W(a), LGRT_FX_PACKED_F(a), \
+            LGRT_FX_PACKED_SIGNED(a), LGRT_FX_PACKED_W(b), \
+            LGRT_FX_PACKED_F(b), LGRT_FX_PACKED_SIGNED(b), \
+            LGRT_FX_PACKED_SATURATING(b) \
+        ); \
+    }
+
+LGRT_FX_SHARED_CONVERT(16, uint16_t)
+LGRT_FX_SHARED_CONVERT(32, uint32_t)
+LGRT_FX_SHARED_CONVERT(64, uint64_t)
+
+#define LGRT_FX_PACKED_CONVERT_16(x, Wa, Fa, Sa, Wb, Fb, Sb, saturating) \
+    lgrt_fx_shared_convert16( \
+        x, LGRT_FX_PACK(Wa, Fa, Sa, false), \
+        LGRT_FX_PACK(Wb, Fb, Sb, saturating) \
+    )
+#define LGRT_FX_PACKED_CONVERT_32(x, Wa, Fa, Sa, Wb, Fb, Sb, saturating) \
+    lgrt_fx_shared_convert32( \
+        x, LGRT_FX_PACK(Wa, Fa, Sa, false), \
+        LGRT_FX_PACK(Wb, Fb, Sb, saturating) \
+    )
+#define LGRT_FX_PACKED_CONVERT_64(x, Wa, Fa, Sa, Wb, Fb, Sb, saturating) \
+    lgrt_fx_shared_convert64( \
+        x, LGRT_FX_PACK(Wa, Fa, Sa, false), \
+        LGRT_FX_PACK(Wb, Fb, Sb, saturating) \
+    )
+#define LGRT_FX_CONVERT_AT_(N) LGRT_FX_PACKED_CONVERT_##N
+
+#else
+#define LGRT_FX_CONVERT_AT_(N) lgrt_fx_convert##N
+#endif
+#define LGRT_FX_CONVERT_AT(N) LGRT_FX_CONVERT_AT_(N)
+
+#define LGRT_FX_FIXED_ROUTINE( \
+    name, a, Wa, Fa, Sa, b, Wb, Fb, Sb, N, saturating \
+) \
+    lgrt_fx_##b LGRT_FX_NAME_OF(name)(lgrt_fx_##a x) { \
+        return lgrt_fx_value_##b(LGRT_FX_CONVERT_AT(N)( \
+            lgrt_fx_bits_##a(x), Wa, Fa, Sa, Wb, Fb, Sb, saturating \
+        )); \
+    }
+
+/* AVR's compilers have these inline, but for the saturating forms. */
+#if defined(__AVR__)
+#define LGRT_FX_FIXED_ROUTINES(a, Wa, Fa, Sa, b, Wb, Fb, Sb, N, suffix) \
+    LGRT_FX_FIXED_ROUTINE( \
+        LGRT_FX_PASTE4(satfract, a, b, suffix), \
+        a, Wa, Fa, Sa, b, Wb, Fb, Sb, N, true \
+    )
+#else
+#define LGRT_FX_FIXED_ROUTINES(a, Wa, Fa, Sa, b, Wb, Fb, Sb, N, suffix) \
+    LGRT_FX_FIXED_ROUTINE( \
+        LGRT_FX_PASTE4(fract, a, b, suffix), \
+        a, Wa, Fa, Sa, b, Wb, Fb, Sb, N, false \
+    ) \
+    LGRT_FX_FIXED_ROUTINE( \
+        LGRT_FX_PASTE4(satfract, a, b, suffix), \
+        a, Wa, Fa, Sa, b, Wb, Fb, Sb, N, true \
+    )
+#endif
+
+#define LGRT_FX_FIXED_PAIR(a, Na, Ca, Wa, Fa, Sa, b, Nb, Cb, Wb, Fb, Sb) \
+    LGRT_FX_FIXED_ROUTINES( \
+        a, Wa, Fa, Sa, b, Wb, Fb, Sb, LGRT_FX_WIDER_##Na##_##Nb, \
+        LGRT_FX_SUFFIX_##Ca##_##Cb \
+    )
+
+/*
+ * Callers extend an integer narrower than a register to all of it, and a
+ * 32-bit unsigned one with zeros even where code for that type would expect a
+ * sign: so these take the register as it comes, and read its low bits. Results
+ * have their own types, which callers extend as they need.
+ */
+#define LGRT_FX_FROM_INTEGER( \
+    name, R, Wi, is_signed, m, Wm, Fm, Sm, N, saturating \
+) \
+    lgrt_fx_##m LGRT_FX_NAME_OF(name)(R x) { \
+        return lgrt_fx_value_##m(LGRT_FX_CONVERT_AT(N)( \
+            x, Wi, 0, is_signed, Wm, Fm, Sm, saturating \
+        )); \
+    }
+
+#define LGRT_FX_TO_INTEGER(name, I, m, Wm, Fm, Sm, Wi, N) \
+    I LGRT_FX_NAME_OF(name)(lgrt_fx_##m x) { \
+        return (I)LGRT_FX_CONVERT_AT(N)( \
+            lgrt_fx_bits_##m(x), Wm, Fm, Sm, Wi, 0, false, false \
+        ); \
+    }
+
+#if defined(__AVR__)
+#define LGRT_FX_INTEGER_ROUTINES(m, Wm, Fm, Sm, i, Wi, R, I, U, N) \
+    LGRT_FX_FROM_INTEGER( \
+        satfract##i##m, R, Wi, true, m, Wm, Fm, Sm, N, true \
+    ) \
+    LGRT_FX_FROM_INTEGER( \
+        satfractuns##i##m, R, Wi, false, m, Wm, Fm, Sm, N, true \
+    )
+#else
+#define LGRT_FX_INTEGER_ROUTINES(m, Wm, Fm, Sm, i, Wi, R, I, U, N) \
+    LGRT_FX_FROM_INTEGER( \
+        fract##i##m, R, Wi, true, m, Wm, Fm, Sm, N, false \
+    ) \
+    LGRT_FX_FROM_INTEGER( \
+        fractuns##i##m, R, Wi, false, m, Wm, Fm, Sm, N, false \
+    ) \
+    LGRT_FX_FROM_INTEGER( \
+        satfract##i##m, R, Wi, true, m, Wm, Fm, Sm, N, true \
+    ) \
+    LGRT_FX_FROM_INTEGER( \
+        satfractuns##i##m, R, Wi, false, m, Wm, Fm, Sm, N, true \
+    ) \
+    LGRT_FX_TO_INTEGER(fract##m##i, I, m, Wm, Fm, Sm, Wi, N) \
+    LGRT_FX_TO_INTEGER(fractuns##m##i, U, m, Wm, Fm, Sm, Wi, N)
+#endif
+
+#define LGRT_FX_INTEGER_PAIR(m, Nm, Cm, Wm, Fm, Sm, i, Ni, Wi, R, I, U) \
+    LGRT_FX_INTEGER_ROUTINES( \
+        m, Wm, Fm, Sm, i, Wi, R, I, U, LGRT_FX_WIDER_##Ni##_##Nm \
+    )
+
+/* Word, class, width, fractional bits, and signedness. */
+#define LGRT_FX_SIGNED_INFO(M) \
+    (__##M##_IBIT__ + __##M##_FBIT__ + 1), __##M##_FBIT__, true
+#define LGRT_FX_UNSIGNED_INFO(M) \
+    (__##M##_IBIT__ + __##M##_FBIT__), __##M##_FBIT__, false
+
+/* The types of AVR that are not 32 bits wide take smaller or other words. */
+#if defined(__AVR__)
+#define LGRT_FX_WORD_OF_8 16
+#define LGRT_FX_WORD_OF_16 16
+#define LGRT_FX_WORD_OF_TA 64
+#else
+#define LGRT_FX_WORD_OF_8 32
+#define LGRT_FX_WORD_OF_16 32
+#define LGRT_FX_WORD_OF_TA 128
+#endif
+
+#define LGRT_FX_INFO_qq LGRT_FX_WORD_OF_8, fract, LGRT_FX_SIGNED_INFO(QQ)
+#define LGRT_FX_INFO_hq LGRT_FX_WORD_OF_16, fract, LGRT_FX_SIGNED_INFO(HQ)
+#define LGRT_FX_INFO_sq 32, fract, LGRT_FX_SIGNED_INFO(SQ)
+#define LGRT_FX_INFO_dq 64, fract, LGRT_FX_SIGNED_INFO(DQ)
+#define LGRT_FX_INFO_tq 128, fract, LGRT_FX_SIGNED_INFO(TQ)
+#define LGRT_FX_INFO_ha LGRT_FX_WORD_OF_16, accum, LGRT_FX_SIGNED_INFO(HA)
+#define LGRT_FX_INFO_sa 32, accum, LGRT_FX_SIGNED_INFO(SA)
+#define LGRT_FX_INFO_da 64, accum, LGRT_FX_SIGNED_INFO(DA)
+#define LGRT_FX_INFO_ta LGRT_FX_WORD_OF_TA, accum, LGRT_FX_SIGNED_INFO(TA)
+#define LGRT_FX_INFO_uqq LGRT_FX_WORD_OF_8, ufract, LGRT_FX_UNSIGNED_INFO(UQQ)
+#define LGRT_FX_INFO_uhq LGRT_FX_WORD_OF_16, ufract, LGRT_FX_UNSIGNED_INFO(UHQ)
+#define LGRT_FX_INFO_usq 32, ufract, LGRT_FX_UNSIGNED_INFO(USQ)
+#define LGRT_FX_INFO_udq 64, ufract, LGRT_FX_UNSIGNED_INFO(UDQ)
+#define LGRT_FX_INFO_utq 128, ufract, LGRT_FX_UNSIGNED_INFO(UTQ)
+#define LGRT_FX_INFO_uha LGRT_FX_WORD_OF_16, uaccum, LGRT_FX_UNSIGNED_INFO(UHA)
+#define LGRT_FX_INFO_usa 32, uaccum, LGRT_FX_UNSIGNED_INFO(USA)
+#define LGRT_FX_INFO_uda 64, uaccum, LGRT_FX_UNSIGNED_INFO(UDA)
+#define LGRT_FX_INFO_uta LGRT_FX_WORD_OF_TA, uaccum, LGRT_FX_UNSIGNED_INFO(UTA)
+
+/* Word, width, the type of an operand, and of a signed or unsigned result. */
+typedef unsigned int lgrt_fx_register __attribute__((__mode__(__word__)));
+
+#if defined(__AVR__)
+#define LGRT_FX_INFO_qi 16, 8, uint8_t, int8_t, uint8_t
+#define LGRT_FX_INFO_hi 16, 16, uint16_t, int16_t, uint16_t
+#define LGRT_FX_INFO_si 32, 32, uint32_t, int32_t, uint32_t
+#else
+#define LGRT_FX_INFO_qi 32, 8, lgrt_fx_register, int8_t, uint8_t
+#define LGRT_FX_INFO_hi 32, 16, lgrt_fx_register, int16_t, uint16_t
+#define LGRT_FX_INFO_si 32, 32, lgrt_fx_register, int32_t, uint32_t
+#endif
+#define LGRT_FX_INFO_di 64, 64, uint64_t, int64_t, uint64_t
+#define LGRT_FX_INFO_ti 128, 128, lgrt_u128, lgrt_i128, lgrt_u128
+
+#define LGRT_FX_PAIR_(X, ...) X(__VA_ARGS__)
+#define LGRT_FX_PAIR(X, a, b) \
+    LGRT_FX_PAIR_(X, a, LGRT_FX_INFO_##a, b, LGRT_FX_INFO_##b)
+
+#define LGRT_FX_BOTH_WAYS(a, b) \
+    LGRT_FX_PAIR(LGRT_FX_FIXED_PAIR, a, b) \
+    LGRT_FX_PAIR(LGRT_FX_FIXED_PAIR, b, a)
+
+/* Each type with the types after it, so that no type goes with itself. */
+#define LGRT_FX_AFTER_qq(m) LGRT_FX_BOTH_WAYS(m, hq) LGRT_FX_AFTER_hq(m)
+#define LGRT_FX_AFTER_hq(m) LGRT_FX_BOTH_WAYS(m, sq) LGRT_FX_AFTER_sq(m)
+#define LGRT_FX_AFTER_sq(m) LGRT_FX_BOTH_WAYS(m, dq) LGRT_FX_AFTER_dq(m)
+#define LGRT_FX_AFTER_dq(m) LGRT_FX_BOTH_WAYS(m, uqq) LGRT_FX_AFTER_uqq(m)
+#define LGRT_FX_AFTER_uqq(m) LGRT_FX_BOTH_WAYS(m, uhq) LGRT_FX_AFTER_uhq(m)
+#define LGRT_FX_AFTER_uhq(m) LGRT_FX_BOTH_WAYS(m, usq) LGRT_FX_AFTER_usq(m)
+#define LGRT_FX_AFTER_usq(m) LGRT_FX_BOTH_WAYS(m, udq) LGRT_FX_AFTER_udq(m)
+#define LGRT_FX_AFTER_udq(m) LGRT_FX_BOTH_WAYS(m, ha) LGRT_FX_AFTER_ha(m)
+#define LGRT_FX_AFTER_ha(m) LGRT_FX_BOTH_WAYS(m, sa) LGRT_FX_AFTER_sa(m)
+#define LGRT_FX_AFTER_sa(m) LGRT_FX_BOTH_WAYS(m, da) LGRT_FX_AFTER_da(m)
+#define LGRT_FX_AFTER_da(m) LGRT_FX_BOTH_WAYS(m, uha) LGRT_FX_AFTER_uha(m)
+#define LGRT_FX_AFTER_uha(m) LGRT_FX_BOTH_WAYS(m, usa) LGRT_FX_AFTER_usa(m)
+#define LGRT_FX_AFTER_usa(m) LGRT_FX_BOTH_WAYS(m, uda) LGRT_FX_AFTER_uda(m)
+#if LGRT_HAS_INT128
+#define LGRT_FX_AFTER_uda(m) LGRT_FX_BOTH_WAYS(m, tq) LGRT_FX_AFTER_tq(m)
+#define LGRT_FX_AFTER_tq(m) LGRT_FX_BOTH_WAYS(m, ta) LGRT_FX_AFTER_ta(m)
+#define LGRT_FX_AFTER_ta(m) LGRT_FX_BOTH_WAYS(m, utq) LGRT_FX_AFTER_utq(m)
+#define LGRT_FX_AFTER_utq(m) LGRT_FX_BOTH_WAYS(m, uta)
+#define LGRT_FX_AFTER_uta(m)
+#elif defined(__AVR__)
+#define LGRT_FX_AFTER_uda(m) LGRT_FX_BOTH_WAYS(m, ta) LGRT_FX_AFTER_ta(m)
+#define LGRT_FX_AFTER_ta(m) LGRT_FX_BOTH_WAYS(m, uta)
+#define LGRT_FX_AFTER_uta(m)
+#else
+#define LGRT_FX_AFTER_uda(m)
+#endif
+
+#if LGRT_HAS_INT128
+#define LGRT_FX_WITH_128_BITS(m) LGRT_FX_PAIR(LGRT_FX_INTEGER_PAIR, m, ti)
+#else
+#define LGRT_FX_WITH_128_BITS(m)
+#endif
+
+#if LGRT_SOFT_FLOAT
+
+/* MIPS16 code has no access to the registers of hard-float values. */
+#if defined(__mips16) && defined(__mips_hard_float)
+#define LGRT_FX_FP_ABI __attribute__((__nomips16__))
+#else
+#define LGRT_FX_FP_ABI
+#endif
+
+/*
+ * The routines of a type differ in a few constants, so that they share what
+ * follows, for size, on AVR through wrappers of its own. To a format with F
+ * fractional bits, a magnitude becomes a significand as the soft-float core
+ * has them, its lost bits in the sticky bit, so that it rounds once, subnormal
+ * results too.
+ */
+#if defined(__AVR__)
+#define LGRT_FX_FP_SHARED LGRT_FX_INLINE
+#else
+#define LGRT_FX_FP_SHARED static __attribute__((__noinline__))
+#endif
+
+#define LGRT_FX_TO_FP(N, L, fmt, T, E, F) \
+    LGRT_FX_FP_SHARED T lgrt_fx_to_##fmt##N( \
+        L x, unsigned int w, unsigned int f, bool is_signed \
+    ) { \
+        bool negative = is_signed && lgrt_fx_sign##N(x, w); \
+        L magnitude = negative ? lgrt_fx_neg##N(x, w) : x; \
+        unsigned int top; \
+        T sig; \
+        \
+        if (magnitude == 0) { \
+            return 0; \
+        } \
+        top = LGRT_FX_TOP(N, magnitude); \
+        if (top <= (F) + 3) { \
+            sig = (T)magnitude << ((F) + 3 - top); \
+        } else { \
+            unsigned int lost = top - ((F) + 3); \
+            L kept = magnitude >> lost; \
+            \
+            sig = (T)kept | (T)((kept << lost) != magnitude); \
+        } \
+        return lgrt_##fmt##_round_pack( \
+            negative ? LGRT_FP_SIGN(T, E, F) : 0, \
+            LGRT_FP_BIAS(E) + top - f, sig \
+        ); \
+    }
+
+/*
+ * From a format, in a word that holds both, the significand counts in units of
+ * the last place of the result at the biased exponent called point here. Above
+ * that it shifts left, and bits past the word are past the result too; below
+ * that it shifts right, which truncates its magnitude. The bits of a limit are
+ * also its magnitude, and that of a negative value in an unsigned type is 0.
+ * Without saturation, the result wraps. A NaN gives 0, and an infinity the
+ * limit of the type, with or without saturation.
+ */
+#define LGRT_FX_FROM_FP(N, L, fmt, T, E, F) \
+    LGRT_FX_FP_SHARED L lgrt_fx_from_##fmt##N( \
+        T x, unsigned int w, unsigned int f, bool to_signed, bool saturating \
+    ) { \
+        T magnitude = x & (LGRT_FP_SIGN(T, E, F) - 1); \
+        T sig = magnitude & (LGRT_FP_INT_BIT(T, F) - 1); \
+        unsigned int e = (unsigned int)(magnitude >> (F)); \
+        unsigned int point = LGRT_FP_BIAS(E) + (F) - f; \
+        bool negative = (x & LGRT_FP_SIGN(T, E, F)) != 0; \
+        L mask = lgrt_fx_mask##N(w); \
+        L limit = negative ? 0 : mask; \
+        L value; \
+        \
+        if (to_signed) { \
+            limit = lgrt_fx_limit##N(negative, w); \
+        } \
+        if (magnitude >= LGRT_FP_INF(T, E, F)) { \
+            return magnitude == LGRT_FP_INF(T, E, F) ? limit : 0; \
+        } \
+        if (e != 0) { \
+            sig |= LGRT_FP_INT_BIT(T, F); \
+        } else { \
+            e = 1; \
+        } \
+        if (e < point) { \
+            value = lgrt_fx_right##N((L)sig, point - e); \
+            if (saturating && value > limit) { \
+                return limit; \
+            } \
+        } else { \
+            if (saturating && (L)sig > lgrt_fx_right##N(limit, e - point)) { \
+                return limit; \
+            } \
+            value = e - point >= N ? 0 : (L)sig << (e - point); \
+        } \
+        return (negative ? (L)0 - value : value) & mask; \
+    }
+
+#define LGRT_FX_FP_CORE(N, L, fmt, T, E, F) \
+    LGRT_FX_TO_FP(N, L, fmt, T, E, F) \
+    LGRT_FX_FROM_FP(N, L, fmt, T, E, F)
+
+#if defined(__AVR__)
+LGRT_FX_TO_FP(16, uint16_t, sf, uint32_t, 8, 23)
+#endif
+LGRT_FX_FP_CORE(32, uint32_t, sf, uint32_t, 8, 23)
+LGRT_FX_FP_CORE(64, uint64_t, sf, uint32_t, 8, 23)
+#if LGRT_HAS_INT128
+LGRT_FX_FP_CORE(128, lgrt_u128, sf, uint32_t, 8, 23)
+#endif
+
+#if LGRT_SOFT_DOUBLE
+#if defined(__AVR__)
+LGRT_FX_TO_FP(16, uint16_t, df, uint64_t, 11, 52)
+#endif
+LGRT_FX_TO_FP(32, uint32_t, df, uint64_t, 11, 52)
+LGRT_FX_FP_CORE(64, uint64_t, df, uint64_t, 11, 52)
+#if LGRT_HAS_INT128
+LGRT_FX_FP_CORE(128, lgrt_u128, df, uint64_t, 11, 52)
+#endif
+#endif
+
+#define LGRT_FX_FROM_FP_AT_(fmt, N) lgrt_fx_from_##fmt##N
+#define LGRT_FX_FROM_FP_AT(fmt, N) LGRT_FX_FROM_FP_AT_(fmt, N)
+
+#if defined(__AVR__)
+
+#define LGRT_FX_SHARED_TO_FP(N, L, fmt, T) \
+    LGRT_FX_SHARED T lgrt_fx_shared_to_##fmt##N(L x, uint16_t p) { \
+        return lgrt_fx_to_##fmt##N( \
+            x, LGRT_FX_PACKED_W(p), LGRT_FX_PACKED_F(p), \
+            LGRT_FX_PACKED_SIGNED(p) \
+        ); \
+    }
+
+#define LGRT_FX_SHARED_FROM_FP(N, L, fmt, T) \
+    LGRT_FX_SHARED L lgrt_fx_shared_from_##fmt##N(T x, uint16_t p) { \
+        return lgrt_fx_from_##fmt##N( \
+            x, LGRT_FX_PACKED_W(p), LGRT_FX_PACKED_F(p), \
+            LGRT_FX_PACKED_SIGNED(p), LGRT_FX_PACKED_SATURATING(p) \
+        ); \
+    }
+
+LGRT_FX_SHARED_TO_FP(16, uint16_t, sf, uint32_t)
+LGRT_FX_SHARED_TO_FP(32, uint32_t, sf, uint32_t)
+LGRT_FX_SHARED_TO_FP(64, uint64_t, sf, uint32_t)
+LGRT_FX_SHARED_FROM_FP(32, uint32_t, sf, uint32_t)
+LGRT_FX_SHARED_FROM_FP(64, uint64_t, sf, uint32_t)
+
+#if LGRT_SOFT_DOUBLE
+LGRT_FX_SHARED_TO_FP(16, uint16_t, df, uint64_t)
+LGRT_FX_SHARED_TO_FP(32, uint32_t, df, uint64_t)
+LGRT_FX_SHARED_TO_FP(64, uint64_t, df, uint64_t)
+LGRT_FX_SHARED_FROM_FP(64, uint64_t, df, uint64_t)
+#endif
+
+#define LGRT_FX_SHARED_FROM_FP_AT_(fmt, N) lgrt_fx_shared_from_##fmt##N
+#define LGRT_FX_SHARED_FROM_FP_AT(fmt, N) LGRT_FX_SHARED_FROM_FP_AT_(fmt, N)
+
+#endif
+
+/*
+ * Compilers call these with floating-point values where the procedure call
+ * standard has them, and where that is in floating-point registers, C has
+ * their bits in core registers and assembly moves them, as for _BitInt. A
+ * 64-bit value in two core registers has its high half first if big-endian.
+ */
+#if defined(__ARM_PCS_VFP)
+
+#define LGRT_FX_VFP_TO_CORE_sf "vmov r0, s0\n"
+#define LGRT_FX_VFP_FROM_CORE_sf "vmov s0, r0\n"
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define LGRT_FX_VFP_TO_CORE_df "vmov r1, r0, d0\n"
+#define LGRT_FX_VFP_FROM_CORE_df "vmov d0, r1, r0\n"
+#else
+#define LGRT_FX_VFP_TO_CORE_df "vmov r0, r1, d0\n"
+#define LGRT_FX_VFP_FROM_CORE_df "vmov d0, r0, r1\n"
+#endif
+
+#define LGRT_FX_TO_FP_ROUTINE(m, Nm, Wm, Fm, Sm, fmt, C, T) \
+    LGRT_CX_VFP_HELPER T lgrt_fx_fract##m##fmt##_bits(lgrt_fx_##m x) { \
+        return lgrt_fx_to_##fmt##Nm(lgrt_fx_bits_##m(x), Wm, Fm, Sm); \
+    } \
+    \
+    LGRT_CX_VFP_ENTRY( \
+        lgrt_fx_fract##m##fmt, "__gnu_fract" #m #fmt, "8", "", \
+        "lgrt_fx_fract" #m #fmt "_bits", LGRT_FX_VFP_FROM_CORE_##fmt \
+    )
+
+#define LGRT_FX_FROM_FP_ROUTINE(op, m, Wm, Fm, Sm, fmt, C, T, N, saturating) \
+    LGRT_CX_VFP_HELPER lgrt_fx_##m lgrt_fx_##op##fmt##m##_bits(T a) { \
+        return lgrt_fx_value_##m(LGRT_FX_FROM_FP_AT(fmt, N)( \
+            a, Wm, Fm, Sm, saturating \
+        )); \
+    } \
+    \
+    LGRT_BITINT_VFP_MOVE( \
+        lgrt_fx_##op##fmt##m, "__gnu_" #op #fmt #m, \
+        LGRT_FX_VFP_TO_CORE_##fmt, "lgrt_fx_" #op #fmt #m "_bits" \
+    )
+
+#elif defined(__AVR__)
+
+#define LGRT_FX_TO_FP_ROUTINE(m, Nm, Wm, Fm, Sm, fmt, C, T) \
+    C LGRT_FX_NAME(fract##m##fmt)(lgrt_fx_##m x) { \
+        return lgrt_fx_shared_to_##fmt##Nm( \
+            lgrt_fx_bits_##m(x), LGRT_FX_PACK(Wm, Fm, Sm, false) \
+        ); \
+    }
+
+#define LGRT_FX_FROM_FP_ROUTINE(op, m, Wm, Fm, Sm, fmt, C, T, N, saturating) \
+    lgrt_fx_##m LGRT_FX_NAME(op##fmt##m)(C a) { \
+        return lgrt_fx_value_##m(LGRT_FX_SHARED_FROM_FP_AT(fmt, N)( \
+            a, LGRT_FX_PACK(Wm, Fm, Sm, saturating) \
+        )); \
+    }
+
+#else
+
+#define LGRT_FX_TO_FP_ROUTINE(m, Nm, Wm, Fm, Sm, fmt, C, T) \
+    LGRT_FX_FP_ABI C LGRT_FX_NAME(fract##m##fmt)(lgrt_fx_##m x) { \
+        return lgrt_##fmt##_from_bits( \
+            lgrt_fx_to_##fmt##Nm(lgrt_fx_bits_##m(x), Wm, Fm, Sm) \
+        ); \
+    }
+
+#define LGRT_FX_FROM_FP_ROUTINE(op, m, Wm, Fm, Sm, fmt, C, T, N, saturating) \
+    LGRT_FX_FP_ABI lgrt_fx_##m LGRT_FX_NAME(op##fmt##m)(C a) { \
+        return lgrt_fx_value_##m(LGRT_FX_FROM_FP_AT(fmt, N)( \
+            lgrt_##fmt##_to_bits(a), Wm, Fm, Sm, saturating \
+        )); \
+    }
+
+#endif
+
+#define LGRT_FX_FP_PAIR(m, Nm, Cm, Wm, Fm, Sm, fmt, Nf, C, T) \
+    LGRT_FX_TO_FP_ROUTINE(m, Nm, Wm, Fm, Sm, fmt, C, T) \
+    LGRT_FX_FROM_FP_ROUTINE( \
+        fract, m, Wm, Fm, Sm, fmt, C, T, LGRT_FX_WIDER_##Nm##_##Nf, false \
+    ) \
+    LGRT_FX_FROM_FP_ROUTINE( \
+        satfract, m, Wm, Fm, Sm, fmt, C, T, LGRT_FX_WIDER_##Nm##_##Nf, true \
+    )
+
+/* Word, the type that passes a value, and the type of its bits. */
+#define LGRT_FX_INFO_sf 32, lgrt_sf_value, uint32_t
+#define LGRT_FX_INFO_df 64, lgrt_df_value, uint64_t
+
+#endif
+
+#if LGRT_SOFT_DOUBLE
+#define LGRT_FX_WITH_FP(m) \
+    LGRT_FX_PAIR(LGRT_FX_FP_PAIR, m, sf) \
+    LGRT_FX_PAIR(LGRT_FX_FP_PAIR, m, df)
+#elif LGRT_SOFT_FLOAT
+#define LGRT_FX_WITH_FP(m) LGRT_FX_PAIR(LGRT_FX_FP_PAIR, m, sf)
+#else
+#define LGRT_FX_WITH_FP(m)
+#endif
+
+#define LGRT_FX_CONVERSIONS(m) \
+    LGRT_FX_AFTER_##m(m) \
+    LGRT_FX_PAIR(LGRT_FX_INTEGER_PAIR, m, qi) \
+    LGRT_FX_PAIR(LGRT_FX_INTEGER_PAIR, m, hi) \
+    LGRT_FX_PAIR(LGRT_FX_INTEGER_PAIR, m, si) \
+    LGRT_FX_PAIR(LGRT_FX_INTEGER_PAIR, m, di) \
+    LGRT_FX_WITH_128_BITS(m) \
+    LGRT_FX_WITH_FP(m)
+
+LGRT_FX_CONVERSIONS(qq)
+LGRT_FX_CONVERSIONS(hq)
+LGRT_FX_CONVERSIONS(sq)
+LGRT_FX_CONVERSIONS(dq)
+LGRT_FX_CONVERSIONS(uqq)
+LGRT_FX_CONVERSIONS(uhq)
+LGRT_FX_CONVERSIONS(usq)
+LGRT_FX_CONVERSIONS(udq)
+LGRT_FX_CONVERSIONS(ha)
+LGRT_FX_CONVERSIONS(sa)
+LGRT_FX_CONVERSIONS(da)
+LGRT_FX_CONVERSIONS(uha)
+LGRT_FX_CONVERSIONS(usa)
+LGRT_FX_CONVERSIONS(uda)
+#if LGRT_HAS_INT128
+LGRT_FX_CONVERSIONS(tq)
+LGRT_FX_CONVERSIONS(ta)
+LGRT_FX_CONVERSIONS(utq)
+LGRT_FX_CONVERSIONS(uta)
+#elif defined(__AVR__)
+LGRT_FX_CONVERSIONS(ta)
+LGRT_FX_CONVERSIONS(uta)
 #endif
 
 #endif
@@ -15487,6 +17003,469 @@ __asm__ (
     LGRT_AVR_IJMP
     LGRT_AVR_END("__tablejump2__")
 );
+
+#endif
+
+/*
+ * Fixed-point routines with conventions of their own. A few instructions serve
+ * where another routine does the work, and the rest save what C may change, as
+ * above, around the C of the fixed-point block.
+ */
+#if !defined(__clang__) && defined(__QQ_FBIT__)
+
+#if defined(__AVR_HAVE_MOVW__)
+#define LGRT_AVR_MOVE_PAIR(low, high, from_low, from_high) \
+    "movw " low ", " from_low "\n"
+#else
+#define LGRT_AVR_MOVE_PAIR(low, high, from_low, from_high) \
+    "mov " low ", " from_low "\n" \
+    "mov " high ", " from_high "\n"
+#endif
+
+/* The bits builtins of stdfix.h take a value and give it back, at -O0. */
+__asm__ (
+    LGRT_AVR_BEGIN("__ret")
+    "ret\n"
+    LGRT_AVR_END("__ret")
+);
+
+/* Saturating, in r25:r24 and in r25:r22, with nothing else changed. */
+__asm__ (
+    ".pushsection .text.__ssabs_2,\"ax\",@progbits\n"
+    LGRT_AVR_ENTRY("__ssabs_2", ".Llgrt_avr_ssabs_2_end")
+    "sbrs r25, 7\n"
+    "ret\n"
+    LGRT_AVR_ENTRY("__ssneg_2", ".Llgrt_avr_ssabs_2_end")
+    "com r25\n"
+    "neg r24\n"
+    "sbci r25, -1\n"
+    "brvc 1f\n"
+    "subi r24, 1\n"
+    "sbci r25, 0\n"
+    "1:\n"
+    "ret\n"
+    ".Llgrt_avr_ssabs_2_end:\n"
+    ".popsection\n"
+);
+
+__asm__ (
+    ".pushsection .text.__ssabs_4,\"ax\",@progbits\n"
+    LGRT_AVR_ENTRY("__ssabs_4", ".Llgrt_avr_ssabs_4_end")
+    "sbrs r25, 7\n"
+    "ret\n"
+    LGRT_AVR_ENTRY("__ssneg_4", ".Llgrt_avr_ssabs_4_end")
+    LGRT_AVR_NEG4("r25", "r24", "r23", "r22")
+    "brvc 1f\n"
+    "subi r22, 1\n"
+    "sbci r23, 0\n"
+    "sbci r24, 0\n"
+    "sbci r25, 0\n"
+    "1:\n"
+    "ret\n"
+    ".Llgrt_avr_ssabs_4_end:\n"
+    ".popsection\n"
+);
+
+#if defined(__AVR_HAVE_MUL__)
+
+/*
+ * r19:r18 * r27:r26, returning in r25:r24, by the fractional bits of the type:
+ * half of the last place goes on the whole product, in r25:r22, to round it to
+ * the nearest value, with ties up, and then the bytes below that place go.
+ */
+#define LGRT_AVR_FX_ROUNDED_7 \
+    "subi r22, -64\n" \
+    "sbci r23, -1\n" \
+    "sbci r24, -1\n" \
+    "lsl r22\n" \
+    "rol r23\n" \
+    "rol r24\n" \
+    "mov r25, r24\n" \
+    "mov r24, r23\n"
+
+#define LGRT_AVR_FX_ROUNDED_8 \
+    "subi r22, -128\n" \
+    "sbci r23, -1\n" \
+    "sbci r24, -1\n" \
+    "mov r25, r24\n" \
+    "mov r24, r23\n"
+
+#define LGRT_AVR_FX_ROUNDED_15 \
+    "subi r23, -64\n" \
+    "sbci r24, -1\n" \
+    "sbci r25, -1\n" \
+    "lsl r23\n" \
+    "rol r24\n" \
+    "rol r25\n"
+
+#define LGRT_AVR_FX_ROUNDED_16 \
+    "subi r23, -128\n" \
+    "sbci r24, -1\n" \
+    "sbci r25, -1\n"
+
+#define LGRT_AVR_FX_MUL16_(name, product, F) \
+    __asm__ ( \
+        LGRT_AVR_BEGIN(name) \
+        LGRT_AVR_CALL(product) \
+        LGRT_AVR_FX_ROUNDED_##F \
+        "ret\n" \
+        LGRT_AVR_END(name) \
+    );
+
+#define LGRT_AVR_FX_MUL16(name, product, F) \
+    LGRT_AVR_FX_MUL16_(name, product, F)
+
+LGRT_AVR_FX_MUL16("__mulhq3", "__mulhisi3", __HQ_FBIT__)
+LGRT_AVR_FX_MUL16("__mulha3", "__mulhisi3", __HA_FBIT__)
+LGRT_AVR_FX_MUL16("__muluhq3", "__umulhisi3", __UHQ_FBIT__)
+LGRT_AVR_FX_MUL16("__muluha3", "__umulhisi3", __UHA_FBIT__)
+
+/*
+ * r19:r16 * r23:r20, returning in r27:r24, with nothing else changed but for
+ * the flags. The whole product comes in r25:r18, and the result is the bytes
+ * r23:r20 of its sum with half of the last place, once they line up.
+ */
+#define LGRT_AVR_FX_ROUNDED_LONG_15 \
+    "subi r19, -64\n" \
+    "sbci r20, -1\n" \
+    "sbci r21, -1\n" \
+    "sbci r22, -1\n" \
+    "sbci r23, -1\n" \
+    "lsl r19\n" \
+    "rol r20\n" \
+    "rol r21\n" \
+    "rol r22\n" \
+    "rol r23\n"
+
+#define LGRT_AVR_FX_ROUNDED_LONG_16 \
+    "subi r19, -128\n" \
+    "sbci r20, -1\n" \
+    "sbci r21, -1\n" \
+    "sbci r22, -1\n" \
+    "sbci r23, -1\n"
+
+#define LGRT_AVR_FX_MUL32_(name, product, F) \
+    __asm__ ( \
+        LGRT_AVR_BEGIN(name) \
+        "push r18\n" \
+        "push r19\n" \
+        "push r20\n" \
+        "push r21\n" \
+        "push r22\n" \
+        "push r23\n" \
+        "movw r24, r18\n" \
+        "movw r18, r20\n" \
+        "movw r20, r22\n" \
+        "movw r22, r16\n" \
+        LGRT_AVR_CALL(product) \
+        LGRT_AVR_FX_ROUNDED_LONG_##F \
+        "movw r24, r20\n" \
+        "movw r26, r22\n" \
+        "pop r23\n" \
+        "pop r22\n" \
+        "pop r21\n" \
+        "pop r20\n" \
+        "pop r19\n" \
+        "pop r18\n" \
+        "ret\n" \
+        LGRT_AVR_END(name) \
+    );
+
+#define LGRT_AVR_FX_MUL32(name, product, F) \
+    LGRT_AVR_FX_MUL32_(name, product, F)
+
+LGRT_AVR_FX_MUL32("__mulsa3", "__mulsidi3", __SA_FBIT__)
+LGRT_AVR_FX_MUL32("__mulusa3", "__umulsidi3", __USA_FBIT__)
+
+#else
+
+/* r24 * r22, both unsigned, returning in r25:r24. */
+__asm__ (
+    LGRT_AVR_BEGIN("__umulqihi3")
+    "clr r25\n"
+    "clr r23\n"
+    LGRT_AVR_JUMP("__mulhi3")
+    LGRT_AVR_END("__umulqihi3")
+);
+
+/*
+ * r24 * r25, returning in r23, in the way of the multiplication that cores
+ * with the instruction have inline: the whole product shifted left by one, of
+ * which the upper byte counts, which rounds down, and the one product that
+ * has no room in it gives the most positive value.
+ */
+__asm__ (
+    LGRT_AVR_BEGIN("__mulqq3")
+    "mov r22, r25\n"
+    "mov r23, r25\n"
+    "lsl r23\n"
+    "sbc r23, r23\n"
+    "mov r25, r24\n"
+    "lsl r25\n"
+    "sbc r25, r25\n"
+    LGRT_AVR_CALL("__mulhi3")
+    "lsl r24\n"
+    "rol r25\n"
+    "mov r23, r25\n"
+    "dec r23\n"
+    "brvs 1f\n"
+    "inc r23\n"
+    "1:\n"
+    "ret\n"
+    LGRT_AVR_END("__mulqq3")
+);
+
+#endif
+
+/* r25 / r22, returning in r24, with r25 alone changed but for that. */
+#define LGRT_AVR_FX_DIV8(name, F, is_signed) \
+    LGRT_AVR_HELPER uint8_t lgrt_avr##name(uint8_t a, uint8_t b) { \
+        return (uint8_t)lgrt_fx_shared_div8( \
+            a, b, LGRT_FX_PACK(8, F, is_signed, false) \
+        ); \
+    } \
+    \
+    LGRT_AVR_STUB( \
+        #name, "lgrt_avr" #name, \
+        LGRT_AVR_PUSH_18_TO_23 \
+        "mov r24, r25\n", \
+        LGRT_AVR_POP_18_TO_23 \
+    )
+
+LGRT_AVR_FX_DIV8(__divqq3, __QQ_FBIT__, true)
+LGRT_AVR_FX_DIV8(__udivuqq3, __UQQ_FBIT__, false)
+
+/* r27:r26 / r23:r22, returning in r25:r24. r27:r26 and r21 may change. */
+#define LGRT_AVR_FX_DIV16(name, F, is_signed) \
+    LGRT_AVR_HELPER uint16_t lgrt_avr##name(uint16_t a, uint16_t b) { \
+        return lgrt_fx_shared_div16( \
+            a, b, LGRT_FX_PACK(16, F, is_signed, false) \
+        ); \
+    } \
+    \
+    LGRT_AVR_STUB( \
+        #name, "lgrt_avr" #name, \
+        "push r18\n" \
+        "push r19\n" \
+        "push r20\n" \
+        "push r22\n" \
+        "push r23\n" \
+        "push r30\n" \
+        "push r31\n" \
+        LGRT_AVR_MOVE_PAIR("r24", "r25", "r26", "r27"), \
+        "pop r31\n" \
+        "pop r30\n" \
+        "pop r23\n" \
+        "pop r22\n" \
+        "pop r20\n" \
+        "pop r19\n" \
+        "pop r18\n" \
+    )
+
+LGRT_AVR_FX_DIV16(__divhq3, __HQ_FBIT__, true)
+LGRT_AVR_FX_DIV16(__divha3, __HA_FBIT__, true)
+LGRT_AVR_FX_DIV16(__udivuhq3, __UHQ_FBIT__, false)
+LGRT_AVR_FX_DIV16(__udivuha3, __UHA_FBIT__, false)
+
+/*
+ * r27:r24 / r21:r18, returning in r25:r22. r27:r26 and r31:r30 may change.
+ * Reduced cores would pass the divisor to C on the stack, where C may change
+ * it, so there it gets a pointer to it, and the saved copy stays as it is.
+ */
+#define LGRT_AVR_FX_DIV32_PUSH \
+    "push r21\n" \
+    "push r20\n" \
+    "push r19\n" \
+    "push r18\n" \
+    LGRT_AVR_MOVE_PAIR("r22", "r23", "r24", "r25") \
+    LGRT_AVR_MOVE_PAIR("r24", "r25", "r26", "r27")
+
+#define LGRT_AVR_FX_DIV32_POP \
+    "pop r18\n" \
+    "pop r19\n" \
+    "pop r20\n" \
+    "pop r21\n"
+
+#if defined(__AVR_TINY__)
+
+#if defined(__AVR_HAVE_8BIT_SP__) || defined(__AVR_SP8__)
+#define LGRT_AVR_FX_DIVISOR_HIGH "clr r21\n"
+#else
+#define LGRT_AVR_FX_DIVISOR_HIGH "in r21, " LGRT_AVR_SPH "\n"
+#endif
+
+#define LGRT_AVR_FX_DIV32(name, F, is_signed) \
+    LGRT_AVR_HELPER uint32_t lgrt_avr##name( \
+        uint32_t a, const uint32_t *b \
+    ) { \
+        return lgrt_fx_shared_div32( \
+            a, *b, LGRT_FX_PACK(32, F, is_signed, false) \
+        ); \
+    } \
+    \
+    LGRT_AVR_STUB( \
+        #name, "lgrt_avr" #name, \
+        LGRT_AVR_FX_DIV32_PUSH \
+        "in r20, " LGRT_AVR_SPL "\n" \
+        LGRT_AVR_FX_DIVISOR_HIGH \
+        "subi r20, -1\n" \
+        "sbci r21, -1\n", \
+        LGRT_AVR_FX_DIV32_POP \
+    )
+
+#else
+
+#define LGRT_AVR_FX_DIV32(name, F, is_signed) \
+    LGRT_AVR_HELPER uint32_t lgrt_avr##name(uint32_t a, uint32_t b) { \
+        return lgrt_fx_shared_div32( \
+            a, b, LGRT_FX_PACK(32, F, is_signed, false) \
+        ); \
+    } \
+    \
+    LGRT_AVR_STUB( \
+        #name, "lgrt_avr" #name, \
+        LGRT_AVR_FX_DIV32_PUSH, \
+        LGRT_AVR_FX_DIV32_POP \
+    )
+
+#endif
+
+LGRT_AVR_FX_DIV32(__divsa3, __SA_FBIT__, true)
+LGRT_AVR_FX_DIV32(__udivusa3, __USA_FBIT__, false)
+
+/*
+ * The count in r24, and the value in r22, r23:r22, or r21:r18, returning in
+ * r24, r25:r24, or r25:r22, which changes what held the value but no more.
+ */
+#define LGRT_AVR_FX_ROUND8(m, M, is_signed) \
+    LGRT_AVR_HELPER uint8_t lgrt_avr__round##m##3(uint8_t x, int8_t n) { \
+        return (uint8_t)lgrt_fx_shared_round8( \
+            x, n, LGRT_FX_PACK(8, __##M##_FBIT__, is_signed, false) \
+        ); \
+    } \
+    \
+    LGRT_AVR_STUB( \
+        "__round" #m "3", "lgrt_avr__round" #m "3", \
+        "push r25\n" \
+        "push r23\n" \
+        LGRT_AVR_PUSH_18_TO_21 \
+        "mov " LGRT_AVR_TMP ", r22\n" \
+        "mov r22, r24\n" \
+        "mov r24, " LGRT_AVR_TMP "\n", \
+        LGRT_AVR_POP_18_TO_21 \
+        "pop r23\n" \
+        "pop r25\n" \
+    )
+
+#define LGRT_AVR_FX_ROUND16(m, M, is_signed) \
+    LGRT_AVR_HELPER uint16_t lgrt_avr__round##m##3(uint16_t x, int8_t n) { \
+        return lgrt_fx_shared_round16( \
+            x, n, LGRT_FX_PACK(16, __##M##_FBIT__, is_signed, false) \
+        ); \
+    } \
+    \
+    LGRT_AVR_STUB( \
+        "__round" #m "3", "lgrt_avr__round" #m "3", \
+        LGRT_AVR_PUSH_18_TO_21 \
+        "mov " LGRT_AVR_TMP ", r24\n" \
+        LGRT_AVR_MOVE_PAIR("r24", "r25", "r22", "r23") \
+        "mov r22, " LGRT_AVR_TMP "\n", \
+        LGRT_AVR_POP_18_TO_21 \
+    )
+
+#define LGRT_AVR_FX_ROUND32(m, M, is_signed) \
+    LGRT_AVR_HELPER uint32_t lgrt_avr__round##m##3(uint32_t x, int8_t n) { \
+        return lgrt_fx_shared_round32( \
+            x, n, LGRT_FX_PACK(32, __##M##_FBIT__, is_signed, false) \
+        ); \
+    } \
+    \
+    LGRT_AVR_STUB( \
+        "__round" #m "3", "lgrt_avr__round" #m "3", \
+        LGRT_AVR_PUSH_X_Z \
+        "mov " LGRT_AVR_TMP ", r24\n" \
+        LGRT_AVR_MOVE_PAIR("r24", "r25", "r20", "r21") \
+        LGRT_AVR_MOVE_PAIR("r22", "r23", "r18", "r19") \
+        "mov r20, " LGRT_AVR_TMP "\n", \
+        LGRT_AVR_POP_X_Z \
+    )
+
+LGRT_AVR_FX_ROUND8(qq, QQ, true)
+LGRT_AVR_FX_ROUND8(uqq, UQQ, false)
+LGRT_AVR_FX_ROUND16(hq, HQ, true)
+LGRT_AVR_FX_ROUND16(ha, HA, true)
+LGRT_AVR_FX_ROUND16(uhq, UHQ, false)
+LGRT_AVR_FX_ROUND16(uha, UHA, false)
+LGRT_AVR_FX_ROUND32(sq, SQ, true)
+LGRT_AVR_FX_ROUND32(sa, SA, true)
+LGRT_AVR_FX_ROUND32(usq, USQ, false)
+LGRT_AVR_FX_ROUND32(usa, USA, false)
+
+/*
+ * The compilers add and subtract constants inline on 8 bytes, and saturate
+ * with these: r25:r18 become all ones if the carry is set, and zeros with the
+ * other, with nothing else changed.
+ */
+#if !defined(__AVR_TINY__)
+
+__asm__ (
+    LGRT_AVR_BEGIN("__sbc_8")
+    "sbc r18, r18\n"
+    "sbc r19, r19\n"
+    "sbc r20, r20\n"
+    "sbc r21, r21\n"
+    "sbc r22, r22\n"
+    "sbc r23, r23\n"
+    "sbc r24, r24\n"
+    "sbc r25, r25\n"
+    "ret\n"
+    LGRT_AVR_END("__sbc_8")
+);
+
+__asm__ (
+    LGRT_AVR_BEGIN("__clr_8")
+    "clr r18\n"
+    "clr r19\n"
+    "clr r20\n"
+    "clr r21\n"
+    "clr r22\n"
+    "clr r23\n"
+    "clr r24\n"
+    "clr r25\n"
+    "ret\n"
+    LGRT_AVR_END("__clr_8")
+);
+
+/* r25:r18 and r17:r10, in place, with nothing else changed. */
+#define LGRT_AVR_FX_8_BYTES(op, expression) \
+    LGRT_AVR_HELPER uint64_t lgrt_avr_fx_##op(uint64_t a, uint64_t b) { \
+        return expression; \
+    }
+
+#define LGRT_AVR_FX_8_BYTES_STUB(name, op) \
+    LGRT_AVR_STUB( \
+        name, "lgrt_avr_fx_" #op, LGRT_AVR_PUSH_X_Z, LGRT_AVR_POP_X_Z \
+    )
+
+LGRT_AVR_FX_8_BYTES(ssadd, lgrt_fx_ssadd64(a, b, 64))
+LGRT_AVR_FX_8_BYTES(sssub, lgrt_fx_sssub64(a, b, 64))
+LGRT_AVR_FX_8_BYTES(usadd, lgrt_fx_usadd64(a, b, 64))
+LGRT_AVR_FX_8_BYTES(ussub, lgrt_fx_ussub64(a, b))
+
+LGRT_AVR_FX_8_BYTES_STUB("__ssadddq3", ssadd)
+LGRT_AVR_FX_8_BYTES_STUB("__ssaddda3", ssadd)
+LGRT_AVR_FX_8_BYTES_STUB("__ssaddta3", ssadd)
+LGRT_AVR_FX_8_BYTES_STUB("__sssubdq3", sssub)
+LGRT_AVR_FX_8_BYTES_STUB("__sssubda3", sssub)
+LGRT_AVR_FX_8_BYTES_STUB("__sssubta3", sssub)
+LGRT_AVR_FX_8_BYTES_STUB("__usaddudq3", usadd)
+LGRT_AVR_FX_8_BYTES_STUB("__usadduda3", usadd)
+LGRT_AVR_FX_8_BYTES_STUB("__usadduta3", usadd)
+LGRT_AVR_FX_8_BYTES_STUB("__ussubudq3", ussub)
+LGRT_AVR_FX_8_BYTES_STUB("__ussubuda3", ussub)
+LGRT_AVR_FX_8_BYTES_STUB("__ussubuta3", ussub)
+
+#endif
 
 #endif
 
