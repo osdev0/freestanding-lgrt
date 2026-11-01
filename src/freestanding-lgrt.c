@@ -227,14 +227,17 @@ LGRT_AAPCS int __clzdi2(int64_t a) {
 }
 
 #if LGRT_HAS_INT128
-LGRT_AAPCS int __clzti2(lgrt_i128 a);
-LGRT_AAPCS int __clzti2(lgrt_i128 a) {
-    lgrt_u128 x = (lgrt_u128)a;
+static inline uint32_t lgrt_clz128(lgrt_u128 x) {
     uint64_t hi = (uint64_t)(x >> 64);
     uint64_t lo = (uint64_t)x;
     uint64_t z = (uint64_t)(hi == 0);
 
-    return (int)((z << 6) + lgrt_clz64(hi | (lo & ((uint64_t)0 - z))));
+    return ((uint32_t)z << 6) + lgrt_clz64(hi | (lo & ((uint64_t)0 - z)));
+}
+
+LGRT_AAPCS int __clzti2(lgrt_i128 a);
+LGRT_AAPCS int __clzti2(lgrt_i128 a) {
+    return (int)lgrt_clz128((lgrt_u128)a);
 }
 #endif
 
@@ -617,9 +620,10 @@ typedef int lgrt_shift_count;
 
 /*
  * The reduced AVR cores, and GCC 4.9 for MSP430, call these for shifts by 32
- * too, so they split and join their values in memory there.
+ * too, so they split and join their values in memory there. The other AVR
+ * cores do it too, where a shift would be a call.
  */
-#if defined(__AVR_TINY__) || defined(__MSP430__)
+#if defined(__AVR__) || defined(__MSP430__)
 union lgrt_words_64 {
     uint64_t whole;
     uint32_t words[2];
@@ -2295,6 +2299,5794 @@ LGRT_AAPCS int __aeabi_memcmp8(
 ) __attribute__((__alias__("__aeabi_memcmp")));
 
 #pragma GCC diagnostic pop
+
+/*
+ * These go byte by byte, through volatile accesses that compilers cannot merge
+ * into the misaligned ones that would call these.
+ */
+
+static inline void lgrt_aeabi_read_bytes(
+    void *value, const void *address, size_t n
+) {
+    unsigned char *d = value;
+    const volatile unsigned char *s = address;
+
+    for (size_t i = 0; i < n; i++) {
+        d[i] = s[i];
+    }
+}
+
+static inline void lgrt_aeabi_write_bytes(
+    void *address, const void *value, size_t n
+) {
+    volatile unsigned char *d = address;
+    const unsigned char *s = value;
+
+    for (size_t i = 0; i < n; i++) {
+        d[i] = s[i];
+    }
+}
+
+LGRT_AAPCS int32_t __aeabi_uread4(void *address);
+LGRT_AAPCS int32_t __aeabi_uread4(void *address) {
+    int32_t value;
+
+    lgrt_aeabi_read_bytes(&value, address, sizeof(int32_t));
+    return value;
+}
+
+LGRT_AAPCS int64_t __aeabi_uread8(void *address);
+LGRT_AAPCS int64_t __aeabi_uread8(void *address) {
+    int64_t value;
+
+    lgrt_aeabi_read_bytes(&value, address, sizeof(int64_t));
+    return value;
+}
+
+LGRT_AAPCS int32_t __aeabi_uwrite4(int32_t value, void *address);
+LGRT_AAPCS int32_t __aeabi_uwrite4(int32_t value, void *address) {
+    lgrt_aeabi_write_bytes(address, &value, sizeof(int32_t));
+    return value;
+}
+
+LGRT_AAPCS int64_t __aeabi_uwrite8(int64_t value, void *address);
+LGRT_AAPCS int64_t __aeabi_uwrite8(int64_t value, void *address) {
+    lgrt_aeabi_write_bytes(address, &value, sizeof(int64_t));
+    return value;
+}
+
+#endif
+
+/*
+ * A function taking float cannot be declared on x86-64 without SSE, nothing
+ * telling that Clang can do it with x87 off too, or on AArch64 without its
+ * floating-point registers, of which __ARM_FP tells, or __FP_FAST_FMAF before
+ * GCC 5.
+ *
+ * Workaround: GCC, Alpha: with -mno-fp-regs, it cannot compile a function that
+ * returns float, and all that tells of that option is __GCC_IEC_559 being 0,
+ * which GCC 4.8 does not define.
+ */
+#if (defined(__x86_64__) && !defined(__SSE__)) \
+ || (defined(__aarch64__) && !defined(__ARM_FP) && !defined(__FP_FAST_FMAF)) \
+ || (defined(__alpha__) && (!defined(__GCC_IEC_559) || __GCC_IEC_559 == 0))
+#define LGRT_SOFT_FLOAT 0
+#else
+#define LGRT_SOFT_FLOAT 1
+#endif
+
+/*
+ * The format of the x87, which x86-64 has without SSE too, and that of 96 bits
+ * of m68k, on all but ColdFire, whose long double is 64-bit.
+ */
+#if defined(__i386__) || defined(__x86_64__) \
+ || (defined(__m68k__) && __LDBL_MANT_DIG__ == 64)
+#define LGRT_SOFT_XF 1
+#else
+#define LGRT_SOFT_XF 0
+#endif
+
+/*
+ * The routines of long double on Alpha pass it in ways that C has no part in,
+ * and so go on without float and double.
+ */
+#if defined(__alpha__) && __LDBL_MANT_DIG__ == 113
+#define LGRT_ALPHA_QUAD 1
+#else
+#define LGRT_ALPHA_QUAD 0
+#endif
+
+#if LGRT_SOFT_FLOAT || LGRT_SOFT_XF || LGRT_ALPHA_QUAD
+
+/*
+ * The soft-float routines work on bits alone, in the default rounding mode,
+ * track no exceptions, and handle subnormal numbers in full. The macros below
+ * generate them for a binary format, from:
+ *
+ * fmt, the name of the format in the routines' names;
+ * C, the type that passes a value of it;
+ * T, an unsigned type, no narrower than unsigned int, of W bits, that holds
+ * its bits and has at least F + 5 bits;
+ * E, the width of its exponent field, and F, that of its fraction field.
+ *
+ * In T, a value has its fraction at the bottom, then its exponent, then its
+ * sign. A significand being worked on has its integer bit at bit F + 3, above
+ * a guard bit, a round bit, and a sticky bit, the last of which keeps whether
+ * any bit below it was lost: enough to round correctly at the end. Products
+ * come from lgrt_fp_wide_mulW, and bit counts of integers from lgrt_clzN.
+ *
+ * lgrt_FMT_to_bits and lgrt_FMT_from_bits copy the bits between C and T.
+ * Compilers could recognise what the routines do to bits passed in the open as
+ * floating-point operations, and call the same routines for those, or load
+ * constant results with conversions, so the bits are hidden from them. Only a
+ * signaling NaN returned in an x87 or m68k register changes on the way.
+ *
+ * The base procedure call standard of 32-bit ARM, which compilers call these
+ * with, passes float as it does uint32_t, and double as it does uint64_t, and
+ * so do AVR and MSP430, by the sizes of arguments. There C is one of those.
+ * That also lets ARM compile them with -mgeneral-regs-only, where GCC rejects
+ * floating-point types with nothing to tell of it, and keeps them off the
+ * floating-point registers. It makes them smaller on the others, and needs no
+ * copies of bits.
+ */
+
+#if defined(__arm__) || defined(__AVR__) || defined(__MSP430__)
+#define LGRT_FP_PASSED_AS_INT 1
+#else
+#define LGRT_FP_PASSED_AS_INT 0
+#endif
+
+/*
+ * MIPS16 code has no access to the floating-point registers that pass these
+ * values, and would need helpers for that, so these are not MIPS16 code.
+ */
+#if defined(__mips16) && defined(__mips_hard_float)
+#define LGRT_FP_ABI __attribute__((__nomips16__))
+#else
+#define LGRT_FP_ABI LGRT_AAPCS
+#endif
+
+/* AVR and MSP430 keep helpers apart, for size, at any optimisation level. */
+#if defined(__AVR__) || defined(__MSP430__)
+#define LGRT_FP_HELPER static __attribute__((__noinline__))
+#else
+#define LGRT_FP_HELPER static inline
+#endif
+
+/* Another name for a routine, for targets with names of their own. */
+#define LGRT_FP_ALIAS(R, name, target, params) \
+    LGRT_FP_ABI R name params; \
+    LGRT_FP_ABI R name params __attribute__((__alias__(target)));
+
+#define LGRT_FP_SIGN(T, E, F) ((T)1 << ((E) + (F)))
+#define LGRT_FP_INT_BIT(T, F) ((T)1 << (F))
+#define LGRT_FP_INF(T, E, F) ((((T)1 << (E)) - 1) << (F))
+#define LGRT_FP_EXP_MAX(E) ((1 << (E)) - 1)
+#define LGRT_FP_BIAS(E) ((1 << ((E) - 1)) - 1)
+
+/*
+ * The quiet bit is the other way round on MIPS before NaN 2008, on PA-RISC,
+ * and on SuperH.
+ */
+#if (defined(__mips__) && !defined(__mips_nan2008)) || defined(__hppa__) \
+ || defined(__sh__)
+#define LGRT_FP_NAN(T, E, F) \
+    (LGRT_FP_INF(T, E, F) | (((T)1 << ((F) - 1)) - 1))
+#define LGRT_WIDE_QUIET(bit) lgrt_wide_sub(bit, lgrt_wide_make(0, 1))
+#else
+#define LGRT_FP_NAN(T, E, F) (LGRT_FP_INF(T, E, F) | ((T)1 << ((F) - 1)))
+/* In the 96-bit format of m68k, the FPU and compilers set all the bits. */
+#if defined(__m68k__)
+#define LGRT_WIDE_QUIET(bit) \
+    lgrt_wide_or(bit, lgrt_wide_sub(bit, lgrt_wide_make(0, 1)))
+#else
+#define LGRT_WIDE_QUIET(bit) (bit)
+#endif
+#endif
+
+#if LGRT_FP_PASSED_AS_INT
+#define LGRT_FP_BITS(fmt, C, T) \
+    static inline T lgrt_##fmt##_to_bits(T bits) { \
+        return bits; \
+    } \
+    \
+    static inline T lgrt_##fmt##_from_bits(T bits) { \
+        return bits; \
+    }
+#else
+#define LGRT_FP_BITS(fmt, C, T) \
+    static inline LGRT_FP_ABI T lgrt_##fmt##_to_bits(C value) { \
+        T bits; \
+        \
+        __builtin_memcpy(&bits, &value, sizeof(T)); \
+        __asm__ ("" : "+g"(bits)); \
+        return bits; \
+    } \
+    \
+    static inline LGRT_FP_ABI C lgrt_##fmt##_from_bits(T bits) { \
+        C value; \
+        \
+        __asm__ ("" : "+g"(bits)); \
+        __builtin_memcpy(&value, &bits, sizeof(T)); \
+        return value; \
+    }
+#endif
+
+/*
+ * A shift right that keeps in the low bit whether any bit was lost. A count
+ * past F + 4 leaves no bit of a significand, which never reaches bit F + 5.
+ */
+#define LGRT_FP_STICKY_SHIFT(fmt, T, F) \
+    LGRT_FP_HELPER T lgrt_##fmt##_sticky_shift(T sig, unsigned int n) { \
+        T kept; \
+        \
+        if (n > (F) + 4) { \
+            return (T)(sig != 0); \
+        } \
+        kept = sig >> n; \
+        return kept | (T)((kept << n) != sig); \
+    }
+
+/*
+ * Packs a result of biased exponent e, with sig below bit F + 4. Exponents are
+ * unsigned for -ftrapv, and e may have wrapped below zero. The rounded
+ * significand is added to the exponent field less one: the integer bit of a
+ * normal result makes up for that, a subnormal result has none, and rounding
+ * up into the next exponent, or into infinity, carries by itself.
+ */
+#define LGRT_FP_ROUND_PACK(fmt, T, E, F) \
+    LGRT_FP_HELPER T lgrt_##fmt##_round_pack(T sign, unsigned int e, T sig) { \
+        T bits; \
+        unsigned int low; \
+        \
+        if ((int)e >= LGRT_FP_EXP_MAX(E)) { \
+            return sign | LGRT_FP_INF(T, E, F); \
+        } \
+        if ((int)e <= 0) { \
+            sig = lgrt_##fmt##_sticky_shift(sig, 1 - e); \
+            e = 1; \
+        } \
+        low = (unsigned int)sig & 7; \
+        bits = ((T)(e - 1) << (F)) + (sig >> 3); \
+        if (low > 4 || (low == 4 && (bits & 1) != 0)) { \
+            bits += 1; \
+        } \
+        return sign | bits; \
+    }
+
+/*
+ * With the larger magnitude first, a NaN or an infinity is first too, and the
+ * subtraction of the significands cannot go below zero. An exact cancellation
+ * gives +0 in the default rounding mode. Only a subtraction of nearly equal
+ * values shifts by more than one bit, and those lose no bits to the sticky
+ * bit.
+ */
+#define LGRT_FP_ADD(fmt, T, E, F) \
+    LGRT_FP_HELPER T lgrt_##fmt##_add(T a, T b) { \
+        T sign = LGRT_FP_SIGN(T, E, F); \
+        T inf = LGRT_FP_INF(T, E, F); \
+        T int_bit = LGRT_FP_INT_BIT(T, F); \
+        bool swapped = (a & (sign - 1)) < (b & (sign - 1)); \
+        T big = swapped ? b : a; \
+        T magnitude = big & (sign - 1); \
+        T other_magnitude = (swapped ? a : b) & (sign - 1); \
+        T sig = magnitude & (int_bit - 1); \
+        T other_sig = other_magnitude & (int_bit - 1); \
+        unsigned int e = (unsigned int)(magnitude >> (F)); \
+        unsigned int other_e = (unsigned int)(other_magnitude >> (F)); \
+        \
+        if (magnitude >= inf) { \
+            if (magnitude > inf \
+             || (other_magnitude == inf && ((a ^ b) & sign) != 0)) { \
+                return LGRT_FP_NAN(T, E, F); \
+            } \
+            return big; \
+        } \
+        if (e != 0) { \
+            sig |= int_bit; \
+        } else { \
+            e = 1; \
+        } \
+        if (other_e != 0) { \
+            other_sig |= int_bit; \
+        } else { \
+            other_e = 1; \
+        } \
+        sig <<= 3; \
+        other_sig = lgrt_##fmt##_sticky_shift(other_sig << 3, e - other_e); \
+        if (((a ^ b) & sign) == 0) { \
+            sig += other_sig; \
+            if (sig >= int_bit << 4) { \
+                sig = (sig >> 1) | (sig & 1); \
+                e += 1; \
+            } \
+        } else { \
+            sig -= other_sig; \
+            if (sig == 0) { \
+                return 0; \
+            } \
+            while (sig < int_bit << 3 && e > 1) { \
+                sig += sig; \
+                e -= 1; \
+            } \
+        } \
+        return lgrt_##fmt##_round_pack(big & sign, e, sig); \
+    }
+
+#define LGRT_FP_ZERO 0
+#define LGRT_FP_FINITE 1
+#define LGRT_FP_INFINITE 2
+#define LGRT_FP_NOT_A_NUMBER 3
+
+/*
+ * The special cases of multiplication and division go by the kinds of their
+ * operands, which keeps them to one comparison of each with infinity.
+ */
+#define LGRT_FP_KIND(fmt, T, E, F) \
+    LGRT_FP_HELPER int lgrt_##fmt##_kind(T magnitude) { \
+        if (magnitude > LGRT_FP_INF(T, E, F)) { \
+            return LGRT_FP_NOT_A_NUMBER; \
+        } \
+        if (magnitude == LGRT_FP_INF(T, E, F)) { \
+            return LGRT_FP_INFINITE; \
+        } \
+        return magnitude != 0 ? LGRT_FP_FINITE : LGRT_FP_ZERO; \
+    }
+
+/* The significand of a finite nonzero value, its integer bit set. */
+#define LGRT_FP_NORMALISE(fmt, T, F) \
+    LGRT_FP_HELPER T lgrt_##fmt##_normalise(T magnitude, unsigned int *e) { \
+        T int_bit = LGRT_FP_INT_BIT(T, F); \
+        T sig = magnitude & (int_bit - 1); \
+        unsigned int exponent = (unsigned int)(magnitude >> (F)); \
+        \
+        if (exponent != 0) { \
+            sig |= int_bit; \
+        } else { \
+            exponent = 1; \
+            while (sig < int_bit) { \
+                sig += sig; \
+                exponent -= 1; \
+            } \
+        } \
+        *e = exponent; \
+        return sig; \
+    }
+
+#if LGRT_SOFT_FLOAT
+/* These give the two halves of the product of two values of W bits. */
+static inline void lgrt_fp_wide_mul32(
+    uint32_t a, uint32_t b, uint32_t *hi, uint32_t *lo
+) {
+    uint64_t product = (uint64_t)a * b;
+
+    *hi = LGRT_HIGH_32(product);
+    *lo = (uint32_t)product;
+}
+#endif
+
+/*
+ * The product of the significands has 2F + 1 or 2F + 2 bits, so a shift by
+ * F - 3 lines it up with the significand worked on, or one bit above that.
+ */
+#define LGRT_FP_MUL(fmt, T, W, E, F) \
+    static inline T lgrt_##fmt##_mul(T a, T b) { \
+        T sign_bit = LGRT_FP_SIGN(T, E, F); \
+        T sign = (a ^ b) & sign_bit; \
+        T magnitude_a = a & (sign_bit - 1); \
+        T magnitude_b = b & (sign_bit - 1); \
+        int kind_a = lgrt_##fmt##_kind(magnitude_a); \
+        int kind_b = lgrt_##fmt##_kind(magnitude_b); \
+        T sig_a; \
+        T sig_b; \
+        T hi; \
+        T lo; \
+        T sig; \
+        unsigned int e_a; \
+        unsigned int e_b; \
+        unsigned int e; \
+        \
+        if (kind_a == LGRT_FP_NOT_A_NUMBER \
+         || kind_b == LGRT_FP_NOT_A_NUMBER) { \
+            return LGRT_FP_NAN(T, E, F); \
+        } \
+        if (kind_a == LGRT_FP_INFINITE || kind_b == LGRT_FP_INFINITE) { \
+            if (kind_a == LGRT_FP_ZERO || kind_b == LGRT_FP_ZERO) { \
+                return LGRT_FP_NAN(T, E, F); \
+            } \
+            return sign | LGRT_FP_INF(T, E, F); \
+        } \
+        if (kind_a == LGRT_FP_ZERO || kind_b == LGRT_FP_ZERO) { \
+            return sign; \
+        } \
+        sig_a = lgrt_##fmt##_normalise(magnitude_a, &e_a); \
+        sig_b = lgrt_##fmt##_normalise(magnitude_b, &e_b); \
+        e = e_a + e_b - LGRT_FP_BIAS(E); \
+        lgrt_fp_wide_mul##W(sig_a, sig_b, &hi, &lo); \
+        sig = (hi << ((W) - (F) + 3)) | (lo >> ((F) - 3)) \
+            | (T)((lo & (((T)1 << ((F) - 3)) - 1)) != 0); \
+        if (sig >= LGRT_FP_INT_BIT(T, F) << 4) { \
+            sig = (sig >> 1) | (sig & 1); \
+            e += 1; \
+        } \
+        return lgrt_##fmt##_round_pack(sign, e, sig); \
+    }
+
+/*
+ * With the remainder made no smaller than the divisor and less than twice it,
+ * long division gives the integer bit first, and F + 3 bits after that.
+ */
+#define LGRT_FP_DIV(fmt, T, E, F) \
+    static inline T lgrt_##fmt##_div(T a, T b) { \
+        T sign_bit = LGRT_FP_SIGN(T, E, F); \
+        T sign = (a ^ b) & sign_bit; \
+        T magnitude_a = a & (sign_bit - 1); \
+        T magnitude_b = b & (sign_bit - 1); \
+        int kind_a = lgrt_##fmt##_kind(magnitude_a); \
+        int kind_b = lgrt_##fmt##_kind(magnitude_b); \
+        T quotient = 0; \
+        T rem; \
+        T divisor; \
+        unsigned int e_a; \
+        unsigned int e_b; \
+        unsigned int e; \
+        \
+        if (kind_a == LGRT_FP_NOT_A_NUMBER \
+         || kind_b == LGRT_FP_NOT_A_NUMBER \
+         || (kind_a == kind_b && kind_a != LGRT_FP_FINITE)) { \
+            return LGRT_FP_NAN(T, E, F); \
+        } \
+        if (kind_a == LGRT_FP_INFINITE || kind_b == LGRT_FP_ZERO) { \
+            return sign | LGRT_FP_INF(T, E, F); \
+        } \
+        if (kind_b == LGRT_FP_INFINITE || kind_a == LGRT_FP_ZERO) { \
+            return sign; \
+        } \
+        rem = lgrt_##fmt##_normalise(magnitude_a, &e_a); \
+        divisor = lgrt_##fmt##_normalise(magnitude_b, &e_b); \
+        e = e_a - e_b + LGRT_FP_BIAS(E); \
+        if (rem < divisor) { \
+            rem += rem; \
+            e -= 1; \
+        } \
+        for (size_t i = 0; i < (F) + 4; i++) { \
+            quotient += quotient; \
+            if (rem >= divisor) { \
+                rem -= divisor; \
+                quotient |= 1; \
+            } \
+            rem += rem; \
+        } \
+        quotient |= (T)(rem != 0); \
+        return lgrt_##fmt##_round_pack(sign, e, quotient); \
+    }
+
+#define LGRT_FP_ARITHMETIC_ROUTINES(fmt, C, T, E, F) \
+    LGRT_FP_ABI C __add##fmt##3(C a, C b); \
+    LGRT_FP_ABI C __add##fmt##3(C a, C b) { \
+        T x = lgrt_##fmt##_to_bits(a); \
+        T y = lgrt_##fmt##_to_bits(b); \
+        \
+        return lgrt_##fmt##_from_bits(lgrt_##fmt##_add(x, y)); \
+    } \
+    \
+    LGRT_FP_ABI C __sub##fmt##3(C a, C b); \
+    LGRT_FP_ABI C __sub##fmt##3(C a, C b) { \
+        T x = lgrt_##fmt##_to_bits(a); \
+        T y = lgrt_##fmt##_to_bits(b) ^ LGRT_FP_SIGN(T, E, F); \
+        \
+        return lgrt_##fmt##_from_bits(lgrt_##fmt##_add(x, y)); \
+    } \
+    \
+    LGRT_FP_ABI C __mul##fmt##3(C a, C b); \
+    LGRT_FP_ABI C __mul##fmt##3(C a, C b) { \
+        T x = lgrt_##fmt##_to_bits(a); \
+        T y = lgrt_##fmt##_to_bits(b); \
+        \
+        return lgrt_##fmt##_from_bits(lgrt_##fmt##_mul(x, y)); \
+    } \
+    \
+    LGRT_FP_ABI C __div##fmt##3(C a, C b); \
+    LGRT_FP_ABI C __div##fmt##3(C a, C b) { \
+        T x = lgrt_##fmt##_to_bits(a); \
+        T y = lgrt_##fmt##_to_bits(b); \
+        \
+        return lgrt_##fmt##_from_bits(lgrt_##fmt##_div(x, y)); \
+    } \
+    \
+    LGRT_FP_ABI C __neg##fmt##2(C a); \
+    LGRT_FP_ABI C __neg##fmt##2(C a) { \
+        T x = lgrt_##fmt##_to_bits(a) ^ LGRT_FP_SIGN(T, E, F); \
+        \
+        return lgrt_##fmt##_from_bits(x); \
+    }
+
+/*
+ * Compilers read the result of a comparison as all of the register that
+ * returns it on some targets, and as its low part on others, down to the low
+ * byte on AVR, so it is extended to all of that register. Its value is -1, 0,
+ * or 1, or unordered if either operand is a NaN.
+ */
+#if LGRT_64BIT || defined(__x86_64__) || defined(__mips64)
+typedef int64_t lgrt_fp_cmp;
+#else
+typedef int lgrt_fp_cmp;
+#endif
+
+#define LGRT_FP_COMPARE(fmt, T, E, F) \
+    LGRT_FP_HELPER int lgrt_##fmt##_compare(T a, T b, int unordered) { \
+        T sign = LGRT_FP_SIGN(T, E, F); \
+        T inf = LGRT_FP_INF(T, E, F); \
+        T magnitude_a = a & (sign - 1); \
+        T magnitude_b = b & (sign - 1); \
+        bool negative = (a & sign) != 0; \
+        \
+        if (magnitude_a > inf || magnitude_b > inf) { \
+            return unordered; \
+        } \
+        if (a == b || (magnitude_a | magnitude_b) == 0) { \
+            return 0; \
+        } \
+        if (((a ^ b) & sign) != 0) { \
+            return negative ? -1 : 1; \
+        } \
+        return (magnitude_a < magnitude_b) != negative ? -1 : 1; \
+    }
+
+#define LGRT_FP_COMPARE_ROUTINE(fmt, C, T, name, unordered) \
+    LGRT_FP_ABI lgrt_fp_cmp name(C a, C b); \
+    LGRT_FP_ABI lgrt_fp_cmp name(C a, C b) { \
+        T x = lgrt_##fmt##_to_bits(a); \
+        T y = lgrt_##fmt##_to_bits(b); \
+        \
+        return lgrt_##fmt##_compare(x, y, unordered); \
+    }
+
+/*
+ * Comparisons with the same value for unordered operands are one routine under
+ * several names.
+ *
+ * Workaround: Clang, AVR: it writes an alias in a form that its own assembler
+ * alone takes, so they stay apart there.
+ */
+#if defined(__clang__) && defined(__AVR__)
+#define LGRT_FP_COMPARE_ALIAS(fmt, C, T, name, target, unordered) \
+    LGRT_FP_COMPARE_ROUTINE(fmt, C, T, name, unordered)
+#else
+#define LGRT_FP_COMPARE_ALIAS(fmt, C, T, name, target, unordered) \
+    LGRT_FP_ABI lgrt_fp_cmp name(C a, C b); \
+    LGRT_FP_ABI lgrt_fp_cmp name(C a, C b) \
+        __attribute__((__alias__(target)));
+#endif
+
+#define LGRT_FP_RELATION_NAMES(fmt, C, T) \
+    LGRT_FP_COMPARE_ROUTINE(fmt, C, T, __lt##fmt##2, 1) \
+    LGRT_FP_COMPARE_ALIAS(fmt, C, T, __le##fmt##2, "__lt" #fmt "2", 1) \
+    LGRT_FP_COMPARE_ALIAS(fmt, C, T, __eq##fmt##2, "__lt" #fmt "2", 1) \
+    LGRT_FP_COMPARE_ALIAS(fmt, C, T, __ne##fmt##2, "__lt" #fmt "2", 1) \
+    LGRT_FP_COMPARE_ROUTINE(fmt, C, T, __gt##fmt##2, -1) \
+    LGRT_FP_COMPARE_ALIAS(fmt, C, T, __ge##fmt##2, "__gt" #fmt "2", -1)
+
+#define LGRT_FP_COMPARE_NAMES(fmt, C, T) \
+    LGRT_FP_RELATION_NAMES(fmt, C, T) \
+    LGRT_FP_COMPARE_ALIAS(fmt, C, T, __cmp##fmt##2, "__lt" #fmt "2", 1)
+
+#define LGRT_FP_UNORD_ROUTINE(fmt, C, T, E, F) \
+    LGRT_FP_ABI lgrt_fp_cmp __unord##fmt##2(C a, C b); \
+    LGRT_FP_ABI lgrt_fp_cmp __unord##fmt##2(C a, C b) { \
+        T mask = LGRT_FP_SIGN(T, E, F) - 1; \
+        T x = lgrt_##fmt##_to_bits(a) & mask; \
+        T y = lgrt_##fmt##_to_bits(b) & mask; \
+        \
+        return x > LGRT_FP_INF(T, E, F) || y > LGRT_FP_INF(T, E, F); \
+    }
+
+#define LGRT_FP_COMPARE_ROUTINES(fmt, C, T, E, F) \
+    LGRT_FP_COMPARE_NAMES(fmt, C, T) \
+    LGRT_FP_UNORD_ROUTINE(fmt, C, T, E, F)
+
+#define LGRT_FP_CORE(fmt, C, T, W, E, F) \
+    LGRT_FP_STICKY_SHIFT(fmt, T, F) \
+    LGRT_FP_ROUND_PACK(fmt, T, E, F) \
+    LGRT_FP_ADD(fmt, T, E, F) \
+    LGRT_FP_KIND(fmt, T, E, F) \
+    LGRT_FP_NORMALISE(fmt, T, F) \
+    LGRT_FP_MUL(fmt, T, W, E, F) \
+    LGRT_FP_DIV(fmt, T, E, F) \
+    LGRT_FP_COMPARE(fmt, T, E, F) \
+    LGRT_FP_ARITHMETIC_ROUTINES(fmt, C, T, E, F)
+
+/*
+ * Conversions to an integer type of IW bits, with I and U its signed and
+ * unsigned forms, and mode its name in the routines' names, truncate. A value
+ * out of range gives the nearest integer of the type, and a NaN gives zero.
+ */
+#define LGRT_FP_TO_INT(fmt, C, T, E, F, mode, I, U, IW) \
+    LGRT_FP_HELPER U lgrt_##fmt##_fix_##mode(T a, U limit) { \
+        T magnitude = a & (LGRT_FP_SIGN(T, E, F) - 1); \
+        T int_bit = LGRT_FP_INT_BIT(T, F); \
+        T sig = (magnitude & (int_bit - 1)) | int_bit; \
+        unsigned int e = (unsigned int)(magnitude >> (F)); \
+        U value; \
+        \
+        if (magnitude > LGRT_FP_INF(T, E, F) || e < LGRT_FP_BIAS(E)) { \
+            return 0; \
+        } \
+        e -= LGRT_FP_BIAS(E); \
+        if (magnitude == LGRT_FP_INF(T, E, F) || e >= (IW)) { \
+            return limit; \
+        } \
+        if ((IW) > (F) && e >= (F)) { \
+            value = (U)sig << (e - (F)); \
+        } else { \
+            value = (U)(sig >> ((F) - e)); \
+        } \
+        return value > limit ? limit : value; \
+    } \
+    \
+    LGRT_FP_ABI I __fix##fmt##mode(C a); \
+    LGRT_FP_ABI I __fix##fmt##mode(C a) { \
+        T x = lgrt_##fmt##_to_bits(a); \
+        U top = (U)1 << ((IW) - 1); \
+        \
+        if ((x & LGRT_FP_SIGN(T, E, F)) != 0) { \
+            return (I)((U)0 - lgrt_##fmt##_fix_##mode(x, top)); \
+        } \
+        return (I)lgrt_##fmt##_fix_##mode(x, top - 1); \
+    } \
+    \
+    LGRT_FP_ABI U __fixuns##fmt##mode(C a); \
+    LGRT_FP_ABI U __fixuns##fmt##mode(C a) { \
+        T x = lgrt_##fmt##_to_bits(a); \
+        \
+        if ((x & LGRT_FP_SIGN(T, E, F)) != 0) { \
+            return 0; \
+        } \
+        return lgrt_##fmt##_fix_##mode(x, (U)0 - 1); \
+    }
+
+/*
+ * The types that conversions from unsigned integers take them in, by mode.
+ *
+ * Workaround: GCC, 64-bit PowerPC after 4.9, s390x, and SPARC64: for those of
+ * unsigned int, its library calls sign-extend the argument, where the ABI has
+ * it zero-extended and code compiled for that type relies on that. So they
+ * take all of the register there, and narrow it to the low half.
+ */
+#if LGRT_64BIT \
+ && (defined(__powerpc__) || defined(__s390__) || defined(__sparc__))
+typedef uint64_t lgrt_fp_unsigned_si;
+#else
+typedef uint32_t lgrt_fp_unsigned_si;
+#endif
+typedef uint64_t lgrt_fp_unsigned_di;
+#if LGRT_HAS_INT128
+typedef lgrt_u128 lgrt_fp_unsigned_ti;
+#endif
+
+#define LGRT_FP_FROM_INT(fmt, C, T, E, F, mode, I, U, IW) \
+    LGRT_FP_HELPER T lgrt_##fmt##_float_##mode(T sign, U value) { \
+        unsigned int top; \
+        T sig; \
+        \
+        if (value == 0) { \
+            return 0; \
+        } \
+        top = (IW) - 1 - lgrt_clz##IW(value); \
+        if ((IW) <= (F) + 4 || top <= (F) + 3) { \
+            sig = (T)value << ((F) + 3 - top); \
+        } else { \
+            unsigned int lost = top - ((F) + 3); \
+            U kept = value >> lost; \
+            \
+            sig = (T)kept | (T)((kept << lost) != value); \
+        } \
+        return lgrt_##fmt##_round_pack(sign, LGRT_FP_BIAS(E) + top, sig); \
+    } \
+    \
+    LGRT_FP_ABI C __float##mode##fmt(I i); \
+    LGRT_FP_ABI C __float##mode##fmt(I i) { \
+        T sign = i < 0 ? LGRT_FP_SIGN(T, E, F) : 0; \
+        U value = i < 0 ? (U)0 - (U)i : (U)i; \
+        \
+        return lgrt_##fmt##_from_bits( \
+            lgrt_##fmt##_float_##mode(sign, value) \
+        ); \
+    } \
+    \
+    LGRT_FP_ABI C __floatun##mode##fmt(lgrt_fp_unsigned_##mode i); \
+    LGRT_FP_ABI C __floatun##mode##fmt(lgrt_fp_unsigned_##mode i) { \
+        return lgrt_##fmt##_from_bits(lgrt_##fmt##_float_##mode(0, (U)i)); \
+    }
+
+/*
+ * Conversions between a format and a wider one, from the parameters above with
+ * _a for the former and _b for the latter. A value that is subnormal in the
+ * former is normal in the latter, where the integer bit of its significand
+ * adds to the exponent field, and so does a carry from rounding the other way.
+ */
+#define LGRT_FP_EXTEND_BITS(fmt_a, T_a, E_a, F_a, fmt_b, T_b, E_b, F_b) \
+    static inline T_b lgrt_##fmt_b##_from_##fmt_a(T_a x) { \
+        T_a magnitude = x & (LGRT_FP_SIGN(T_a, E_a, F_a) - 1); \
+        T_b bits = (x & LGRT_FP_SIGN(T_a, E_a, F_a)) != 0 \
+            ? LGRT_FP_SIGN(T_b, E_b, F_b) : 0; \
+        T_a sig; \
+        unsigned int e; \
+        \
+        if (magnitude > LGRT_FP_INF(T_a, E_a, F_a)) { \
+            bits = LGRT_FP_NAN(T_b, E_b, F_b); \
+        } else if (magnitude == LGRT_FP_INF(T_a, E_a, F_a)) { \
+            bits |= LGRT_FP_INF(T_b, E_b, F_b); \
+        } else if (magnitude != 0) { \
+            sig = lgrt_##fmt_a##_normalise(magnitude, &e); \
+            e = e + LGRT_FP_BIAS(E_b) - LGRT_FP_BIAS(E_a) - 1; \
+            bits |= ((T_b)e << (F_b)) + ((T_b)sig << ((F_b) - (F_a))); \
+        } \
+        return bits; \
+    }
+
+#define LGRT_FP_EXTEND(fmt_a, C_a, T_a, E_a, F_a, fmt_b, C_b, T_b, E_b, F_b) \
+    LGRT_FP_EXTEND_BITS(fmt_a, T_a, E_a, F_a, fmt_b, T_b, E_b, F_b) \
+    \
+    LGRT_FP_ABI C_b __extend##fmt_a##fmt_b##2(C_a a); \
+    LGRT_FP_ABI C_b __extend##fmt_a##fmt_b##2(C_a a) { \
+        return lgrt_##fmt_b##_from_bits( \
+            lgrt_##fmt_b##_from_##fmt_a(lgrt_##fmt_a##_to_bits(a)) \
+        ); \
+    }
+
+#define LGRT_FP_TRUNC_BITS(fmt_a, T_a, E_a, F_a, fmt_b, T_b, E_b, F_b) \
+    static inline T_a lgrt_##fmt_b##_to_##fmt_a(T_b x) { \
+        T_b magnitude = x & (LGRT_FP_SIGN(T_b, E_b, F_b) - 1); \
+        T_a sign = (x & LGRT_FP_SIGN(T_b, E_b, F_b)) != 0 \
+            ? LGRT_FP_SIGN(T_a, E_a, F_a) : 0; \
+        T_b sig = magnitude & (LGRT_FP_INT_BIT(T_b, F_b) - 1); \
+        T_b kept; \
+        unsigned int e = (unsigned int)(magnitude >> (F_b)); \
+        \
+        if (magnitude > LGRT_FP_INF(T_b, E_b, F_b)) { \
+            return LGRT_FP_NAN(T_a, E_a, F_a); \
+        } \
+        if (magnitude == LGRT_FP_INF(T_b, E_b, F_b)) { \
+            return sign | LGRT_FP_INF(T_a, E_a, F_a); \
+        } \
+        if (e != 0) { \
+            sig |= LGRT_FP_INT_BIT(T_b, F_b); \
+        } else { \
+            e = 1; \
+        } \
+        kept = sig >> ((F_b) - (F_a) - 3); \
+        return lgrt_##fmt_a##_round_pack( \
+            sign, e + LGRT_FP_BIAS(E_a) - LGRT_FP_BIAS(E_b), \
+            (T_a)kept | (T_a)((kept << ((F_b) - (F_a) - 3)) != sig) \
+        ); \
+    }
+
+#define LGRT_FP_TRUNC(fmt_a, C_a, T_a, E_a, F_a, fmt_b, C_b, T_b, E_b, F_b) \
+    LGRT_FP_TRUNC_BITS(fmt_a, T_a, E_a, F_a, fmt_b, T_b, E_b, F_b) \
+    \
+    LGRT_FP_ABI C_a __trunc##fmt_b##fmt_a##2(C_b a); \
+    LGRT_FP_ABI C_a __trunc##fmt_b##fmt_a##2(C_b a) { \
+        return lgrt_##fmt_a##_from_bits( \
+            lgrt_##fmt_b##_to_##fmt_a(lgrt_##fmt_b##_to_bits(a)) \
+        ); \
+    }
+
+#if LGRT_SOFT_FLOAT
+
+#if LGRT_FP_PASSED_AS_INT
+typedef uint32_t lgrt_sf_value;
+#else
+typedef float lgrt_sf_value;
+#endif
+
+LGRT_FP_BITS(sf, lgrt_sf_value, uint32_t)
+LGRT_FP_CORE(sf, lgrt_sf_value, uint32_t, 32, 8, 23)
+LGRT_FP_COMPARE_ROUTINES(sf, lgrt_sf_value, uint32_t, 8, 23)
+LGRT_FP_TO_INT(sf, lgrt_sf_value, uint32_t, 8, 23, si, int32_t, uint32_t, 32)
+LGRT_FP_TO_INT(sf, lgrt_sf_value, uint32_t, 8, 23, di, int64_t, uint64_t, 64)
+LGRT_FP_FROM_INT(sf, lgrt_sf_value, uint32_t, 8, 23, si, int32_t, uint32_t, 32)
+LGRT_FP_FROM_INT(sf, lgrt_sf_value, uint32_t, 8, 23, di, int64_t, uint64_t, 64)
+
+#if LGRT_HAS_INT128
+LGRT_FP_TO_INT(
+    sf, lgrt_sf_value, uint32_t, 8, 23, ti, lgrt_i128, lgrt_u128, 128
+)
+LGRT_FP_FROM_INT(
+    sf, lgrt_sf_value, uint32_t, 8, 23, ti, lgrt_i128, lgrt_u128, 128
+)
+#endif
+
+#endif
+
+/*
+ * The 64-bit format is double, or long double where double is narrower, as on
+ * AVR from GCC 10 by default and SuperH with -m4-single-only. AVR has neither
+ * before that, or with Clang by default. Clang on x86-64 without SSE2 cannot
+ * compile functions that take or return double.
+ */
+#if !LGRT_SOFT_FLOAT \
+ || (__SIZEOF_DOUBLE__ != 8 && __SIZEOF_LONG_DOUBLE__ != 8) \
+ || (defined(__x86_64__) && defined(__clang__) && !defined(__SSE2__))
+#define LGRT_SOFT_DOUBLE 0
+#else
+#define LGRT_SOFT_DOUBLE 1
+#endif
+
+/*
+ * IEEE quad is long double where that has its 113 bits, and __float128 where a
+ * compiler offers that next to a narrower long double. SPARC and Alpha have
+ * routines of other names for it, further down, and of these names for 128-bit
+ * integers and complex values, and on SPARC with -msoft-float. PowerPC has
+ * names of its own, for __float128 and with VSX, and for long double without
+ * VSX.
+ */
+#if LGRT_ALPHA_QUAD
+#define LGRT_QUAD_OWN_NAMES 1
+typedef long double lgrt_quad_value;
+#elif !LGRT_SOFT_FLOAT
+#elif defined(__powerpc__)
+#if defined(__FLOAT128__)
+#define LGRT_SOFT_QUAD 1
+__extension__ typedef __float128 lgrt_quad_value;
+#elif defined(__LONG_DOUBLE_IEEE128__)
+#define LGRT_SOFT_QUAD 1
+typedef long double lgrt_quad_value;
+#endif
+#elif __LDBL_MANT_DIG__ == 113
+typedef long double lgrt_quad_value;
+#if defined(__sparc__)
+#define LGRT_QUAD_OWN_NAMES 1
+#else
+#define LGRT_SOFT_QUAD 1
+#endif
+#elif defined(__SIZEOF_FLOAT128__)
+#define LGRT_SOFT_QUAD 1
+__extension__ typedef __float128 lgrt_quad_value;
+#endif
+
+#if !defined(LGRT_SOFT_QUAD)
+#define LGRT_SOFT_QUAD 0
+#endif
+
+#if !defined(LGRT_QUAD_OWN_NAMES)
+#define LGRT_QUAD_OWN_NAMES 0
+#endif
+
+/*
+ * The double-double format of IBM long double holds a value as the sum of two
+ * doubles, the larger first in memory on either endianness, and only the first
+ * when that is an infinity or a NaN. It comes as long double, or as __ibm128
+ * next to a long double of IEEE quad.
+ */
+#if !LGRT_SOFT_DOUBLE || !defined(__powerpc__)
+#define LGRT_HAS_IBM_128 0
+#elif __LDBL_MANT_DIG__ == 106
+#define LGRT_HAS_IBM_128 1
+typedef long double lgrt_ibm_value;
+#elif defined(__LONG_DOUBLE_IEEE128__) \
+   && (defined(__FLOAT128__) || defined(__VSX__) || defined(__clang__)) \
+   && !(defined(__clang__) && __clang_major__ < 13)
+#define LGRT_HAS_IBM_128 1
+__extension__ typedef __ibm128 lgrt_ibm_value;
+#else
+#define LGRT_HAS_IBM_128 0
+#endif
+
+#define LGRT_SOFT_WIDE \
+    (LGRT_SOFT_QUAD || LGRT_QUAD_OWN_NAMES || LGRT_SOFT_XF)
+
+#if LGRT_SOFT_DOUBLE || LGRT_SOFT_WIDE
+
+/*
+ * In 32-bit pieces, as 32-bit targets have no 128-bit type, and so that 64-bit
+ * ones do not involve the routines for that type. Neither middle sum can
+ * overflow, as (2^32 - 1)^2 + 2^32 - 1 < 2^64.
+ */
+static inline void lgrt_fp_wide_mul64(
+    uint64_t a, uint64_t b, uint64_t *hi, uint64_t *lo
+) {
+    uint32_t a0 = (uint32_t)a;
+    uint32_t a1 = LGRT_HIGH_32(a);
+    uint32_t b0 = (uint32_t)b;
+    uint32_t b1 = LGRT_HIGH_32(b);
+    uint64_t p00 = (uint64_t)a0 * b0;
+    uint64_t m1 = (uint64_t)a1 * b0 + LGRT_HIGH_32(p00);
+    uint64_t m2 = (uint64_t)a0 * b1 + (uint32_t)m1;
+
+    *hi = (uint64_t)a1 * b1 + LGRT_HIGH_32(m1) + LGRT_HIGH_32(m2);
+    *lo = LGRT_JOIN_32((uint32_t)m2, (uint32_t)p00);
+}
+
+#endif
+
+#if LGRT_SOFT_DOUBLE
+
+#if LGRT_FP_PASSED_AS_INT
+typedef uint64_t lgrt_df_value;
+#elif __SIZEOF_DOUBLE__ == 8
+typedef double lgrt_df_value;
+#else
+typedef long double lgrt_df_value;
+#endif
+
+LGRT_FP_BITS(df, lgrt_df_value, uint64_t)
+LGRT_FP_CORE(df, lgrt_df_value, uint64_t, 64, 11, 52)
+
+/*
+ * GCC on AVR takes these results for this format as truth values, nonzero
+ * where the relation holds, as __WITH_DOUBLE_COMPARISON__ being 2 tells. Clang
+ * goes by their sign here, as GCC does for float.
+ */
+#if defined(__AVR__) && defined(__WITH_DOUBLE_COMPARISON__) \
+ && __WITH_DOUBLE_COMPARISON__ == 2
+
+#define LGRT_DF_TRUTH_ROUTINE(name, unordered, op) \
+    LGRT_FP_ABI lgrt_fp_cmp name(lgrt_df_value a, lgrt_df_value b); \
+    LGRT_FP_ABI lgrt_fp_cmp name(lgrt_df_value a, lgrt_df_value b) { \
+        uint64_t x = lgrt_df_to_bits(a); \
+        uint64_t y = lgrt_df_to_bits(b); \
+        \
+        return lgrt_df_compare(x, y, unordered) op 0; \
+    }
+
+LGRT_DF_TRUTH_ROUTINE(__eqdf2, 1, ==)
+LGRT_DF_TRUTH_ROUTINE(__nedf2, 1, !=)
+LGRT_DF_TRUTH_ROUTINE(__ltdf2, 1, <)
+LGRT_DF_TRUTH_ROUTINE(__ledf2, 1, <=)
+LGRT_DF_TRUTH_ROUTINE(__gtdf2, -1, >)
+LGRT_DF_TRUTH_ROUTINE(__gedf2, -1, >=)
+LGRT_FP_COMPARE_ROUTINE(df, lgrt_df_value, uint64_t, __cmpdf2, 1)
+LGRT_FP_UNORD_ROUTINE(df, lgrt_df_value, uint64_t, 11, 52)
+
+#else
+LGRT_FP_COMPARE_ROUTINES(df, lgrt_df_value, uint64_t, 11, 52)
+#endif
+
+LGRT_FP_TO_INT(df, lgrt_df_value, uint64_t, 11, 52, si, int32_t, uint32_t, 32)
+LGRT_FP_TO_INT(df, lgrt_df_value, uint64_t, 11, 52, di, int64_t, uint64_t, 64)
+LGRT_FP_FROM_INT(
+    df, lgrt_df_value, uint64_t, 11, 52, si, int32_t, uint32_t, 32
+)
+LGRT_FP_FROM_INT(
+    df, lgrt_df_value, uint64_t, 11, 52, di, int64_t, uint64_t, 64
+)
+LGRT_FP_EXTEND(
+    sf, lgrt_sf_value, uint32_t, 8, 23, df, lgrt_df_value, uint64_t, 11, 52
+)
+LGRT_FP_TRUNC(
+    sf, lgrt_sf_value, uint32_t, 8, 23, df, lgrt_df_value, uint64_t, 11, 52
+)
+
+#if LGRT_HAS_INT128
+LGRT_FP_TO_INT(
+    df, lgrt_df_value, uint64_t, 11, 52, ti, lgrt_i128, lgrt_u128, 128
+)
+LGRT_FP_FROM_INT(
+    df, lgrt_df_value, uint64_t, 11, 52, ti, lgrt_i128, lgrt_u128, 128
+)
+#endif
+
+#endif
+
+#if LGRT_SOFT_WIDE
+
+/*
+ * Formats of more than 64 bits have a core of their own, over two 64-bit words
+ * on every target, as 32-bit ones have no 128-bit type, and the others then
+ * need none of the routines for one either. It goes step by step as the core
+ * above does, with helpers for what that does with operators. It takes:
+ *
+ * M, the largest value of the exponent field, which infinities and NaNs have,
+ * with a bias of M / 2;
+ * F, the width of the fraction field, at least 63.
+ *
+ * A value has its fraction at the bottom, then its exponent, and its sign in
+ * the top bit of the high word. A significand being worked on has F + 5 bits.
+ */
+
+/* Not all that follows is used on every target. */
+#define LGRT_WIDE_HELPER static inline __attribute__((__unused__))
+
+/* The words in the order that they have in a value in memory. */
+struct lgrt_wide {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    uint64_t high;
+    uint64_t low;
+#else
+    uint64_t low;
+    uint64_t high;
+#endif
+};
+
+LGRT_WIDE_HELPER struct lgrt_wide lgrt_wide_make(uint64_t high, uint64_t low) {
+    struct lgrt_wide a;
+
+    a.high = high;
+    a.low = low;
+    return a;
+}
+
+/* A count of 128 or more leaves nothing. */
+LGRT_WIDE_HELPER struct lgrt_wide lgrt_wide_shl(
+    struct lgrt_wide a, unsigned int n
+) {
+    if (n == 0) {
+        return a;
+    }
+    if (n >= 128) {
+        return lgrt_wide_make(0, 0);
+    }
+    if (n >= 64) {
+        return lgrt_wide_make(a.low << (n - 64), 0);
+    }
+    return lgrt_wide_make((a.high << n) | (a.low >> (64 - n)), a.low << n);
+}
+
+LGRT_WIDE_HELPER struct lgrt_wide lgrt_wide_shr(
+    struct lgrt_wide a, unsigned int n
+) {
+    if (n == 0) {
+        return a;
+    }
+    if (n >= 128) {
+        return lgrt_wide_make(0, 0);
+    }
+    if (n >= 64) {
+        return lgrt_wide_make(0, a.high >> (n - 64));
+    }
+    return lgrt_wide_make(a.high >> n, (a.low >> n) | (a.high << (64 - n)));
+}
+
+LGRT_WIDE_HELPER struct lgrt_wide lgrt_wide_add(
+    struct lgrt_wide a, struct lgrt_wide b
+) {
+    uint64_t low = a.low + b.low;
+
+    return lgrt_wide_make(a.high + b.high + (uint64_t)(low < a.low), low);
+}
+
+LGRT_WIDE_HELPER struct lgrt_wide lgrt_wide_sub(
+    struct lgrt_wide a, struct lgrt_wide b
+) {
+    return lgrt_wide_make(
+        a.high - b.high - (uint64_t)(a.low < b.low), a.low - b.low
+    );
+}
+
+LGRT_WIDE_HELPER struct lgrt_wide lgrt_wide_or(
+    struct lgrt_wide a, struct lgrt_wide b
+) {
+    return lgrt_wide_make(a.high | b.high, a.low | b.low);
+}
+
+LGRT_WIDE_HELPER bool lgrt_wide_eq(struct lgrt_wide a, struct lgrt_wide b) {
+    return ((a.high ^ b.high) | (a.low ^ b.low)) == 0;
+}
+
+LGRT_WIDE_HELPER bool lgrt_wide_lt(struct lgrt_wide a, struct lgrt_wide b) {
+    return a.high < b.high || (a.high == b.high && a.low < b.low);
+}
+
+/* The n lowest bits. */
+LGRT_WIDE_HELPER struct lgrt_wide lgrt_wide_low_bits(
+    struct lgrt_wide a, unsigned int n
+) {
+    if (n >= 64) {
+        return lgrt_wide_make(a.high & (((uint64_t)1 << (n - 64)) - 1), a.low);
+    }
+    return lgrt_wide_make(0, a.low & (((uint64_t)1 << n) - 1));
+}
+
+/* The exponent field of a value without its sign. */
+LGRT_WIDE_HELPER unsigned int lgrt_wide_exponent(
+    struct lgrt_wide magnitude, unsigned int f
+) {
+    return (unsigned int)lgrt_wide_shr(magnitude, f).low;
+}
+
+/* A shift right that keeps in the low bit whether any bit was lost. */
+LGRT_WIDE_HELPER struct lgrt_wide lgrt_wide_sticky_shift(
+    struct lgrt_wide sig, unsigned int n
+) {
+    struct lgrt_wide kept = lgrt_wide_shr(sig, n);
+
+    kept.low |= (uint64_t)!lgrt_wide_eq(lgrt_wide_shl(kept, n), sig);
+    return kept;
+}
+
+/* The two halves of a product, from those of the words. */
+LGRT_WIDE_HELPER void lgrt_wide_mul(
+    struct lgrt_wide a, struct lgrt_wide b, struct lgrt_wide *hi,
+    struct lgrt_wide *lo
+) {
+    struct lgrt_wide low_low;
+    struct lgrt_wide low_high;
+    struct lgrt_wide high_low;
+    struct lgrt_wide high_high;
+    struct lgrt_wide sum;
+
+    lgrt_fp_wide_mul64(a.low, b.low, &low_low.high, &low_low.low);
+    lgrt_fp_wide_mul64(a.low, b.high, &low_high.high, &low_high.low);
+    lgrt_fp_wide_mul64(a.high, b.low, &high_low.high, &high_low.low);
+    lgrt_fp_wide_mul64(a.high, b.high, &high_high.high, &high_high.low);
+    sum = lgrt_wide_add(
+        lgrt_wide_make(0, low_low.high), lgrt_wide_make(0, low_high.low)
+    );
+    sum = lgrt_wide_add(sum, lgrt_wide_make(0, high_low.low));
+    *lo = lgrt_wide_make(sum.low, low_low.low);
+    sum = lgrt_wide_add(
+        lgrt_wide_make(0, sum.high), lgrt_wide_make(0, low_high.high)
+    );
+    sum = lgrt_wide_add(sum, lgrt_wide_make(0, high_low.high));
+    sum = lgrt_wide_add(sum, lgrt_wide_make(0, high_high.low));
+    *hi = lgrt_wide_make(high_high.high + sum.high, sum.low);
+}
+
+#define LGRT_WIDE_SIGN ((uint64_t)1 << 63)
+#define LGRT_WIDE_MAGNITUDE(a) \
+    lgrt_wide_make((a).high & (LGRT_WIDE_SIGN - 1), (a).low)
+#define LGRT_WIDE_INT_BIT(F) lgrt_wide_shl(lgrt_wide_make(0, 1), (F))
+#define LGRT_WIDE_BIAS(M) ((M) / 2)
+#define LGRT_WIDE_INF(M, F) lgrt_wide_shl(lgrt_wide_make(0, (M)), (F))
+#define LGRT_WIDE_NAN(M, F) \
+    lgrt_wide_or( \
+        LGRT_WIDE_INF(M, F), LGRT_WIDE_QUIET(LGRT_WIDE_INT_BIT((F) - 1)) \
+    )
+
+#define LGRT_WIDE_BITS(fmt, C) \
+    static inline LGRT_FP_ABI struct lgrt_wide lgrt_##fmt##_to_bits( \
+        C value \
+    ) { \
+        struct lgrt_wide bits; \
+        \
+        __builtin_memcpy(&bits, &value, sizeof(struct lgrt_wide)); \
+        __asm__ ("" : "+g"(bits.high), "+g"(bits.low)); \
+        return bits; \
+    } \
+    \
+    static inline LGRT_FP_ABI C lgrt_##fmt##_from_bits( \
+        struct lgrt_wide bits \
+    ) { \
+        C value; \
+        \
+        __asm__ ("" : "+g"(bits.high), "+g"(bits.low)); \
+        __builtin_memcpy(&value, &bits, sizeof(struct lgrt_wide)); \
+        return value; \
+    }
+
+#define LGRT_WIDE_ROUND_PACK(fmt, M, F) \
+    LGRT_WIDE_HELPER struct lgrt_wide lgrt_##fmt##_round_pack( \
+        uint64_t sign, unsigned int e, struct lgrt_wide sig \
+    ) { \
+        struct lgrt_wide bits; \
+        unsigned int low; \
+        \
+        if ((int)e >= (M)) { \
+            bits = LGRT_WIDE_INF(M, F); \
+            bits.high |= sign; \
+            return bits; \
+        } \
+        if ((int)e <= 0) { \
+            sig = lgrt_wide_sticky_shift(sig, 1 - e); \
+            e = 1; \
+        } \
+        low = (unsigned int)sig.low & 7; \
+        bits = lgrt_wide_add( \
+            lgrt_wide_shl(lgrt_wide_make(0, e - 1), (F)), \
+            lgrt_wide_shr(sig, 3) \
+        ); \
+        if (low > 4 || (low == 4 && (bits.low & 1) != 0)) { \
+            bits = lgrt_wide_add(bits, lgrt_wide_make(0, 1)); \
+        } \
+        bits.high |= sign; \
+        return bits; \
+    }
+
+#define LGRT_WIDE_ADD(fmt, M, F) \
+    LGRT_WIDE_HELPER struct lgrt_wide lgrt_##fmt##_add( \
+        struct lgrt_wide a, struct lgrt_wide b \
+    ) { \
+        uint64_t sign = LGRT_WIDE_SIGN; \
+        struct lgrt_wide inf = LGRT_WIDE_INF(M, F); \
+        struct lgrt_wide int_bit = LGRT_WIDE_INT_BIT(F); \
+        struct lgrt_wide magnitude_a = LGRT_WIDE_MAGNITUDE(a); \
+        struct lgrt_wide magnitude_b = LGRT_WIDE_MAGNITUDE(b); \
+        bool swapped = lgrt_wide_lt(magnitude_a, magnitude_b); \
+        struct lgrt_wide big = swapped ? b : a; \
+        struct lgrt_wide magnitude = swapped ? magnitude_b : magnitude_a; \
+        struct lgrt_wide other = swapped ? magnitude_a : magnitude_b; \
+        struct lgrt_wide sig = lgrt_wide_low_bits(magnitude, (F)); \
+        struct lgrt_wide other_sig = lgrt_wide_low_bits(other, (F)); \
+        unsigned int e = lgrt_wide_exponent(magnitude, (F)); \
+        unsigned int other_e = lgrt_wide_exponent(other, (F)); \
+        bool subtract = ((a.high ^ b.high) & sign) != 0; \
+        \
+        if (!lgrt_wide_lt(magnitude, inf)) { \
+            if (lgrt_wide_lt(inf, magnitude) \
+             || (lgrt_wide_eq(other, inf) && subtract)) { \
+                return LGRT_WIDE_NAN(M, F); \
+            } \
+            return big; \
+        } \
+        if (e != 0) { \
+            sig = lgrt_wide_or(sig, int_bit); \
+        } else { \
+            e = 1; \
+        } \
+        if (other_e != 0) { \
+            other_sig = lgrt_wide_or(other_sig, int_bit); \
+        } else { \
+            other_e = 1; \
+        } \
+        sig = lgrt_wide_shl(sig, 3); \
+        other_sig = lgrt_wide_sticky_shift( \
+            lgrt_wide_shl(other_sig, 3), e - other_e \
+        ); \
+        if (!subtract) { \
+            sig = lgrt_wide_add(sig, other_sig); \
+            if (!lgrt_wide_lt(sig, lgrt_wide_shl(int_bit, 4))) { \
+                sig = lgrt_wide_sticky_shift(sig, 1); \
+                e += 1; \
+            } \
+        } else { \
+            sig = lgrt_wide_sub(sig, other_sig); \
+            if (lgrt_wide_eq(sig, lgrt_wide_make(0, 0))) { \
+                return sig; \
+            } \
+            while (lgrt_wide_lt(sig, lgrt_wide_shl(int_bit, 3)) && e > 1) { \
+                sig = lgrt_wide_shl(sig, 1); \
+                e -= 1; \
+            } \
+        } \
+        return lgrt_##fmt##_round_pack(big.high & sign, e, sig); \
+    }
+
+#define LGRT_WIDE_KIND(fmt, M, F) \
+    LGRT_WIDE_HELPER int lgrt_##fmt##_kind(struct lgrt_wide magnitude) { \
+        struct lgrt_wide inf = LGRT_WIDE_INF(M, F); \
+        \
+        if (lgrt_wide_lt(inf, magnitude)) { \
+            return LGRT_FP_NOT_A_NUMBER; \
+        } \
+        if (lgrt_wide_eq(magnitude, inf)) { \
+            return LGRT_FP_INFINITE; \
+        } \
+        return lgrt_wide_eq(magnitude, lgrt_wide_make(0, 0)) \
+            ? LGRT_FP_ZERO : LGRT_FP_FINITE; \
+    }
+
+#define LGRT_WIDE_NORMALISE(fmt, F) \
+    LGRT_WIDE_HELPER struct lgrt_wide lgrt_##fmt##_normalise( \
+        struct lgrt_wide magnitude, unsigned int *e \
+    ) { \
+        struct lgrt_wide int_bit = LGRT_WIDE_INT_BIT(F); \
+        struct lgrt_wide sig = lgrt_wide_low_bits(magnitude, (F)); \
+        unsigned int exponent = lgrt_wide_exponent(magnitude, (F)); \
+        \
+        if (exponent != 0) { \
+            sig = lgrt_wide_or(sig, int_bit); \
+        } else { \
+            exponent = 1; \
+            while (lgrt_wide_lt(sig, int_bit)) { \
+                sig = lgrt_wide_shl(sig, 1); \
+                exponent -= 1; \
+            } \
+        } \
+        *e = exponent; \
+        return sig; \
+    }
+
+#define LGRT_WIDE_MUL(fmt, M, F) \
+    LGRT_WIDE_HELPER struct lgrt_wide lgrt_##fmt##_mul( \
+        struct lgrt_wide a, struct lgrt_wide b \
+    ) { \
+        uint64_t sign = (a.high ^ b.high) & LGRT_WIDE_SIGN; \
+        struct lgrt_wide magnitude_a = LGRT_WIDE_MAGNITUDE(a); \
+        struct lgrt_wide magnitude_b = LGRT_WIDE_MAGNITUDE(b); \
+        int kind_a = lgrt_##fmt##_kind(magnitude_a); \
+        int kind_b = lgrt_##fmt##_kind(magnitude_b); \
+        struct lgrt_wide bits = lgrt_wide_make(sign, 0); \
+        struct lgrt_wide sig_a; \
+        struct lgrt_wide sig_b; \
+        struct lgrt_wide hi; \
+        struct lgrt_wide lo; \
+        struct lgrt_wide sig; \
+        unsigned int e_a; \
+        unsigned int e_b; \
+        unsigned int e; \
+        \
+        if (kind_a == LGRT_FP_NOT_A_NUMBER \
+         || kind_b == LGRT_FP_NOT_A_NUMBER) { \
+            return LGRT_WIDE_NAN(M, F); \
+        } \
+        if (kind_a == LGRT_FP_INFINITE || kind_b == LGRT_FP_INFINITE) { \
+            if (kind_a == LGRT_FP_ZERO || kind_b == LGRT_FP_ZERO) { \
+                return LGRT_WIDE_NAN(M, F); \
+            } \
+            return lgrt_wide_or(bits, LGRT_WIDE_INF(M, F)); \
+        } \
+        if (kind_a == LGRT_FP_ZERO || kind_b == LGRT_FP_ZERO) { \
+            return bits; \
+        } \
+        sig_a = lgrt_##fmt##_normalise(magnitude_a, &e_a); \
+        sig_b = lgrt_##fmt##_normalise(magnitude_b, &e_b); \
+        e = e_a + e_b - LGRT_WIDE_BIAS(M); \
+        lgrt_wide_mul(sig_a, sig_b, &hi, &lo); \
+        sig = lgrt_wide_or( \
+            lgrt_wide_shl(hi, 128 - (F) + 3), lgrt_wide_shr(lo, (F) - 3) \
+        ); \
+        lo = lgrt_wide_low_bits(lo, (F) - 3); \
+        sig.low |= (uint64_t)!lgrt_wide_eq(lo, lgrt_wide_make(0, 0)); \
+        if (!lgrt_wide_lt(sig, lgrt_wide_shl(LGRT_WIDE_INT_BIT(F), 4))) { \
+            sig = lgrt_wide_sticky_shift(sig, 1); \
+            e += 1; \
+        } \
+        return lgrt_##fmt##_round_pack(sign, e, sig); \
+    }
+
+#define LGRT_WIDE_DIV(fmt, M, F) \
+    LGRT_WIDE_HELPER struct lgrt_wide lgrt_##fmt##_div( \
+        struct lgrt_wide a, struct lgrt_wide b \
+    ) { \
+        uint64_t sign = (a.high ^ b.high) & LGRT_WIDE_SIGN; \
+        struct lgrt_wide magnitude_a = LGRT_WIDE_MAGNITUDE(a); \
+        struct lgrt_wide magnitude_b = LGRT_WIDE_MAGNITUDE(b); \
+        int kind_a = lgrt_##fmt##_kind(magnitude_a); \
+        int kind_b = lgrt_##fmt##_kind(magnitude_b); \
+        struct lgrt_wide bits = lgrt_wide_make(sign, 0); \
+        struct lgrt_wide quotient = lgrt_wide_make(0, 0); \
+        struct lgrt_wide rem; \
+        struct lgrt_wide divisor; \
+        unsigned int e_a; \
+        unsigned int e_b; \
+        unsigned int e; \
+        \
+        if (kind_a == LGRT_FP_NOT_A_NUMBER \
+         || kind_b == LGRT_FP_NOT_A_NUMBER \
+         || (kind_a == kind_b && kind_a != LGRT_FP_FINITE)) { \
+            return LGRT_WIDE_NAN(M, F); \
+        } \
+        if (kind_a == LGRT_FP_INFINITE || kind_b == LGRT_FP_ZERO) { \
+            return lgrt_wide_or(bits, LGRT_WIDE_INF(M, F)); \
+        } \
+        if (kind_b == LGRT_FP_INFINITE || kind_a == LGRT_FP_ZERO) { \
+            return bits; \
+        } \
+        rem = lgrt_##fmt##_normalise(magnitude_a, &e_a); \
+        divisor = lgrt_##fmt##_normalise(magnitude_b, &e_b); \
+        e = e_a - e_b + LGRT_WIDE_BIAS(M); \
+        if (lgrt_wide_lt(rem, divisor)) { \
+            rem = lgrt_wide_shl(rem, 1); \
+            e -= 1; \
+        } \
+        for (size_t i = 0; i < (F) + 4; i++) { \
+            quotient = lgrt_wide_shl(quotient, 1); \
+            if (!lgrt_wide_lt(rem, divisor)) { \
+                rem = lgrt_wide_sub(rem, divisor); \
+                quotient.low |= 1; \
+            } \
+            rem = lgrt_wide_shl(rem, 1); \
+        } \
+        quotient.low |= (uint64_t)!lgrt_wide_eq(rem, lgrt_wide_make(0, 0)); \
+        return lgrt_##fmt##_round_pack(sign, e, quotient); \
+    }
+
+#define LGRT_WIDE_COMPARE(fmt, M, F) \
+    static inline int lgrt_##fmt##_compare( \
+        struct lgrt_wide a, struct lgrt_wide b, int unordered \
+    ) { \
+        uint64_t sign = LGRT_WIDE_SIGN; \
+        struct lgrt_wide inf = LGRT_WIDE_INF(M, F); \
+        struct lgrt_wide magnitude_a = LGRT_WIDE_MAGNITUDE(a); \
+        struct lgrt_wide magnitude_b = LGRT_WIDE_MAGNITUDE(b); \
+        struct lgrt_wide either = lgrt_wide_or(magnitude_a, magnitude_b); \
+        bool negative = (a.high & sign) != 0; \
+        \
+        if (lgrt_wide_lt(inf, magnitude_a) \
+         || lgrt_wide_lt(inf, magnitude_b)) { \
+            return unordered; \
+        } \
+        if (lgrt_wide_eq(a, b) || (either.high | either.low) == 0) { \
+            return 0; \
+        } \
+        if (((a.high ^ b.high) & sign) != 0) { \
+            return negative ? -1 : 1; \
+        } \
+        return lgrt_wide_lt(magnitude_a, magnitude_b) != negative ? -1 : 1; \
+    }
+
+/* C returns a value and P passes one in, where those cannot be one type. */
+#define LGRT_WIDE_ARITHMETIC_ROUTINES(fmt, C, P, M, F) \
+    LGRT_FP_ABI C __add##fmt##3(P a, P b); \
+    LGRT_FP_ABI C __add##fmt##3(P a, P b) { \
+        struct lgrt_wide x = lgrt_##fmt##_to_bits(a); \
+        struct lgrt_wide y = lgrt_##fmt##_to_bits(b); \
+        \
+        return lgrt_##fmt##_from_bits(lgrt_##fmt##_add(x, y)); \
+    } \
+    \
+    LGRT_FP_ABI C __sub##fmt##3(P a, P b); \
+    LGRT_FP_ABI C __sub##fmt##3(P a, P b) { \
+        struct lgrt_wide x = lgrt_##fmt##_to_bits(a); \
+        struct lgrt_wide y = lgrt_##fmt##_to_bits(b); \
+        \
+        y.high ^= LGRT_WIDE_SIGN; \
+        return lgrt_##fmt##_from_bits(lgrt_##fmt##_add(x, y)); \
+    } \
+    \
+    LGRT_FP_ABI C __mul##fmt##3(P a, P b); \
+    LGRT_FP_ABI C __mul##fmt##3(P a, P b) { \
+        struct lgrt_wide x = lgrt_##fmt##_to_bits(a); \
+        struct lgrt_wide y = lgrt_##fmt##_to_bits(b); \
+        \
+        return lgrt_##fmt##_from_bits(lgrt_##fmt##_mul(x, y)); \
+    } \
+    \
+    LGRT_FP_ABI C __div##fmt##3(P a, P b); \
+    LGRT_FP_ABI C __div##fmt##3(P a, P b) { \
+        struct lgrt_wide x = lgrt_##fmt##_to_bits(a); \
+        struct lgrt_wide y = lgrt_##fmt##_to_bits(b); \
+        \
+        return lgrt_##fmt##_from_bits(lgrt_##fmt##_div(x, y)); \
+    } \
+    \
+    LGRT_FP_ABI C __neg##fmt##2(P a); \
+    LGRT_FP_ABI C __neg##fmt##2(P a) { \
+        struct lgrt_wide x = lgrt_##fmt##_to_bits(a); \
+        \
+        x.high ^= LGRT_WIDE_SIGN; \
+        return lgrt_##fmt##_from_bits(x); \
+    }
+
+#define LGRT_WIDE_COMPARE_ROUTINES(fmt, C, M, F) \
+    LGRT_FP_COMPARE_NAMES(fmt, C, struct lgrt_wide) \
+    \
+    LGRT_FP_ABI lgrt_fp_cmp __unord##fmt##2(C a, C b); \
+    LGRT_FP_ABI lgrt_fp_cmp __unord##fmt##2(C a, C b) { \
+        struct lgrt_wide x = lgrt_##fmt##_to_bits(a); \
+        struct lgrt_wide y = lgrt_##fmt##_to_bits(b); \
+        struct lgrt_wide inf = LGRT_WIDE_INF(M, F); \
+        \
+        return lgrt_wide_lt(inf, LGRT_WIDE_MAGNITUDE(x)) \
+            || lgrt_wide_lt(inf, LGRT_WIDE_MAGNITUDE(y)); \
+    }
+
+#define LGRT_WIDE_CORE(fmt, M, F) \
+    LGRT_WIDE_ROUND_PACK(fmt, M, F) \
+    LGRT_WIDE_ADD(fmt, M, F) \
+    LGRT_WIDE_KIND(fmt, M, F) \
+    LGRT_WIDE_NORMALISE(fmt, F) \
+    LGRT_WIDE_MUL(fmt, M, F) \
+    LGRT_WIDE_DIV(fmt, M, F)
+
+#define LGRT_WIDE_ARITHMETIC(fmt, C, P, M, F) \
+    LGRT_WIDE_CORE(fmt, M, F) \
+    LGRT_WIDE_ARITHMETIC_ROUTINES(fmt, C, P, M, F)
+
+#define LGRT_WIDE_COMPARISONS(fmt, C, M, F) \
+    LGRT_WIDE_COMPARE(fmt, M, F) \
+    LGRT_WIDE_COMPARE_ROUTINES(fmt, C, M, F)
+
+/*
+ * These truncate, out of range and for a NaN as LGRT_FP_TO_INT does. In
+ * lgrt_FMT_wrap_MODE, a negative value goes as in the signed conversion, and
+ * its integer is cast to the unsigned type.
+ */
+#define LGRT_WIDE_TO_INT_BITS(fmt, M, F, mode, I, U, IW) \
+    LGRT_WIDE_HELPER U lgrt_##fmt##_fix_##mode(struct lgrt_wide a, U limit) { \
+        struct lgrt_wide magnitude = LGRT_WIDE_MAGNITUDE(a); \
+        struct lgrt_wide sig = lgrt_wide_or( \
+            lgrt_wide_low_bits(magnitude, (F)), LGRT_WIDE_INT_BIT(F) \
+        ); \
+        unsigned int e = lgrt_wide_exponent(magnitude, (F)); \
+        U value; \
+        \
+        if (lgrt_wide_lt(LGRT_WIDE_INF(M, F), magnitude) \
+         || e < LGRT_WIDE_BIAS(M)) { \
+            return 0; \
+        } \
+        e -= LGRT_WIDE_BIAS(M); \
+        if (e >= (IW)) { \
+            return limit; \
+        } \
+        value = (U)lgrt_wide_shr(sig, (F) - e).low; \
+        return value > limit ? limit : value; \
+    } \
+    \
+    LGRT_WIDE_HELPER I lgrt_##fmt##_to_##mode(struct lgrt_wide x) { \
+        U top = (U)1 << ((IW) - 1); \
+        \
+        if ((x.high & LGRT_WIDE_SIGN) != 0) { \
+            return (I)((U)0 - lgrt_##fmt##_fix_##mode(x, top)); \
+        } \
+        return (I)lgrt_##fmt##_fix_##mode(x, top - 1); \
+    } \
+    \
+    LGRT_WIDE_HELPER U lgrt_##fmt##_to_uns##mode(struct lgrt_wide x) { \
+        if ((x.high & LGRT_WIDE_SIGN) != 0) { \
+            return 0; \
+        } \
+        return lgrt_##fmt##_fix_##mode(x, (U)0 - 1); \
+    } \
+    \
+    LGRT_WIDE_HELPER U lgrt_##fmt##_wrap_##mode(struct lgrt_wide x) { \
+        if ((x.high & LGRT_WIDE_SIGN) != 0) { \
+            return (U)0 - lgrt_##fmt##_fix_##mode(x, (U)1 << ((IW) - 1)); \
+        } \
+        return lgrt_##fmt##_fix_##mode(x, (U)0 - 1); \
+    }
+
+#define LGRT_WIDE_TO_INT(fmt, C, M, F, mode, I, U, IW) \
+    LGRT_WIDE_TO_INT_BITS(fmt, M, F, mode, I, U, IW) \
+    \
+    LGRT_FP_ABI I __fix##fmt##mode(C a); \
+    LGRT_FP_ABI I __fix##fmt##mode(C a) { \
+        return lgrt_##fmt##_to_##mode(lgrt_##fmt##_to_bits(a)); \
+    } \
+    \
+    LGRT_FP_ABI U __fixuns##fmt##mode(C a); \
+    LGRT_FP_ABI U __fixuns##fmt##mode(C a) { \
+        return lgrt_##fmt##_to_uns##mode(lgrt_##fmt##_to_bits(a)); \
+    }
+
+/* The significands have room for the integers, so nothing rounds. */
+#define LGRT_WIDE_FROM_INT_BITS(fmt, M, F, mode, I, U, IW) \
+    LGRT_WIDE_HELPER struct lgrt_wide lgrt_##fmt##_float_##mode( \
+        uint64_t sign, U value \
+    ) { \
+        unsigned int top; \
+        \
+        if (value == 0) { \
+            return lgrt_wide_make(0, 0); \
+        } \
+        top = (IW) - 1 - lgrt_clz##IW(value); \
+        return lgrt_##fmt##_round_pack( \
+            sign, LGRT_WIDE_BIAS(M) + top, \
+            lgrt_wide_shl(lgrt_wide_make(0, value), (F) + 3 - top) \
+        ); \
+    } \
+    \
+    LGRT_WIDE_HELPER struct lgrt_wide lgrt_##fmt##_from_##mode(I i) { \
+        uint64_t sign = i < 0 ? LGRT_WIDE_SIGN : 0; \
+        U value = i < 0 ? (U)0 - (U)i : (U)i; \
+        \
+        return lgrt_##fmt##_float_##mode(sign, value); \
+    }
+
+#define LGRT_WIDE_FROM_INT(fmt, C, M, F, mode, I, U, IW) \
+    LGRT_WIDE_FROM_INT_BITS(fmt, M, F, mode, I, U, IW) \
+    \
+    LGRT_FP_ABI C __float##mode##fmt(I i); \
+    LGRT_FP_ABI C __float##mode##fmt(I i) { \
+        return lgrt_##fmt##_from_bits(lgrt_##fmt##_from_##mode(i)); \
+    } \
+    \
+    LGRT_FP_ABI C __floatun##mode##fmt(lgrt_fp_unsigned_##mode i); \
+    LGRT_FP_ABI C __floatun##mode##fmt(lgrt_fp_unsigned_##mode i) { \
+        return lgrt_##fmt##_from_bits(lgrt_##fmt##_float_##mode(0, (U)i)); \
+    }
+
+#if LGRT_HAS_INT128
+
+static inline struct lgrt_wide lgrt_wide_from_u128(lgrt_u128 a) {
+    return lgrt_wide_make((uint64_t)(a >> 64), (uint64_t)a);
+}
+
+static inline lgrt_u128 lgrt_wide_to_u128(struct lgrt_wide a) {
+    return ((lgrt_u128)a.high << 64) | a.low;
+}
+
+/*
+ * Conversions with 128-bit integers, which can be wider than a significand on
+ * top of what the macros above do, on two words rather than on the type.
+ */
+#define LGRT_WIDE_TO_TI(fmt, C, M, F) \
+    static inline struct lgrt_wide lgrt_##fmt##_fix_ti( \
+        struct lgrt_wide a, struct lgrt_wide limit \
+    ) { \
+        struct lgrt_wide magnitude = LGRT_WIDE_MAGNITUDE(a); \
+        struct lgrt_wide sig = lgrt_wide_or( \
+            lgrt_wide_low_bits(magnitude, (F)), LGRT_WIDE_INT_BIT(F) \
+        ); \
+        unsigned int e = lgrt_wide_exponent(magnitude, (F)); \
+        struct lgrt_wide value; \
+        \
+        if (lgrt_wide_lt(LGRT_WIDE_INF(M, F), magnitude) \
+         || e < LGRT_WIDE_BIAS(M)) { \
+            return lgrt_wide_make(0, 0); \
+        } \
+        e -= LGRT_WIDE_BIAS(M); \
+        if (e >= 128) { \
+            return limit; \
+        } \
+        value = e > (F) ? lgrt_wide_shl(sig, e - (F)) \
+            : lgrt_wide_shr(sig, (F) - e); \
+        return lgrt_wide_lt(limit, value) ? limit : value; \
+    } \
+    \
+    LGRT_FP_ABI lgrt_i128 __fix##fmt##ti(C a); \
+    LGRT_FP_ABI lgrt_i128 __fix##fmt##ti(C a) { \
+        struct lgrt_wide x = lgrt_##fmt##_to_bits(a); \
+        struct lgrt_wide top = lgrt_wide_make(LGRT_WIDE_SIGN, 0); \
+        struct lgrt_wide value; \
+        \
+        if ((x.high & LGRT_WIDE_SIGN) != 0) { \
+            value = lgrt_wide_sub( \
+                lgrt_wide_make(0, 0), lgrt_##fmt##_fix_ti(x, top) \
+            ); \
+        } else { \
+            value = lgrt_##fmt##_fix_ti( \
+                x, lgrt_wide_sub(top, lgrt_wide_make(0, 1)) \
+            ); \
+        } \
+        return (lgrt_i128)lgrt_wide_to_u128(value); \
+    } \
+    \
+    LGRT_FP_ABI lgrt_u128 __fixuns##fmt##ti(C a); \
+    LGRT_FP_ABI lgrt_u128 __fixuns##fmt##ti(C a) { \
+        struct lgrt_wide x = lgrt_##fmt##_to_bits(a); \
+        \
+        if ((x.high & LGRT_WIDE_SIGN) != 0) { \
+            return 0; \
+        } \
+        return lgrt_wide_to_u128( \
+            lgrt_##fmt##_fix_ti( \
+                x, lgrt_wide_make((uint64_t)0 - 1, (uint64_t)0 - 1) \
+            ) \
+        ); \
+    }
+
+#define LGRT_WIDE_FROM_TI_BITS(fmt, M, F) \
+    static inline struct lgrt_wide lgrt_##fmt##_float_ti( \
+        uint64_t sign, struct lgrt_wide value \
+    ) { \
+        unsigned int top; \
+        \
+        if (lgrt_wide_eq(value, lgrt_wide_make(0, 0))) { \
+            return value; \
+        } \
+        top = value.high != 0 ? 127 - lgrt_clz64(value.high) \
+            : 63 - lgrt_clz64(value.low); \
+        return lgrt_##fmt##_round_pack( \
+            sign, LGRT_WIDE_BIAS(M) + top, \
+            top <= (F) + 3 ? lgrt_wide_shl(value, (F) + 3 - top) \
+                : lgrt_wide_sticky_shift(value, top - ((F) + 3)) \
+        ); \
+    } \
+    \
+    static inline struct lgrt_wide lgrt_##fmt##_from_ti(lgrt_i128 i) { \
+        lgrt_u128 value = i < 0 ? (lgrt_u128)0 - (lgrt_u128)i : (lgrt_u128)i; \
+        \
+        return lgrt_##fmt##_float_ti( \
+            i < 0 ? LGRT_WIDE_SIGN : 0, lgrt_wide_from_u128(value) \
+        ); \
+    }
+
+#define LGRT_WIDE_FROM_TI(fmt, C, M, F) \
+    LGRT_WIDE_FROM_TI_BITS(fmt, M, F) \
+    \
+    LGRT_FP_ABI C __floatti##fmt(lgrt_i128 i); \
+    LGRT_FP_ABI C __floatti##fmt(lgrt_i128 i) { \
+        return lgrt_##fmt##_from_bits(lgrt_##fmt##_from_ti(i)); \
+    } \
+    \
+    LGRT_FP_ABI C __floatunti##fmt(lgrt_u128 i); \
+    LGRT_FP_ABI C __floatunti##fmt(lgrt_u128 i) { \
+        return lgrt_##fmt##_from_bits( \
+            lgrt_##fmt##_float_ti(0, lgrt_wide_from_u128(i)) \
+        ); \
+    }
+
+#define LGRT_QUAD_TI_ROUTINES(fmt) \
+    LGRT_WIDE_TO_TI(fmt, lgrt_quad_value, 32767, 112) \
+    LGRT_WIDE_FROM_TI(fmt, lgrt_quad_value, 32767, 112)
+
+#else
+#define LGRT_QUAD_TI_ROUTINES(fmt)
+#endif
+
+/*
+ * Conversions between a format of the core above, with the _a parameters, and
+ * one of this core, with the _b ones, as LGRT_FP_EXTEND does them.
+ */
+#define LGRT_WIDE_EXTEND_BITS(fmt_a, T_a, E_a, F_a, fmt_b, M_b, F_b) \
+    static inline struct lgrt_wide lgrt_##fmt_b##_from_##fmt_a(T_a x) { \
+        T_a magnitude = x & (LGRT_FP_SIGN(T_a, E_a, F_a) - 1); \
+        struct lgrt_wide bits = lgrt_wide_make(0, 0); \
+        T_a sig; \
+        unsigned int e; \
+        \
+        if (magnitude > LGRT_FP_INF(T_a, E_a, F_a)) { \
+            return LGRT_WIDE_NAN(M_b, F_b); \
+        } \
+        if (magnitude == LGRT_FP_INF(T_a, E_a, F_a)) { \
+            bits = LGRT_WIDE_INF(M_b, F_b); \
+        } else if (magnitude != 0) { \
+            sig = lgrt_##fmt_a##_normalise(magnitude, &e); \
+            e = e + LGRT_WIDE_BIAS(M_b) - LGRT_FP_BIAS(E_a) - 1; \
+            bits = lgrt_wide_add( \
+                lgrt_wide_shl(lgrt_wide_make(0, e), (F_b)), \
+                lgrt_wide_shl(lgrt_wide_make(0, sig), (F_b) - (F_a)) \
+            ); \
+        } \
+        if ((x & LGRT_FP_SIGN(T_a, E_a, F_a)) != 0) { \
+            bits.high |= LGRT_WIDE_SIGN; \
+        } \
+        return bits; \
+    }
+
+#define LGRT_WIDE_EXTEND(fmt_a, C_a, T_a, E_a, F_a, fmt_b, C_b, M_b, F_b) \
+    LGRT_WIDE_EXTEND_BITS(fmt_a, T_a, E_a, F_a, fmt_b, M_b, F_b) \
+    \
+    LGRT_FP_ABI C_b __extend##fmt_a##fmt_b##2(C_a a); \
+    LGRT_FP_ABI C_b __extend##fmt_a##fmt_b##2(C_a a) { \
+        return lgrt_##fmt_b##_from_bits( \
+            lgrt_##fmt_b##_from_##fmt_a(lgrt_##fmt_a##_to_bits(a)) \
+        ); \
+    }
+
+#define LGRT_WIDE_TRUNC_BITS(fmt_a, T_a, E_a, F_a, fmt_b, M_b, F_b) \
+    static inline T_a lgrt_##fmt_b##_to_##fmt_a(struct lgrt_wide x) { \
+        struct lgrt_wide magnitude = LGRT_WIDE_MAGNITUDE(x); \
+        struct lgrt_wide inf = LGRT_WIDE_INF(M_b, F_b); \
+        T_a sign = (x.high & LGRT_WIDE_SIGN) != 0 \
+            ? LGRT_FP_SIGN(T_a, E_a, F_a) : 0; \
+        struct lgrt_wide sig = lgrt_wide_low_bits(magnitude, (F_b)); \
+        struct lgrt_wide kept; \
+        unsigned int e = lgrt_wide_exponent(magnitude, (F_b)); \
+        \
+        if (lgrt_wide_lt(inf, magnitude)) { \
+            return LGRT_FP_NAN(T_a, E_a, F_a); \
+        } \
+        if (lgrt_wide_eq(magnitude, inf)) { \
+            return sign | LGRT_FP_INF(T_a, E_a, F_a); \
+        } \
+        if (e != 0) { \
+            sig = lgrt_wide_or(sig, LGRT_WIDE_INT_BIT(F_b)); \
+        } else { \
+            e = 1; \
+        } \
+        kept = lgrt_wide_sticky_shift(sig, (F_b) - (F_a) - 3); \
+        return lgrt_##fmt_a##_round_pack( \
+            sign, e + LGRT_FP_BIAS(E_a) - LGRT_WIDE_BIAS(M_b), (T_a)kept.low \
+        ); \
+    }
+
+#define LGRT_WIDE_TRUNC(fmt_a, C_a, T_a, E_a, F_a, fmt_b, C_b, M_b, F_b) \
+    LGRT_WIDE_TRUNC_BITS(fmt_a, T_a, E_a, F_a, fmt_b, M_b, F_b) \
+    \
+    LGRT_FP_ABI C_a __trunc##fmt_b##fmt_a##2(C_b a); \
+    LGRT_FP_ABI C_a __trunc##fmt_b##fmt_a##2(C_b a) { \
+        return lgrt_##fmt_a##_from_bits( \
+            lgrt_##fmt_b##_to_##fmt_a(lgrt_##fmt_b##_to_bits(a)) \
+        ); \
+    }
+
+#if LGRT_SOFT_DOUBLE
+#define LGRT_QUAD_DOUBLE_ROUTINES(fmt) \
+    LGRT_WIDE_EXTEND( \
+        df, lgrt_df_value, uint64_t, 11, 52, fmt, lgrt_quad_value, 32767, 112 \
+    ) \
+    LGRT_WIDE_TRUNC( \
+        df, lgrt_df_value, uint64_t, 11, 52, fmt, lgrt_quad_value, 32767, 112 \
+    )
+#else
+#define LGRT_QUAD_DOUBLE_ROUTINES(fmt)
+#endif
+
+#define LGRT_QUAD_ROUTINES(fmt) \
+    LGRT_WIDE_BITS(fmt, lgrt_quad_value) \
+    LGRT_WIDE_ARITHMETIC(fmt, lgrt_quad_value, lgrt_quad_value, 32767, 112) \
+    LGRT_WIDE_COMPARISONS(fmt, lgrt_quad_value, 32767, 112) \
+    LGRT_WIDE_TO_INT( \
+        fmt, lgrt_quad_value, 32767, 112, si, int32_t, uint32_t, 32 \
+    ) \
+    LGRT_WIDE_TO_INT( \
+        fmt, lgrt_quad_value, 32767, 112, di, int64_t, uint64_t, 64 \
+    ) \
+    LGRT_WIDE_FROM_INT( \
+        fmt, lgrt_quad_value, 32767, 112, si, int32_t, uint32_t, 32 \
+    ) \
+    LGRT_WIDE_FROM_INT( \
+        fmt, lgrt_quad_value, 32767, 112, di, int64_t, uint64_t, 64 \
+    ) \
+    LGRT_WIDE_EXTEND( \
+        sf, lgrt_sf_value, uint32_t, 8, 23, fmt, lgrt_quad_value, 32767, 112 \
+    ) \
+    LGRT_WIDE_TRUNC( \
+        sf, lgrt_sf_value, uint32_t, 8, 23, fmt, lgrt_quad_value, 32767, 112 \
+    ) \
+    LGRT_QUAD_DOUBLE_ROUTINES(fmt) \
+    LGRT_QUAD_TI_ROUTINES(fmt)
+
+#if LGRT_SOFT_QUAD
+
+/*
+ * PowerPC has names of its own for these, but for GCC with long double without
+ * VSX, which calls them by the usual ones or by those further down.
+ */
+#if defined(__powerpc__) \
+ && (defined(__FLOAT128__) || defined(__VSX__) || defined(__clang__))
+
+LGRT_QUAD_ROUTINES(kf)
+
+#if LGRT_HAS_INT128
+/* GCC calls these conversions by the names of its software forms. */
+LGRT_FP_ALIAS(lgrt_i128, __fixkfti_sw, "__fixkfti", (lgrt_quad_value a))
+LGRT_FP_ALIAS(lgrt_u128, __fixunskfti_sw, "__fixunskfti", (lgrt_quad_value a))
+LGRT_FP_ALIAS(lgrt_quad_value, __floattikf_sw, "__floattikf", (lgrt_i128 a))
+LGRT_FP_ALIAS(
+    lgrt_quad_value, __floatuntikf_sw, "__floatuntikf", (lgrt_u128 a)
+)
+#endif
+
+/*
+ * The difference between a value in quad and the nearest double is exact in
+ * the format of IBM long double, and so are both doubles in quad.
+ */
+#if LGRT_HAS_IBM_128
+
+lgrt_ibm_value __extendkftf2(lgrt_quad_value a);
+lgrt_ibm_value __extendkftf2(lgrt_quad_value a) {
+    struct lgrt_wide x = lgrt_kf_to_bits(a);
+    uint64_t parts[2] = { lgrt_kf_to_df(x), 0 };
+    uint64_t mask = LGRT_FP_SIGN(uint64_t, 11, 52) - 1;
+    lgrt_ibm_value value;
+
+    if ((parts[0] & mask) < LGRT_FP_INF(uint64_t, 11, 52)) {
+        struct lgrt_wide high = lgrt_kf_from_df(parts[0]);
+
+        high.high ^= LGRT_WIDE_SIGN;
+        parts[1] = lgrt_kf_to_df(lgrt_kf_add(x, high));
+    }
+    __builtin_memcpy(&value, parts, sizeof(parts));
+    return value;
+}
+
+lgrt_quad_value __trunctfkf2(lgrt_ibm_value a);
+lgrt_quad_value __trunctfkf2(lgrt_ibm_value a) {
+    uint64_t parts[2];
+    uint64_t mask = LGRT_FP_SIGN(uint64_t, 11, 52) - 1;
+    struct lgrt_wide high;
+
+    __builtin_memcpy(parts, &a, sizeof(parts));
+    high = lgrt_kf_from_df(parts[0]);
+    if ((parts[0] & mask) < LGRT_FP_INF(uint64_t, 11, 52)
+     && (parts[1] & mask) != 0) {
+        high = lgrt_kf_add(high, lgrt_kf_from_df(parts[1]));
+    }
+    return lgrt_kf_from_bits(high);
+}
+
+#endif
+
+#else
+
+LGRT_QUAD_ROUTINES(tf)
+
+#if defined(__powerpc__)
+
+/* The comparisons have the same results under these names. */
+
+#define LGRT_QUAD_COMPARE_ALIAS(name, target) \
+    LGRT_FP_ALIAS( \
+        lgrt_fp_cmp, name, target, (lgrt_quad_value a, lgrt_quad_value b) \
+    )
+
+#define LGRT_QUAD_BINARY_ALIAS(name, target) \
+    LGRT_FP_ALIAS( \
+        lgrt_quad_value, name, target, (lgrt_quad_value a, lgrt_quad_value b) \
+    )
+
+LGRT_QUAD_BINARY_ALIAS(_q_add, "__addtf3")
+LGRT_QUAD_BINARY_ALIAS(_q_sub, "__subtf3")
+LGRT_QUAD_BINARY_ALIAS(_q_mul, "__multf3")
+LGRT_QUAD_BINARY_ALIAS(_q_div, "__divtf3")
+LGRT_QUAD_COMPARE_ALIAS(_q_feq, "__lttf2")
+LGRT_QUAD_COMPARE_ALIAS(_q_fne, "__lttf2")
+LGRT_QUAD_COMPARE_ALIAS(_q_flt, "__lttf2")
+LGRT_QUAD_COMPARE_ALIAS(_q_fle, "__lttf2")
+LGRT_QUAD_COMPARE_ALIAS(_q_fgt, "__gttf2")
+LGRT_QUAD_COMPARE_ALIAS(_q_fge, "__gttf2")
+LGRT_FP_ALIAS(lgrt_quad_value, _q_neg, "__negtf2", (lgrt_quad_value a))
+LGRT_FP_ALIAS(int32_t, _q_qtoi, "__fixtfsi", (lgrt_quad_value a))
+LGRT_FP_ALIAS(uint32_t, _q_qtou, "__fixunstfsi", (lgrt_quad_value a))
+LGRT_FP_ALIAS(lgrt_quad_value, _q_itoq, "__floatsitf", (int32_t a))
+LGRT_FP_ALIAS(
+    lgrt_quad_value, _q_utoq, "__floatunsitf", (lgrt_fp_unsigned_si a)
+)
+LGRT_FP_ALIAS(lgrt_sf_value, _q_qtos, "__trunctfsf2", (lgrt_quad_value a))
+LGRT_FP_ALIAS(lgrt_df_value, _q_qtod, "__trunctfdf2", (lgrt_quad_value a))
+LGRT_FP_ALIAS(lgrt_quad_value, _q_stoq, "__extendsftf2", (lgrt_sf_value a))
+LGRT_FP_ALIAS(lgrt_quad_value, _q_dtoq, "__extenddftf2", (lgrt_df_value a))
+
+#endif
+
+#endif
+
+#elif LGRT_QUAD_OWN_NAMES
+
+#if !LGRT_SOFT_DOUBLE
+LGRT_FP_STICKY_SHIFT(df, uint64_t, 52)
+LGRT_FP_ROUND_PACK(df, uint64_t, 11, 52)
+LGRT_FP_NORMALISE(df, uint64_t, 52)
+#endif
+
+LGRT_WIDE_BITS(tf, lgrt_quad_value)
+LGRT_WIDE_CORE(tf, 32767, 112)
+LGRT_QUAD_TI_ROUTINES(tf)
+LGRT_WIDE_COMPARE(tf, 32767, 112)
+LGRT_WIDE_TO_INT_BITS(tf, 32767, 112, si, int32_t, uint32_t, 32)
+LGRT_WIDE_TO_INT_BITS(tf, 32767, 112, di, int64_t, uint64_t, 64)
+LGRT_WIDE_FROM_INT_BITS(tf, 32767, 112, si, int32_t, uint32_t, 32)
+LGRT_WIDE_FROM_INT_BITS(tf, 32767, 112, di, int64_t, uint64_t, 64)
+LGRT_WIDE_EXTEND_BITS(df, uint64_t, 11, 52, tf, 32767, 112)
+LGRT_WIDE_TRUNC_BITS(df, uint64_t, 11, 52, tf, 32767, 112)
+
+LGRT_WIDE_HELPER struct lgrt_wide lgrt_tf_sub(
+    struct lgrt_wide a, struct lgrt_wide b
+) {
+    b.high ^= LGRT_WIDE_SIGN;
+    return lgrt_tf_add(a, b);
+}
+
+#if defined(__sparc__)
+
+LGRT_WIDE_EXTEND_BITS(sf, uint32_t, 8, 23, tf, 32767, 112)
+LGRT_WIDE_TRUNC_BITS(sf, uint32_t, 8, 23, tf, 32767, 112)
+
+/*
+ * What compilers call for long double on SPARC, and how it passes values:
+ *
+ * 32-bit, _Q_*: as C passes that type, by pointer, with the caller's memory
+ * for a result.
+ *
+ * 64-bit, _Qp_*: pointers to the operands, after one to the result where that
+ * is a long double. C would use floating-point registers for those.
+ *
+ * 64-bit with -msoft-float, the usual names: as C passes that type, in integer
+ * registers.
+ *
+ * 32-bit with -msoft-float, Clang, the usual names, and _Q_lltoq, and
+ * _Q_ulltoq: each operand as two uint64_t, and a result in the four registers
+ * that a complex value of those comes back in. Only _Q_qtoll and _Q_qtoull
+ * stay as C passes that type, by pointer.
+ *
+ * LGRT_TF_BINARY and the others write a routine in the form at hand, from an
+ * expression over x and y, the bits of its operands, or i, its operand of
+ * another type. The comparisons with an f in their names give truth values.
+ */
+#if !LGRT_64BIT && defined(__clang__) && defined(SOFT_FLOAT)
+#define LGRT_TF_IN_REGISTERS 1
+#else
+#define LGRT_TF_IN_REGISTERS 0
+#endif
+
+#if LGRT_TF_IN_REGISTERS
+
+__extension__ typedef _Complex unsigned long long lgrt_tf_registers;
+
+static inline lgrt_tf_registers lgrt_tf_to_registers(struct lgrt_wide bits) {
+    lgrt_tf_registers value;
+
+    __builtin_memcpy(&value, &bits, sizeof(struct lgrt_wide));
+    return value;
+}
+
+#define LGRT_TF_BINARY(name, value) \
+    lgrt_tf_registers name( \
+        uint64_t a_high, uint64_t a_low, uint64_t b_high, uint64_t b_low \
+    ); \
+    lgrt_tf_registers name( \
+        uint64_t a_high, uint64_t a_low, uint64_t b_high, uint64_t b_low \
+    ) { \
+        struct lgrt_wide x = lgrt_wide_make(a_high, a_low); \
+        struct lgrt_wide y = lgrt_wide_make(b_high, b_low); \
+        \
+        return lgrt_tf_to_registers(value); \
+    }
+
+#define LGRT_TF_RELATION(name, value) \
+    lgrt_fp_cmp name( \
+        uint64_t a_high, uint64_t a_low, uint64_t b_high, uint64_t b_low \
+    ); \
+    lgrt_fp_cmp name( \
+        uint64_t a_high, uint64_t a_low, uint64_t b_high, uint64_t b_low \
+    ) { \
+        struct lgrt_wide x = lgrt_wide_make(a_high, a_low); \
+        struct lgrt_wide y = lgrt_wide_make(b_high, b_low); \
+        \
+        return value; \
+    }
+
+#define LGRT_TF_FROM(name, P, value) \
+    lgrt_tf_registers name(P i); \
+    lgrt_tf_registers name(P i) { \
+        return lgrt_tf_to_registers(value); \
+    }
+
+#define LGRT_TF_TO(name, R, value) \
+    R name(uint64_t high, uint64_t low); \
+    R name(uint64_t high, uint64_t low) { \
+        struct lgrt_wide x = lgrt_wide_make(high, low); \
+        \
+        return value; \
+    }
+
+#define LGRT_TF_TO_AS_C(name, R, value) \
+    R name(lgrt_quad_value a); \
+    R name(lgrt_quad_value a) { \
+        struct lgrt_wide x = lgrt_tf_to_bits(a); \
+        \
+        return value; \
+    }
+
+#elif LGRT_64BIT && !defined(_SOFT_FLOAT) && !defined(SOFT_FLOAT)
+
+#define LGRT_TF_BINARY(name, value) \
+    void name( \
+        lgrt_quad_value *r, const lgrt_quad_value *a, \
+        const lgrt_quad_value *b \
+    ); \
+    void name( \
+        lgrt_quad_value *r, const lgrt_quad_value *a, \
+        const lgrt_quad_value *b \
+    ) { \
+        struct lgrt_wide x = lgrt_tf_to_bits(*a); \
+        struct lgrt_wide y = lgrt_tf_to_bits(*b); \
+        \
+        *r = lgrt_tf_from_bits(value); \
+    }
+
+#define LGRT_TF_RELATION(name, value) \
+    lgrt_fp_cmp name(const lgrt_quad_value *a, const lgrt_quad_value *b); \
+    lgrt_fp_cmp name(const lgrt_quad_value *a, const lgrt_quad_value *b) { \
+        struct lgrt_wide x = lgrt_tf_to_bits(*a); \
+        struct lgrt_wide y = lgrt_tf_to_bits(*b); \
+        \
+        return value; \
+    }
+
+#define LGRT_TF_FROM(name, P, value) \
+    void name(lgrt_quad_value *r, P i); \
+    void name(lgrt_quad_value *r, P i) { \
+        *r = lgrt_tf_from_bits(value); \
+    }
+
+#define LGRT_TF_TO(name, R, value) \
+    R name(const lgrt_quad_value *a); \
+    R name(const lgrt_quad_value *a) { \
+        struct lgrt_wide x = lgrt_tf_to_bits(*a); \
+        \
+        return value; \
+    }
+
+#else
+
+#define LGRT_TF_BINARY(name, value) \
+    lgrt_quad_value name(lgrt_quad_value a, lgrt_quad_value b); \
+    lgrt_quad_value name(lgrt_quad_value a, lgrt_quad_value b) { \
+        struct lgrt_wide x = lgrt_tf_to_bits(a); \
+        struct lgrt_wide y = lgrt_tf_to_bits(b); \
+        \
+        return lgrt_tf_from_bits(value); \
+    }
+
+#define LGRT_TF_RELATION(name, value) \
+    lgrt_fp_cmp name(lgrt_quad_value a, lgrt_quad_value b); \
+    lgrt_fp_cmp name(lgrt_quad_value a, lgrt_quad_value b) { \
+        struct lgrt_wide x = lgrt_tf_to_bits(a); \
+        struct lgrt_wide y = lgrt_tf_to_bits(b); \
+        \
+        return value; \
+    }
+
+#define LGRT_TF_FROM(name, P, value) \
+    lgrt_quad_value name(P i); \
+    lgrt_quad_value name(P i) { \
+        return lgrt_tf_from_bits(value); \
+    }
+
+#define LGRT_TF_TO(name, R, value) \
+    R name(lgrt_quad_value a); \
+    R name(lgrt_quad_value a) { \
+        struct lgrt_wide x = lgrt_tf_to_bits(a); \
+        \
+        return value; \
+    }
+
+#endif
+
+#define LGRT_TF_EQUAL (lgrt_tf_compare(x, y, 1) == 0)
+#define LGRT_TF_NOT_EQUAL (lgrt_tf_compare(x, y, 1) != 0)
+#define LGRT_TF_LESS (lgrt_tf_compare(x, y, 1) < 0)
+#define LGRT_TF_LESS_EQUAL (lgrt_tf_compare(x, y, 1) <= 0)
+#define LGRT_TF_GREATER (lgrt_tf_compare(x, y, -1) > 0)
+#define LGRT_TF_GREATER_EQUAL (lgrt_tf_compare(x, y, -1) >= 0)
+#define LGRT_TF_UNORDERED (lgrt_tf_compare(x, y, 2) == 2)
+#define LGRT_TF_FROM_SF lgrt_tf_from_sf(lgrt_sf_to_bits(i))
+#define LGRT_TF_FROM_DF lgrt_tf_from_df(lgrt_df_to_bits(i))
+#define LGRT_TF_TO_SF lgrt_sf_from_bits(lgrt_tf_to_sf(x))
+#define LGRT_TF_TO_DF lgrt_df_from_bits(lgrt_tf_to_df(x))
+
+/*
+ * The value of _Q_cmp and _Qp_cmp: 0 for equal, 1 for less, 2 for greater, and
+ * 3 for unordered.
+ */
+LGRT_WIDE_HELPER int lgrt_tf_order(struct lgrt_wide a, struct lgrt_wide b) {
+    int order = lgrt_tf_compare(a, b, 2);
+
+    return order < 0 ? 1 : order == 0 ? 0 : order + 1;
+}
+
+/*
+ * One bit of the root at a time, for a value of m * 2^e with e even, keeping
+ * m - q * q = r * 2^-j for the root q after j bits and its remainder r. Both
+ * have 114 bits below the point, and r at most 4 above it. The sticky bit
+ * comes from r, so the result is correctly rounded.
+ */
+LGRT_WIDE_HELPER struct lgrt_wide lgrt_tf_sqrt(struct lgrt_wide a) {
+    struct lgrt_wide magnitude = LGRT_WIDE_MAGNITUDE(a);
+    int kind = lgrt_tf_kind(magnitude);
+    struct lgrt_wide root = LGRT_WIDE_INT_BIT(114);
+    struct lgrt_wide rem;
+    struct lgrt_wide sig;
+    unsigned int e;
+
+    if (kind == LGRT_FP_ZERO) {
+        return a;
+    }
+    if (kind == LGRT_FP_NOT_A_NUMBER || (a.high & LGRT_WIDE_SIGN) != 0) {
+        return LGRT_WIDE_NAN(32767, 112);
+    }
+    if (kind == LGRT_FP_INFINITE) {
+        return a;
+    }
+    sig = lgrt_tf_normalise(magnitude, &e);
+    e -= LGRT_WIDE_BIAS(32767);
+    rem = lgrt_wide_sub(lgrt_wide_shl(sig, 2 + (e & 1)), root);
+    e -= e & 1;
+    for (size_t i = 114; i-- > 0; ) {
+        struct lgrt_wide unit = LGRT_WIDE_INT_BIT((unsigned int)i);
+        struct lgrt_wide trial = lgrt_wide_add(lgrt_wide_shl(root, 1), unit);
+
+        rem = lgrt_wide_shl(rem, 1);
+        if (!lgrt_wide_lt(rem, trial)) {
+            rem = lgrt_wide_sub(rem, trial);
+            root = lgrt_wide_add(root, unit);
+        }
+    }
+    sig = lgrt_wide_shl(root, 1);
+    sig.low |= (uint64_t)!lgrt_wide_eq(rem, lgrt_wide_make(0, 0));
+    e = ((e + 0x10000) >> 1) - 0x8000;
+    return lgrt_tf_round_pack(0, e + LGRT_WIDE_BIAS(32767), sig);
+}
+
+#if LGRT_TF_IN_REGISTERS
+
+LGRT_TF_BINARY(__addtf3, lgrt_tf_add(x, y))
+LGRT_TF_BINARY(__subtf3, lgrt_tf_sub(x, y))
+LGRT_TF_BINARY(__multf3, lgrt_tf_mul(x, y))
+LGRT_TF_BINARY(__divtf3, lgrt_tf_div(x, y))
+LGRT_TF_RELATION(__eqtf2, lgrt_tf_compare(x, y, 1))
+LGRT_TF_RELATION(__netf2, lgrt_tf_compare(x, y, 1))
+LGRT_TF_RELATION(__lttf2, lgrt_tf_compare(x, y, 1))
+LGRT_TF_RELATION(__letf2, lgrt_tf_compare(x, y, 1))
+LGRT_TF_RELATION(__gttf2, lgrt_tf_compare(x, y, -1))
+LGRT_TF_RELATION(__getf2, lgrt_tf_compare(x, y, -1))
+LGRT_TF_RELATION(__unordtf2, LGRT_TF_UNORDERED)
+LGRT_TF_FROM(__extendsftf2, lgrt_sf_value, LGRT_TF_FROM_SF)
+LGRT_TF_FROM(__extenddftf2, lgrt_df_value, LGRT_TF_FROM_DF)
+LGRT_TF_FROM(__floatsitf, int32_t, lgrt_tf_from_si(i))
+LGRT_TF_FROM(__floatunsitf, uint32_t, lgrt_tf_float_si(0, i))
+LGRT_TF_FROM(_Q_lltoq, int64_t, lgrt_tf_from_di(i))
+LGRT_TF_FROM(_Q_ulltoq, uint64_t, lgrt_tf_float_di(0, i))
+LGRT_TF_TO(__trunctfsf2, lgrt_sf_value, LGRT_TF_TO_SF)
+LGRT_TF_TO(__trunctfdf2, lgrt_df_value, LGRT_TF_TO_DF)
+LGRT_TF_TO(__fixtfsi, int32_t, lgrt_tf_to_si(x))
+LGRT_TF_TO(__fixunstfsi, uint32_t, lgrt_tf_to_unssi(x))
+LGRT_TF_TO_AS_C(_Q_qtoll, int64_t, lgrt_tf_to_di(x))
+LGRT_TF_TO_AS_C(_Q_qtoull, uint64_t, lgrt_tf_wrap_di(x))
+
+#elif !LGRT_64BIT
+
+LGRT_TF_BINARY(_Q_add, lgrt_tf_add(x, y))
+LGRT_TF_BINARY(_Q_sub, lgrt_tf_sub(x, y))
+LGRT_TF_BINARY(_Q_mul, lgrt_tf_mul(x, y))
+LGRT_TF_BINARY(_Q_div, lgrt_tf_div(x, y))
+LGRT_TF_RELATION(_Q_cmp, lgrt_tf_order(x, y))
+LGRT_TF_RELATION(_Q_feq, LGRT_TF_EQUAL)
+LGRT_TF_RELATION(_Q_fne, LGRT_TF_NOT_EQUAL)
+LGRT_TF_RELATION(_Q_flt, LGRT_TF_LESS)
+LGRT_TF_RELATION(_Q_fle, LGRT_TF_LESS_EQUAL)
+LGRT_TF_RELATION(_Q_fgt, LGRT_TF_GREATER)
+LGRT_TF_RELATION(_Q_fge, LGRT_TF_GREATER_EQUAL)
+LGRT_TF_FROM(_Q_stoq, lgrt_sf_value, LGRT_TF_FROM_SF)
+LGRT_TF_FROM(_Q_dtoq, lgrt_df_value, LGRT_TF_FROM_DF)
+LGRT_TF_FROM(_Q_itoq, int32_t, lgrt_tf_from_si(i))
+LGRT_TF_FROM(_Q_utoq, uint32_t, lgrt_tf_float_si(0, i))
+LGRT_TF_FROM(_Q_lltoq, int64_t, lgrt_tf_from_di(i))
+LGRT_TF_FROM(_Q_ulltoq, uint64_t, lgrt_tf_float_di(0, i))
+LGRT_TF_TO(_Q_qtos, lgrt_sf_value, LGRT_TF_TO_SF)
+LGRT_TF_TO(_Q_qtod, lgrt_df_value, LGRT_TF_TO_DF)
+LGRT_TF_TO(_Q_qtoi, int32_t, lgrt_tf_to_si(x))
+/*
+ * The SPARC Compliance Definition has a negative value of _Q_qtou go through
+ * the signed integer, and the others like it do so here too.
+ */
+LGRT_TF_TO(_Q_qtou, uint32_t, lgrt_tf_wrap_si(x))
+LGRT_TF_TO(_Q_qtoll, int64_t, lgrt_tf_to_di(x))
+LGRT_TF_TO(_Q_qtoull, uint64_t, lgrt_tf_wrap_di(x))
+
+lgrt_quad_value _Q_sqrt(lgrt_quad_value a);
+lgrt_quad_value _Q_sqrt(lgrt_quad_value a) {
+    return lgrt_tf_from_bits(lgrt_tf_sqrt(lgrt_tf_to_bits(a)));
+}
+
+/* GCC calls this one by its usual name, with and only with -msoft-float. */
+#if defined(_SOFT_FLOAT)
+LGRT_TF_RELATION(__unordtf2, LGRT_TF_UNORDERED)
+#endif
+
+#elif !defined(_SOFT_FLOAT) && !defined(SOFT_FLOAT)
+
+LGRT_TF_BINARY(_Qp_add, lgrt_tf_add(x, y))
+LGRT_TF_BINARY(_Qp_sub, lgrt_tf_sub(x, y))
+LGRT_TF_BINARY(_Qp_mul, lgrt_tf_mul(x, y))
+LGRT_TF_BINARY(_Qp_div, lgrt_tf_div(x, y))
+LGRT_TF_RELATION(_Qp_cmp, lgrt_tf_order(x, y))
+LGRT_TF_RELATION(_Qp_feq, LGRT_TF_EQUAL)
+LGRT_TF_RELATION(_Qp_fne, LGRT_TF_NOT_EQUAL)
+LGRT_TF_RELATION(_Qp_flt, LGRT_TF_LESS)
+LGRT_TF_RELATION(_Qp_fle, LGRT_TF_LESS_EQUAL)
+LGRT_TF_RELATION(_Qp_fgt, LGRT_TF_GREATER)
+LGRT_TF_RELATION(_Qp_fge, LGRT_TF_GREATER_EQUAL)
+LGRT_TF_FROM(_Qp_stoq, lgrt_sf_value, LGRT_TF_FROM_SF)
+LGRT_TF_FROM(_Qp_dtoq, lgrt_df_value, LGRT_TF_FROM_DF)
+/*
+ * GCC extends a 32-bit integer to all of its register, and Clang leaves what
+ * is there, so these two take the low half of that register.
+ */
+LGRT_TF_FROM(_Qp_itoq, uint64_t, lgrt_tf_from_si((int32_t)(uint32_t)i))
+LGRT_TF_FROM(_Qp_uitoq, uint64_t, lgrt_tf_float_si(0, (uint32_t)i))
+LGRT_TF_FROM(_Qp_xtoq, int64_t, lgrt_tf_from_di(i))
+LGRT_TF_FROM(_Qp_uxtoq, uint64_t, lgrt_tf_float_di(0, i))
+LGRT_TF_TO(_Qp_qtos, lgrt_sf_value, LGRT_TF_TO_SF)
+LGRT_TF_TO(_Qp_qtod, lgrt_df_value, LGRT_TF_TO_DF)
+LGRT_TF_TO(_Qp_qtoi, int32_t, lgrt_tf_to_si(x))
+LGRT_TF_TO(_Qp_qtoui, uint32_t, lgrt_tf_wrap_si(x))
+LGRT_TF_TO(_Qp_qtox, int64_t, lgrt_tf_to_di(x))
+LGRT_TF_TO(_Qp_qtoux, uint64_t, lgrt_tf_wrap_di(x))
+
+void _Qp_sqrt(lgrt_quad_value *r, const lgrt_quad_value *a);
+void _Qp_sqrt(lgrt_quad_value *r, const lgrt_quad_value *a) {
+    *r = lgrt_tf_from_bits(lgrt_tf_sqrt(lgrt_tf_to_bits(*a)));
+}
+
+#else
+
+LGRT_TF_BINARY(__addtf3, lgrt_tf_add(x, y))
+LGRT_TF_BINARY(__subtf3, lgrt_tf_sub(x, y))
+LGRT_TF_BINARY(__multf3, lgrt_tf_mul(x, y))
+LGRT_TF_BINARY(__divtf3, lgrt_tf_div(x, y))
+
+/*
+ * GCC takes these results as truth values, nonzero where the relation holds,
+ * and Clang goes by their sign.
+ */
+#if defined(__clang__)
+LGRT_TF_RELATION(__eqtf2, lgrt_tf_compare(x, y, 1))
+LGRT_TF_RELATION(__netf2, lgrt_tf_compare(x, y, 1))
+LGRT_TF_RELATION(__lttf2, lgrt_tf_compare(x, y, 1))
+LGRT_TF_RELATION(__letf2, lgrt_tf_compare(x, y, 1))
+LGRT_TF_RELATION(__gttf2, lgrt_tf_compare(x, y, -1))
+LGRT_TF_RELATION(__getf2, lgrt_tf_compare(x, y, -1))
+#else
+LGRT_TF_RELATION(__eqtf2, LGRT_TF_EQUAL)
+LGRT_TF_RELATION(__netf2, LGRT_TF_NOT_EQUAL)
+LGRT_TF_RELATION(__lttf2, LGRT_TF_LESS)
+LGRT_TF_RELATION(__letf2, LGRT_TF_LESS_EQUAL)
+LGRT_TF_RELATION(__gttf2, LGRT_TF_GREATER)
+LGRT_TF_RELATION(__getf2, LGRT_TF_GREATER_EQUAL)
+#endif
+
+LGRT_TF_RELATION(__unordtf2, LGRT_TF_UNORDERED)
+LGRT_TF_FROM(__extendsftf2, lgrt_sf_value, LGRT_TF_FROM_SF)
+LGRT_TF_FROM(__extenddftf2, lgrt_df_value, LGRT_TF_FROM_DF)
+/* These two take the low half of the register, as _Qp_itoq does. */
+LGRT_TF_FROM(__floatsitf, uint64_t, lgrt_tf_from_si((int32_t)(uint32_t)i))
+LGRT_TF_FROM(__floatunsitf, uint64_t, lgrt_tf_float_si(0, (uint32_t)i))
+LGRT_TF_FROM(__floatditf, int64_t, lgrt_tf_from_di(i))
+LGRT_TF_FROM(__floatunditf, uint64_t, lgrt_tf_float_di(0, i))
+LGRT_TF_TO(__trunctfsf2, lgrt_sf_value, LGRT_TF_TO_SF)
+LGRT_TF_TO(__trunctfdf2, lgrt_df_value, LGRT_TF_TO_DF)
+LGRT_TF_TO(__fixtfsi, int32_t, lgrt_tf_to_si(x))
+LGRT_TF_TO(__fixunstfsi, uint32_t, lgrt_tf_to_unssi(x))
+LGRT_TF_TO(__fixtfdi, int64_t, lgrt_tf_to_di(x))
+LGRT_TF_TO(__fixunstfdi, uint64_t, lgrt_tf_to_unsdi(x))
+
+#endif
+
+#elif defined(__alpha__)
+
+/*
+ * GCC passes long double to these in two integer registers, the low word
+ * first, $16 and $17 and then $18 and $19, and otherwise calls them as it does
+ * any other function. Those that give a long double give it in $16 and $17,
+ * which C cannot do, and GCC has no naked functions here, so LGRT_OTS_ENTRY
+ * makes those of a helper with C's calling convention that writes to memory.
+ *
+ * A caller that shares $29 skips what loads it, and .prologue is how it knows.
+ * The sequence numbers must be unique in the file, where the compiler goes up
+ * from 1 for its own.
+ *
+ * The argument after the operands of some of these is a rounding mode, set by
+ * -mfp-rounding-mode: 2 by default for to nearest, and 1, 0, or 4 for towards
+ * minus infinity, towards zero, or dynamic. Nothing reads it, and all of these
+ * round to nearest.
+ */
+#define LGRT_OTS_HELPER __attribute__((__used__, __visibility__("hidden")))
+
+#define LGRT_OTS_ENTRY(name, sequence, helper, setup, finish) \
+    __asm__ ( \
+        ".pushsection .text." name ",\"ax\",@progbits\n" \
+        ".p2align 2\n" \
+        ".globl " name "\n" \
+        ".ent " name "\n" \
+        name ":\n" \
+        ".frame $30, 32, $26, 0\n" \
+        ".mask 0x04000000, -32\n" \
+        "ldah $29, 0($27) !gpdisp!" sequence "\n" \
+        "lda $29, 0($29) !gpdisp!" sequence "\n" \
+        "lda $30, -32($30)\n" \
+        "stq $26, 0($30)\n" \
+        ".prologue 1\n" \
+        setup \
+        "ldq $27, " helper "($29) !literal\n" \
+        "jsr $26, ($27), " helper "\n" \
+        "ldq $26, 0($30)\n" \
+        finish \
+        "lda $30, 32($30)\n" \
+        "ret $31, ($26), 1\n" \
+        ".end " name "\n" \
+        ".popsection\n" \
+    );
+
+#define LGRT_OTS_QUAD_BACK \
+    "ldq $16, 16($30)\n" \
+    "ldq $17, 24($30)\n"
+
+#define LGRT_OTS_ARITHMETIC(name, sequence, helper, value) \
+    void helper( \
+        uint64_t a_low, uint64_t a_high, uint64_t b_low, uint64_t b_high, \
+        struct lgrt_wide *r \
+    ); \
+    LGRT_OTS_HELPER void helper( \
+        uint64_t a_low, uint64_t a_high, uint64_t b_low, uint64_t b_high, \
+        struct lgrt_wide *r \
+    ) { \
+        struct lgrt_wide x = lgrt_wide_make(a_high, a_low); \
+        struct lgrt_wide y = lgrt_wide_make(b_high, b_low); \
+        \
+        *r = value; \
+    } \
+    \
+    LGRT_OTS_ENTRY( \
+        name, sequence, #helper, "lda $20, 16($30)\n", LGRT_OTS_QUAD_BACK \
+    )
+
+LGRT_OTS_ARITHMETIC("_OtsAddX", "900001", lgrt_ots_add, lgrt_tf_add(x, y))
+LGRT_OTS_ARITHMETIC("_OtsSubX", "900002", lgrt_ots_sub, lgrt_tf_sub(x, y))
+LGRT_OTS_ARITHMETIC("_OtsMulX", "900003", lgrt_ots_mul, lgrt_tf_mul(x, y))
+LGRT_OTS_ARITHMETIC("_OtsDivX", "900004", lgrt_ots_div, lgrt_tf_div(x, y))
+
+void lgrt_ots_from_signed(int64_t i, struct lgrt_wide *r);
+LGRT_OTS_HELPER void lgrt_ots_from_signed(int64_t i, struct lgrt_wide *r) {
+    *r = lgrt_tf_from_di(i);
+}
+
+LGRT_OTS_ENTRY(
+    "_OtsCvtQX", "900005", "lgrt_ots_from_signed", "lda $17, 16($30)\n",
+    LGRT_OTS_QUAD_BACK
+)
+
+void lgrt_ots_from_unsigned(uint64_t i, struct lgrt_wide *r);
+LGRT_OTS_HELPER void lgrt_ots_from_unsigned(uint64_t i, struct lgrt_wide *r) {
+    *r = lgrt_tf_float_di(0, i);
+}
+
+LGRT_OTS_ENTRY(
+    "_OtsCvtQUX", "900006", "lgrt_ots_from_unsigned", "lda $17, 16($30)\n",
+    LGRT_OTS_QUAD_BACK
+)
+
+/* The double comes in $f16, and floating-point types stay out of helpers. */
+void lgrt_ots_from_double(uint64_t bits, struct lgrt_wide *r);
+LGRT_OTS_HELPER void lgrt_ots_from_double(uint64_t bits, struct lgrt_wide *r) {
+    *r = lgrt_tf_from_df(bits);
+}
+
+LGRT_OTS_ENTRY(
+    "_OtsConvertFloatTX", "900007", "lgrt_ots_from_double",
+    "stt $f16, 16($30)\n"
+    "ldq $16, 16($30)\n"
+    "lda $17, 16($30)\n",
+    LGRT_OTS_QUAD_BACK
+)
+
+/*
+ * The double goes back in $f0, or in $0 with -mno-fp-regs, which no macro
+ * tells from -msoft-float, so it goes in both.
+ */
+uint64_t lgrt_ots_to_double(uint64_t low, uint64_t high);
+LGRT_OTS_HELPER uint64_t lgrt_ots_to_double(uint64_t low, uint64_t high) {
+    return lgrt_tf_to_df(lgrt_wide_make(high, low));
+}
+
+LGRT_OTS_ENTRY(
+    "_OtsConvertFloatXT", "900008", "lgrt_ots_to_double", "",
+    "stq $0, 16($30)\n"
+    "ldt $f0, 16($30)\n"
+)
+
+/*
+ * With -msoft-float or -mno-fp-regs, GCC calls this for float, with long
+ * double as C passes it, by pointer, and the result as above, in the form that
+ * loading it from memory gives.
+ */
+#if !LGRT_SOFT_FLOAT
+
+LGRT_FP_STICKY_SHIFT(sf, uint32_t, 23)
+LGRT_FP_ROUND_PACK(sf, uint32_t, 8, 23)
+LGRT_WIDE_TRUNC_BITS(sf, uint32_t, 8, 23, tf, 32767, 112)
+
+int32_t lgrt_ots_to_float(const lgrt_quad_value *a);
+LGRT_OTS_HELPER int32_t lgrt_ots_to_float(const lgrt_quad_value *a) {
+    return (int32_t)lgrt_tf_to_sf(lgrt_tf_to_bits(*a));
+}
+
+LGRT_OTS_ENTRY(
+    "__trunctfsf2", "900009", "lgrt_ots_to_float", "",
+    "stl $0, 16($30)\n"
+    "lds $f0, 16($30)\n"
+)
+
+#endif
+
+/*
+ * GCC calls this for conversions to unsigned types too, so values up to 2^64
+ * give what those need, and negative ones what signed types do.
+ */
+int64_t _OtsCvtXQ(uint64_t low, uint64_t high);
+int64_t _OtsCvtXQ(uint64_t low, uint64_t high) {
+    return (int64_t)lgrt_tf_wrap_di(lgrt_wide_make(high, low));
+}
+
+/*
+ * These give 1 where the relation holds, and 0 where it does not. GCC takes a
+ * negative value from _OtsEqlX as unordered operands, and -1 is what these
+ * give for those: false for what reads a positive value as true, and true for
+ * _OtsNeqX, which reads any other than 0 as true.
+ */
+#define LGRT_OTS_RELATION(name, op) \
+    lgrt_fp_cmp name( \
+        uint64_t a_low, uint64_t a_high, uint64_t b_low, uint64_t b_high \
+    ); \
+    lgrt_fp_cmp name( \
+        uint64_t a_low, uint64_t a_high, uint64_t b_low, uint64_t b_high \
+    ) { \
+        struct lgrt_wide x = lgrt_wide_make(a_high, a_low); \
+        struct lgrt_wide y = lgrt_wide_make(b_high, b_low); \
+        int order = lgrt_tf_compare(x, y, 2); \
+        \
+        return order == 2 ? -1 : order op 0; \
+    }
+
+LGRT_OTS_RELATION(_OtsEqlX, ==)
+LGRT_OTS_RELATION(_OtsNeqX, !=)
+LGRT_OTS_RELATION(_OtsLssX, <)
+LGRT_OTS_RELATION(_OtsLeqX, <=)
+LGRT_OTS_RELATION(_OtsGtrX, >)
+LGRT_OTS_RELATION(_OtsGeqX, >=)
+
+#endif
+
+#endif
+
+#if LGRT_SOFT_XF
+
+#define LGRT_XF_INT_BIT ((uint64_t)1 << 63)
+
+/*
+ * The core treats the integer bit of these formats as it does any other: it
+ * sees it only here, where values come and go.
+ */
+#if defined(__m68k__)
+
+/*
+ * A value of 96 bits has its sign and exponent field at the top of its first
+ * word, then 16 bits that are ignored and written as zero, then its
+ * significand. The exponent field means what it says down to 0, where a set
+ * integer bit makes a normal number and a clear one a denormal one of the same
+ * exponent, a binade below where IEEE formats stop. The core has this as a
+ * format with a field one higher, so that denormal numbers have 0 there.
+ *
+ * All encodings have a meaning. An unnormal number, of a clear integer bit
+ * under a higher field, gets normalised as it is used, its significand and
+ * field making up its value, and is a zero if its significand is. The integer
+ * bit means nothing for infinities and NaNs.
+ */
+#define LGRT_XF_EXP_MAX 32768
+#define LGRT_XF_RETURNED 1
+
+typedef long double lgrt_xf_value;
+
+/*
+ * Values are passed on the stack, where this structure goes too. As long
+ * double, compilers can load them into a floating-point register on the way,
+ * which changes some of them.
+ */
+struct lgrt_xf_words {
+    uint32_t words[3];
+};
+
+#define LGRT_XF_PARAMETER struct lgrt_xf_words
+
+static inline struct lgrt_wide lgrt_xf_to_bits(struct lgrt_xf_words value) {
+    uint32_t top = value.words[0];
+    uint64_t sig = LGRT_JOIN_32(value.words[1], value.words[2]);
+    uint64_t field = (top >> 16) & 0x7fff;
+
+    if (field == 0x7fff) {
+        field = LGRT_XF_EXP_MAX;
+    } else {
+        if (sig == 0) {
+            field = 0;
+        }
+        while (sig < LGRT_XF_INT_BIT && field != 0) {
+            sig += sig;
+            field -= 1;
+        }
+        field = sig < LGRT_XF_INT_BIT ? 0 : field + 1;
+    }
+    return lgrt_wide_make(
+        ((uint64_t)(top >> 31) << 63) | (field >> 1),
+        (field << 63) | (sig & (LGRT_XF_INT_BIT - 1))
+    );
+}
+
+/* An infinity has a clear integer bit, as compilers and the FPU write it. */
+static inline lgrt_xf_value lgrt_xf_from_bits(struct lgrt_wide bits) {
+    uint64_t field = ((bits.high << 1) | (bits.low >> 63)) & 0xffff;
+    uint64_t sig = bits.low & (LGRT_XF_INT_BIT - 1);
+    uint32_t words[3];
+    lgrt_xf_value value;
+
+    if (field != 0) {
+        if (field != LGRT_XF_EXP_MAX || sig != 0) {
+            sig |= LGRT_XF_INT_BIT;
+        }
+        field -= 1;
+    }
+    words[0] = ((uint32_t)(bits.high >> 63) << 31) | ((uint32_t)field << 16);
+    words[1] = LGRT_HIGH_32(sig);
+    words[2] = (uint32_t)sig;
+    __asm__ ("" : "+g"(words[0]), "+g"(words[1]), "+g"(words[2]));
+    __builtin_memcpy(&value, words, sizeof(words));
+    return value;
+}
+
+#else
+
+/*
+ * A value has its significand first, then its sign and exponent field, in 16
+ * bits, then padding up to the size of the type. The 387 and later read a
+ * pseudo-denormal number, of a set integer bit under a zero field, as having a
+ * field of 1, and raise invalid for any other encoding that IEEE 754 does not
+ * have: unnormal numbers, pseudo-infinities, and pseudo-NaNs, of a clear
+ * integer bit under a nonzero field. Those are NaNs here for that reason.
+ */
+#define LGRT_XF_EXP_MAX 32767
+
+/*
+ * Clang rejects long double in a definition with x87 off, with nothing telling
+ * of that, so the routines it may call take that type's place below. x86-64
+ * passes long double where unsigned __int128 goes once the six registers for
+ * integers are taken, and IA-32 where a structure of its size goes, and both
+ * return it on top of the x87 stack.
+ */
+#if !defined(__clang__)
+__extension__ typedef __float80 lgrt_xf_value;
+typedef lgrt_xf_value lgrt_xf_argument;
+#define LGRT_XF_PARAMETER lgrt_xf_argument
+#elif defined(__x86_64__)
+typedef lgrt_u128 lgrt_xf_argument;
+#define LGRT_XF_IGNORED __attribute__((__unused__))
+#define LGRT_XF_PARAMETER \
+    uint64_t rdi LGRT_XF_IGNORED, uint64_t rsi LGRT_XF_IGNORED, \
+    uint64_t rdx LGRT_XF_IGNORED, uint64_t rcx LGRT_XF_IGNORED, \
+    uint64_t r8 LGRT_XF_IGNORED, uint64_t r9 LGRT_XF_IGNORED, \
+    lgrt_xf_argument
+#else
+typedef struct { uint32_t words[3]; } lgrt_xf_argument;
+#define LGRT_XF_PARAMETER lgrt_xf_argument
+#endif
+
+static inline struct lgrt_wide lgrt_xf_to_bits(lgrt_xf_argument value) {
+    struct lgrt_wide raw = lgrt_wide_make(0, 0);
+    uint64_t field;
+
+    __builtin_memcpy(&raw, &value, sizeof(lgrt_xf_argument));
+    __asm__ ("" : "+g"(raw.high), "+g"(raw.low));
+    field = raw.high & 0x7fff;
+    if (field == 0 && raw.low >= LGRT_XF_INT_BIT) {
+        field = 1;
+    } else if (field != 0 && raw.low < LGRT_XF_INT_BIT) {
+        return LGRT_WIDE_NAN(LGRT_XF_EXP_MAX, 63);
+    }
+    return lgrt_wide_make(
+        ((raw.high & 0x8000) << 48) | (field >> 1),
+        (field << 63) | (raw.low & (LGRT_XF_INT_BIT - 1))
+    );
+}
+
+/* The bits in memory, with the padding clear. */
+static inline struct lgrt_wide lgrt_xf_encode(struct lgrt_wide bits) {
+    uint64_t field = ((bits.high << 1) | (bits.low >> 63)) & 0x7fff;
+
+    return lgrt_wide_make(
+        ((bits.high >> 48) & 0x8000) | field,
+        (bits.low & (LGRT_XF_INT_BIT - 1))
+            | (field != 0 ? LGRT_XF_INT_BIT : 0)
+    );
+}
+
+#if defined(__clang__)
+
+static inline void lgrt_xf_return(struct lgrt_wide bits) {
+    struct lgrt_wide raw = lgrt_xf_encode(bits);
+
+    __asm__ ("fldt %0" : : "m"(raw));
+}
+
+/*
+ * x86-64 cannot return long double with x87 off. Passing it still works, in
+ * memory, so the routines that only take one are still called there.
+ */
+#elif !defined(__x86_64__) || !defined(_SOFT_FLOAT)
+
+static inline lgrt_xf_value lgrt_xf_from_bits(struct lgrt_wide bits) {
+    struct lgrt_wide raw = lgrt_xf_encode(bits);
+    lgrt_xf_value value;
+
+    __asm__ ("" : "+g"(raw.high), "+g"(raw.low));
+    __builtin_memcpy(&value, &raw, sizeof(lgrt_xf_value));
+    return value;
+}
+
+#define LGRT_XF_RETURNED 1
+
+#endif
+
+#endif
+
+#if !defined(LGRT_XF_RETURNED)
+#define LGRT_XF_RETURNED 0
+#endif
+
+#if LGRT_XF_RETURNED
+
+LGRT_WIDE_ARITHMETIC(xf, lgrt_xf_value, LGRT_XF_PARAMETER, LGRT_XF_EXP_MAX, 63)
+LGRT_WIDE_FROM_INT(
+    xf, lgrt_xf_value, LGRT_XF_EXP_MAX, 63, si, int32_t, uint32_t, 32
+)
+LGRT_WIDE_FROM_INT(
+    xf, lgrt_xf_value, LGRT_XF_EXP_MAX, 63, di, int64_t, uint64_t, 64
+)
+#if LGRT_SOFT_FLOAT
+LGRT_WIDE_EXTEND(
+    sf, lgrt_sf_value, uint32_t, 8, 23, xf, lgrt_xf_value, LGRT_XF_EXP_MAX, 63
+)
+#endif
+#if LGRT_SOFT_DOUBLE
+LGRT_WIDE_EXTEND(
+    df, lgrt_df_value, uint64_t, 11, 52, xf, lgrt_xf_value, LGRT_XF_EXP_MAX, 63
+)
+#endif
+#if LGRT_HAS_INT128
+LGRT_WIDE_FROM_TI(xf, lgrt_xf_value, LGRT_XF_EXP_MAX, 63)
+#endif
+
+#elif defined(__clang__)
+
+LGRT_WIDE_CORE(xf, LGRT_XF_EXP_MAX, 63)
+
+#if LGRT_HAS_INT128
+
+LGRT_WIDE_FROM_TI_BITS(xf, LGRT_XF_EXP_MAX, 63)
+
+void __floattixf(lgrt_i128 i);
+void __floattixf(lgrt_i128 i) {
+    lgrt_xf_return(lgrt_xf_from_ti(i));
+}
+
+void __floatuntixf(lgrt_u128 i);
+void __floatuntixf(lgrt_u128 i) {
+    lgrt_xf_return(lgrt_xf_float_ti(0, lgrt_wide_from_u128(i)));
+}
+
+#endif
+
+#endif
+
+#if !defined(__clang__) || defined(__m68k__)
+
+LGRT_WIDE_COMPARISONS(xf, LGRT_XF_PARAMETER, LGRT_XF_EXP_MAX, 63)
+LGRT_WIDE_TO_INT(
+    xf, LGRT_XF_PARAMETER, LGRT_XF_EXP_MAX, 63, si, int32_t, uint32_t, 32
+)
+LGRT_WIDE_TO_INT(
+    xf, LGRT_XF_PARAMETER, LGRT_XF_EXP_MAX, 63, di, int64_t, uint64_t, 64
+)
+#if LGRT_SOFT_FLOAT
+LGRT_WIDE_TRUNC(
+    sf, lgrt_sf_value, uint32_t, 8, 23, xf, LGRT_XF_PARAMETER,
+    LGRT_XF_EXP_MAX, 63
+)
+#endif
+#if LGRT_SOFT_DOUBLE
+LGRT_WIDE_TRUNC(
+    df, lgrt_df_value, uint64_t, 11, 52, xf, LGRT_XF_PARAMETER,
+    LGRT_XF_EXP_MAX, 63
+)
+#endif
+
+#endif
+
+#if LGRT_HAS_INT128
+LGRT_WIDE_TO_TI(xf, LGRT_XF_PARAMETER, LGRT_XF_EXP_MAX, 63)
+#endif
+
+/* Quad has the same exponents as the x87, and a longer significand. */
+#if LGRT_SOFT_QUAD && (defined(__i386__) || defined(__x86_64__))
+
+lgrt_quad_value __extendxftf2(LGRT_XF_PARAMETER a);
+lgrt_quad_value __extendxftf2(LGRT_XF_PARAMETER a) {
+    struct lgrt_wide x = lgrt_xf_to_bits(a);
+    struct lgrt_wide magnitude = LGRT_WIDE_MAGNITUDE(x);
+
+    if (lgrt_wide_lt(LGRT_WIDE_INF(LGRT_XF_EXP_MAX, 63), magnitude)) {
+        return lgrt_tf_from_bits(LGRT_WIDE_NAN(32767, 112));
+    }
+    magnitude = lgrt_wide_shl(magnitude, 112 - 63);
+    magnitude.high |= x.high & LGRT_WIDE_SIGN;
+    return lgrt_tf_from_bits(magnitude);
+}
+
+#if LGRT_XF_RETURNED || defined(__clang__)
+
+static inline struct lgrt_wide lgrt_xf_from_tf(struct lgrt_wide x) {
+    struct lgrt_wide magnitude = LGRT_WIDE_MAGNITUDE(x);
+    struct lgrt_wide sig = lgrt_wide_low_bits(magnitude, 112);
+    struct lgrt_wide bits = LGRT_WIDE_INF(LGRT_XF_EXP_MAX, 63);
+    unsigned int e = lgrt_wide_exponent(magnitude, 112);
+
+    if (lgrt_wide_lt(LGRT_WIDE_INF(32767, 112), magnitude)) {
+        return LGRT_WIDE_NAN(LGRT_XF_EXP_MAX, 63);
+    }
+    if (lgrt_wide_eq(magnitude, LGRT_WIDE_INF(32767, 112))) {
+        bits.high |= x.high & LGRT_WIDE_SIGN;
+        return bits;
+    }
+    if (e != 0) {
+        sig = lgrt_wide_or(sig, LGRT_WIDE_INT_BIT(112));
+    } else {
+        e = 1;
+    }
+    return lgrt_xf_round_pack(
+        x.high & LGRT_WIDE_SIGN, e, lgrt_wide_sticky_shift(sig, 112 - 63 - 3)
+    );
+}
+
+#if defined(__clang__)
+void __trunctfxf2(lgrt_quad_value a);
+void __trunctfxf2(lgrt_quad_value a) {
+    lgrt_xf_return(lgrt_xf_from_tf(lgrt_tf_to_bits(a)));
+}
+#else
+lgrt_xf_value __trunctfxf2(lgrt_quad_value a);
+lgrt_xf_value __trunctfxf2(lgrt_quad_value a) {
+    return lgrt_xf_from_bits(lgrt_xf_from_tf(lgrt_tf_to_bits(a)));
+}
+#endif
+
+#endif
+
+#endif
+
+#endif
+
+#endif
+
+#if defined(__ARM_EABI__)
+
+/* The names of the run-time ABI, and what the generic routines leave out. */
+
+#define LGRT_AEABI_COMPARE(fmt, C, name, unordered, op) \
+    LGRT_AAPCS int name(C a, C b); \
+    LGRT_AAPCS int name(C a, C b) { \
+        return lgrt_##fmt##_compare(a, b, unordered) op 0; \
+    }
+
+/*
+ * These return in the flags and keep every register but ip and lr, so they
+ * save the argument registers around the comparison, with its -1, 0, or 1. One
+ * more than that, compared with 1, clears C only for less, and sets Z only for
+ * equal. The saved registers are laid out for the end of the division routines
+ * once those of r0 and r1 are gone, and loading them changes no flags.
+ */
+#define LGRT_AEABI_FLAGS_ASM(f, swap) \
+    ".syntax unified\n" \
+    LGRT_DIVMOD_ENTRY \
+    "push {r0, r1, r2, r3}\n" \
+    swap \
+    "bl " f "\n" \
+    "adds r0, r0, #1\n" \
+    "cmp r0, #1\n" \
+    "pop {r0, r1}\n" \
+    LGRT_DIVMOD_EXIT \
+    LGRT_ASM_END
+
+#define LGRT_AEABI_ROUTINES(x, fmt, C, E, F, swap) \
+    LGRT_FP_ALIAS(C, __aeabi_##x##add, "__add" #fmt "3", (C a, C b)) \
+    LGRT_FP_ALIAS(C, __aeabi_##x##sub, "__sub" #fmt "3", (C a, C b)) \
+    LGRT_FP_ALIAS(C, __aeabi_##x##mul, "__mul" #fmt "3", (C a, C b)) \
+    LGRT_FP_ALIAS(C, __aeabi_##x##div, "__div" #fmt "3", (C a, C b)) \
+    LGRT_FP_ALIAS(C, __aeabi_##x##neg, "__neg" #fmt "2", (C a)) \
+    LGRT_FP_ALIAS(int, __aeabi_##x##cmpun, "__unord" #fmt "2", (C a, C b)) \
+    LGRT_FP_ALIAS(int32_t, __aeabi_##x##2iz, "__fix" #fmt "si", (C a)) \
+    LGRT_FP_ALIAS(uint32_t, __aeabi_##x##2uiz, "__fixuns" #fmt "si", (C a)) \
+    LGRT_FP_ALIAS(int64_t, __aeabi_##x##2lz, "__fix" #fmt "di", (C a)) \
+    LGRT_FP_ALIAS(uint64_t, __aeabi_##x##2ulz, "__fixuns" #fmt "di", (C a)) \
+    LGRT_FP_ALIAS(C, __aeabi_i2##x, "__floatsi" #fmt, (int32_t a)) \
+    LGRT_FP_ALIAS(C, __aeabi_ui2##x, "__floatunsi" #fmt, (uint32_t a)) \
+    LGRT_FP_ALIAS(C, __aeabi_l2##x, "__floatdi" #fmt, (int64_t a)) \
+    LGRT_FP_ALIAS(C, __aeabi_ul2##x, "__floatundi" #fmt, (uint64_t a)) \
+    \
+    LGRT_AAPCS C __aeabi_##x##rsub(C a, C b); \
+    LGRT_AAPCS C __aeabi_##x##rsub(C a, C b) { \
+        return lgrt_##fmt##_add(b, a ^ LGRT_FP_SIGN(C, E, F)); \
+    } \
+    \
+    LGRT_AEABI_COMPARE(fmt, C, __aeabi_##x##cmpeq, 1, ==) \
+    LGRT_AEABI_COMPARE(fmt, C, __aeabi_##x##cmplt, 1, <) \
+    LGRT_AEABI_COMPARE(fmt, C, __aeabi_##x##cmple, 1, <=) \
+    LGRT_AEABI_COMPARE(fmt, C, __aeabi_##x##cmpge, -1, >=) \
+    LGRT_AEABI_COMPARE(fmt, C, __aeabi_##x##cmpgt, -1, >) \
+    \
+    LGRT_AAPCS void __aeabi_c##x##cmple(C a, C b); \
+    LGRT_AAPCS __attribute__((__naked__)) void __aeabi_c##x##cmple( \
+        C a, C b \
+    ) { \
+        __asm__ volatile ( \
+            LGRT_AEABI_FLAGS_ASM("__lt" #fmt "2", "") \
+        ); \
+    } \
+    \
+    LGRT_FP_ALIAS( \
+        void, __aeabi_c##x##cmpeq, "__aeabi_c" #x "cmple", (C a, C b) \
+    ) \
+    \
+    LGRT_AAPCS void __aeabi_c##x##rcmple(C a, C b); \
+    LGRT_AAPCS __attribute__((__naked__)) void __aeabi_c##x##rcmple( \
+        C a, C b \
+    ) { \
+        __asm__ volatile ( \
+            LGRT_AEABI_FLAGS_ASM("__lt" #fmt "2", swap) \
+        ); \
+    }
+
+/* Workaround: GCC, ARM: as for the division routines. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+
+LGRT_AEABI_ROUTINES(
+    f, sf, uint32_t, 8, 23,
+    "ldr r0, [sp, #4]\n"
+    "ldr r1, [sp]\n"
+)
+LGRT_AEABI_ROUTINES(
+    d, df, uint64_t, 11, 52,
+    "ldr r0, [sp, #8]\n"
+    "ldr r1, [sp, #12]\n"
+    "ldr r2, [sp]\n"
+    "ldr r3, [sp, #4]\n"
+)
+
+#pragma GCC diagnostic pop
+
+LGRT_FP_ALIAS(uint64_t, __aeabi_f2d, "__extendsfdf2", (uint32_t a))
+LGRT_FP_ALIAS(uint32_t, __aeabi_d2f, "__truncdfsf2", (uint64_t a))
+
+#endif
+
+#if defined(__hexagon__)
+
+/*
+ * A square root bit by bit, from the top. The value to take the root of lies
+ * in [1, 4), for an even exponent, and q is the root found so far, with rem
+ * the value less the square of q, doubled for each bit of q. All of them have
+ * F + 3 bits after the point. The bias is odd, so an even exponent has an odd
+ * biased one, and half the former, biased, is half the sum of that and the
+ * bias.
+ */
+#define LGRT_FP_SQRT(fmt, T, E, F) \
+    static inline T lgrt_##fmt##_sqrt(T a) { \
+        T sign = LGRT_FP_SIGN(T, E, F); \
+        T magnitude = a & (sign - 1); \
+        T q = LGRT_FP_INT_BIT(T, F) << 3; \
+        T sig; \
+        T rem; \
+        unsigned int e; \
+        \
+        if (magnitude == 0 || a == LGRT_FP_INF(T, E, F)) { \
+            return a; \
+        } \
+        if (a >= LGRT_FP_INF(T, E, F)) { \
+            return LGRT_FP_NAN(T, E, F); \
+        } \
+        sig = lgrt_##fmt##_normalise(magnitude, &e); \
+        if ((e & 1) == 0) { \
+            sig += sig; \
+            e -= 1; \
+        } \
+        rem = (sig << 3) - q; \
+        for (T bit = q >> 1; bit != 0; bit >>= 1) { \
+            T trial = q + q + bit; \
+            \
+            rem += rem; \
+            if (rem >= trial) { \
+                rem -= trial; \
+                q += bit; \
+            } \
+        } \
+        q |= (T)(rem != 0); \
+        return lgrt_##fmt##_round_pack( \
+            0, (e + LGRT_FP_BIAS(E)) >> 1, q \
+        ); \
+    }
+
+LGRT_FP_SQRT(sf, uint32_t, 8, 23)
+LGRT_FP_SQRT(df, uint64_t, 11, 52)
+
+float __hexagon_sqrtf(float a);
+float __hexagon_sqrtf(float a) {
+    return lgrt_sf_from_bits(lgrt_sf_sqrt(lgrt_sf_to_bits(a)));
+}
+
+double __hexagon_fast2_sqrtdf2(double a);
+double __hexagon_fast2_sqrtdf2(double a) {
+    return lgrt_df_from_bits(lgrt_df_sqrt(lgrt_df_to_bits(a)));
+}
+
+LGRT_FP_ALIAS(double, __hexagon_adddf3, "__adddf3", (double a, double b))
+LGRT_FP_ALIAS(double, __hexagon_subdf3, "__subdf3", (double a, double b))
+LGRT_FP_ALIAS(double, __hexagon_muldf3, "__muldf3", (double a, double b))
+LGRT_FP_ALIAS(double, __hexagon_divdf3, "__divdf3", (double a, double b))
+LGRT_FP_ALIAS(float, __hexagon_divsf3, "__divsf3", (float a, float b))
+
+/* What -ffast-math calls is free to be more exact than it needs to be. */
+LGRT_FP_ALIAS(double, __hexagon_fast_adddf3, "__adddf3", (double a, double b))
+LGRT_FP_ALIAS(double, __hexagon_fast_subdf3, "__subdf3", (double a, double b))
+LGRT_FP_ALIAS(double, __hexagon_fast_muldf3, "__muldf3", (double a, double b))
+LGRT_FP_ALIAS(double, __hexagon_fast_divdf3, "__divdf3", (double a, double b))
+LGRT_FP_ALIAS(float, __hexagon_fast_divsf3, "__divsf3", (float a, float b))
+LGRT_FP_ALIAS(float, __hexagon_fast2_sqrtf, "__hexagon_sqrtf", (float a))
+
+#endif
+
+#if defined(__mips__) && defined(__mips_hard_float) \
+ && defined(_ABIO32) && _MIPS_SIM == _ABIO32 \
+ && !defined(__mips_micromips) \
+ && !(defined(__mips_isa_rev) && __mips_isa_rev >= 6)
+
+/*
+ * What hard-float MIPS16 code calls, as it has no access to the floating-point
+ * registers. Operands and results stay in the general registers, in the order
+ * of integers of their sizes, and floating-point instructions do the work in
+ * 32-bit code. Comparisons need no such instructions, so they work on the bits
+ * in code of any kind.
+ */
+
+#define LGRT_MIPS16_BINARY(fmt, T, name, op) \
+    LGRT_FP_ABI T name(T a, T b); \
+    LGRT_FP_ABI T name(T a, T b) { \
+        return lgrt_##fmt##_to_bits( \
+            lgrt_##fmt##_from_bits(a) op lgrt_##fmt##_from_bits(b) \
+        ); \
+    }
+
+#define LGRT_MIPS16_COMPARE_ALIAS(T, name, target) \
+    lgrt_fp_cmp name(T a, T b); \
+    lgrt_fp_cmp name(T a, T b) __attribute__((__alias__(target)));
+
+#define LGRT_MIPS16_ROUTINES(fmt, C, T, E, F) \
+    LGRT_MIPS16_BINARY(fmt, T, __mips16_add##fmt##3, +) \
+    LGRT_MIPS16_BINARY(fmt, T, __mips16_sub##fmt##3, -) \
+    LGRT_MIPS16_BINARY(fmt, T, __mips16_mul##fmt##3, *) \
+    LGRT_MIPS16_BINARY(fmt, T, __mips16_div##fmt##3, /) \
+    \
+    lgrt_fp_cmp __mips16_lt##fmt##2(T a, T b); \
+    lgrt_fp_cmp __mips16_lt##fmt##2(T a, T b) { \
+        return lgrt_##fmt##_compare(a, b, 1); \
+    } \
+    \
+    LGRT_MIPS16_COMPARE_ALIAS(T, __mips16_le##fmt##2, "__mips16_lt" #fmt "2") \
+    LGRT_MIPS16_COMPARE_ALIAS(T, __mips16_eq##fmt##2, "__mips16_lt" #fmt "2") \
+    LGRT_MIPS16_COMPARE_ALIAS(T, __mips16_ne##fmt##2, "__mips16_lt" #fmt "2") \
+    \
+    lgrt_fp_cmp __mips16_gt##fmt##2(T a, T b); \
+    lgrt_fp_cmp __mips16_gt##fmt##2(T a, T b) { \
+        return lgrt_##fmt##_compare(a, b, -1); \
+    } \
+    \
+    LGRT_MIPS16_COMPARE_ALIAS(T, __mips16_ge##fmt##2, "__mips16_gt" #fmt "2") \
+    \
+    lgrt_fp_cmp __mips16_unord##fmt##2(T a, T b); \
+    lgrt_fp_cmp __mips16_unord##fmt##2(T a, T b) { \
+        T mask = LGRT_FP_SIGN(T, E, F) - 1; \
+        \
+        return (a & mask) > LGRT_FP_INF(T, E, F) \
+            || (b & mask) > LGRT_FP_INF(T, E, F); \
+    } \
+    \
+    LGRT_FP_ABI int32_t __mips16_fix_trunc##fmt##si(T a); \
+    LGRT_FP_ABI int32_t __mips16_fix_trunc##fmt##si(T a) { \
+        return (int32_t)lgrt_##fmt##_from_bits(a); \
+    } \
+    \
+    LGRT_FP_ABI T __mips16_floatsi##fmt(int32_t a); \
+    LGRT_FP_ABI T __mips16_floatsi##fmt(int32_t a) { \
+        return lgrt_##fmt##_to_bits((C)a); \
+    } \
+    \
+    LGRT_FP_ABI T __mips16_floatunsi##fmt(uint32_t a); \
+    LGRT_FP_ABI T __mips16_floatunsi##fmt(uint32_t a) { \
+        return lgrt_##fmt##_to_bits((C)a); \
+    }
+
+LGRT_MIPS16_ROUTINES(sf, lgrt_sf_value, uint32_t, 8, 23)
+
+/*
+ * These have conventions of their own, so each is assembly in a section of its
+ * own. Moves of doubles go through memory, in the order of the two registers
+ * that hold them, whatever the byte order and the width of the floating-point
+ * registers. The frame is their own, as their callers may have none to spare.
+ */
+#define LGRT_MIPS16_STUB(name, body) \
+    __asm__ ( \
+        ".pushsection .text." name ",\"ax\",@progbits\n" \
+        ".set push\n" \
+        ".set nomips16\n" \
+        ".set reorder\n" \
+        ".set macro\n" \
+        ".p2align 2\n" \
+        ".globl " name "\n" \
+        ".hidden " name "\n" \
+        ".type " name ", @function\n" \
+        name ":\n" \
+        body \
+        ".size " name ", . - " name "\n" \
+        ".set pop\n" \
+        ".popsection\n" \
+    );
+
+#define LGRT_MIPS16_TO_FPR(first, second, fpr) \
+    "addiu $sp, $sp, -8\n" \
+    "sw " first ", 0($sp)\n" \
+    "sw " second ", 4($sp)\n" \
+    "l.d " fpr ", 0($sp)\n" \
+    "addiu $sp, $sp, 8\n"
+
+#define LGRT_MIPS16_FROM_FPR(fpr, first, second) \
+    "addiu $sp, $sp, -8\n" \
+    "s.d " fpr ", 0($sp)\n" \
+    "lw " first ", 0($sp)\n" \
+    "lw " second ", 4($sp)\n" \
+    "addiu $sp, $sp, 8\n"
+
+/*
+ * A function returning a floating-point value that MIPS16 code calls needs it
+ * in the floating-point registers, should its caller not be MIPS16 code. The
+ * general registers stay as they are.
+ */
+LGRT_MIPS16_STUB(
+    "__mips16_ret_sf",
+    "mtc1 $2, $f0\n"
+    "jr $31\n"
+)
+
+LGRT_MIPS16_STUB(
+    "__mips16_ret_sc",
+    "mtc1 $2, $f0\n"
+    "mtc1 $3, $f2\n"
+    "jr $31\n"
+)
+
+/*
+ * MIPS16 code calls through pointers with these, the address in $2 and the
+ * arguments in the general registers. The number in each name tells which of
+ * the first two arguments go in floating-point registers, with two bits for
+ * each, the first in the lowest: 1 for float, and 2 for double. Without a
+ * floating-point result, a stub jumps to the function. Otherwise, $18 keeps
+ * the return address over the call, and the result comes back to the general
+ * registers.
+ */
+#define LGRT_MIPS16_CALL(n, args) \
+    LGRT_MIPS16_STUB( \
+        "__mips16_call_stub_" #n, \
+        args \
+        "move $25, $2\n" \
+        "jr $25\n" \
+    )
+
+#define LGRT_MIPS16_CALL_RETURN(kind, n, args, result) \
+    LGRT_MIPS16_STUB( \
+        "__mips16_call_stub_" kind "_" #n, \
+        "move $18, $31\n" \
+        args \
+        "move $25, $2\n" \
+        "jalr $25\n" \
+        result \
+        "jr $18\n" \
+    )
+
+#define LGRT_MIPS16_ARGS_1 "mtc1 $4, $f12\n"
+#define LGRT_MIPS16_ARGS_5 \
+    "mtc1 $4, $f12\n" \
+    "mtc1 $5, $f14\n"
+
+#define LGRT_MIPS16_RETURN_SF "mfc1 $2, $f0\n"
+#define LGRT_MIPS16_RETURN_SC \
+    "mfc1 $2, $f0\n" \
+    "mfc1 $3, $f2\n"
+
+LGRT_MIPS16_CALL(1, LGRT_MIPS16_ARGS_1)
+LGRT_MIPS16_CALL(5, LGRT_MIPS16_ARGS_5)
+
+#define LGRT_MIPS16_CALLS_OF_FLOATS(kind, result) \
+    LGRT_MIPS16_CALL_RETURN(kind, 0, "", result) \
+    LGRT_MIPS16_CALL_RETURN(kind, 1, LGRT_MIPS16_ARGS_1, result) \
+    LGRT_MIPS16_CALL_RETURN(kind, 5, LGRT_MIPS16_ARGS_5, result)
+
+LGRT_MIPS16_CALLS_OF_FLOATS("sf", LGRT_MIPS16_RETURN_SF)
+LGRT_MIPS16_CALLS_OF_FLOATS("sc", LGRT_MIPS16_RETURN_SC)
+
+#if !defined(__mips_single_float)
+
+LGRT_MIPS16_ROUTINES(df, lgrt_df_value, uint64_t, 11, 52)
+
+LGRT_FP_ABI uint64_t __mips16_extendsfdf2(uint32_t a);
+LGRT_FP_ABI uint64_t __mips16_extendsfdf2(uint32_t a) {
+    return lgrt_df_to_bits((lgrt_df_value)lgrt_sf_from_bits(a));
+}
+
+LGRT_FP_ABI uint32_t __mips16_truncdfsf2(uint64_t a);
+LGRT_FP_ABI uint32_t __mips16_truncdfsf2(uint64_t a) {
+    return lgrt_sf_to_bits((lgrt_sf_value)lgrt_df_from_bits(a));
+}
+
+LGRT_MIPS16_STUB(
+    "__mips16_ret_df",
+    LGRT_MIPS16_TO_FPR("$2", "$3", "$f0")
+    "jr $31\n"
+)
+
+LGRT_MIPS16_STUB(
+    "__mips16_ret_dc",
+    LGRT_MIPS16_TO_FPR("$2", "$3", "$f0")
+    LGRT_MIPS16_TO_FPR("$4", "$5", "$f2")
+    "jr $31\n"
+)
+
+#define LGRT_MIPS16_ARGS_2 LGRT_MIPS16_TO_FPR("$4", "$5", "$f12")
+#define LGRT_MIPS16_ARGS_6 \
+    LGRT_MIPS16_TO_FPR("$4", "$5", "$f12") \
+    "mtc1 $6, $f14\n"
+#define LGRT_MIPS16_ARGS_9 \
+    "mtc1 $4, $f12\n" \
+    LGRT_MIPS16_TO_FPR("$6", "$7", "$f14")
+#define LGRT_MIPS16_ARGS_10 \
+    LGRT_MIPS16_TO_FPR("$4", "$5", "$f12") \
+    LGRT_MIPS16_TO_FPR("$6", "$7", "$f14")
+
+#define LGRT_MIPS16_RETURN_DF LGRT_MIPS16_FROM_FPR("$f0", "$2", "$3")
+#define LGRT_MIPS16_RETURN_DC \
+    LGRT_MIPS16_FROM_FPR("$f0", "$2", "$3") \
+    LGRT_MIPS16_FROM_FPR("$f2", "$4", "$5")
+
+LGRT_MIPS16_CALL(2, LGRT_MIPS16_ARGS_2)
+LGRT_MIPS16_CALL(6, LGRT_MIPS16_ARGS_6)
+LGRT_MIPS16_CALL(9, LGRT_MIPS16_ARGS_9)
+LGRT_MIPS16_CALL(10, LGRT_MIPS16_ARGS_10)
+
+#define LGRT_MIPS16_CALLS_OF_DOUBLES(kind, result) \
+    LGRT_MIPS16_CALL_RETURN(kind, 2, LGRT_MIPS16_ARGS_2, result) \
+    LGRT_MIPS16_CALL_RETURN(kind, 6, LGRT_MIPS16_ARGS_6, result) \
+    LGRT_MIPS16_CALL_RETURN(kind, 9, LGRT_MIPS16_ARGS_9, result) \
+    LGRT_MIPS16_CALL_RETURN(kind, 10, LGRT_MIPS16_ARGS_10, result)
+
+LGRT_MIPS16_CALLS_OF_FLOATS("df", LGRT_MIPS16_RETURN_DF)
+LGRT_MIPS16_CALLS_OF_FLOATS("dc", LGRT_MIPS16_RETURN_DC)
+LGRT_MIPS16_CALLS_OF_DOUBLES("sf", LGRT_MIPS16_RETURN_SF)
+LGRT_MIPS16_CALLS_OF_DOUBLES("sc", LGRT_MIPS16_RETURN_SC)
+LGRT_MIPS16_CALLS_OF_DOUBLES("df", LGRT_MIPS16_RETURN_DF)
+LGRT_MIPS16_CALLS_OF_DOUBLES("dc", LGRT_MIPS16_RETURN_DC)
+
+#endif
+
+#endif
+
+#if LGRT_SOFT_FLOAT
+
+/*
+ * The 16-bit formats, half precision with E of 5 and F of 10, and bfloat16
+ * with 8 and 7, go through the core above on 32 bits. Compilers pass both as
+ * they pass _Float16, where they have that type, which GCC can only use on x86
+ * with SSE2. Clang has __fp16 on every target besides, and passes that as an
+ * integer where it has no _Float16. ARM has names of its own, further down.
+ *
+ * Workaround: Clang before 9, every target: it defines __FLT16_MANT_DIG__ for
+ * a type that 8 rejects on some targets, and 6 and 7 cannot compile on others,
+ * and it passes half as an integer to its library calls in any case.
+ *
+ * Workaround: Clang before 17, RISC-V with a hard-float ABI, without Zfh, and
+ * without Zfhmin from 16: it passes _Float16 in floating-point registers in C
+ * and to __mulhc3 and __divhc3, but half in integer registers to the library
+ * calls for its conversions.
+ */
+#if defined(__clang__) && __clang_major__ < 17 && defined(__riscv) \
+ && !defined(__riscv_float_abi_soft) && !defined(__riscv_zfh) \
+ && (!defined(__riscv_zfhmin) || __clang_major__ < 16)
+#define LGRT_HF_CONVERSIONS_AS_INT 1
+#else
+#define LGRT_HF_CONVERSIONS_AS_INT 0
+#endif
+
+/*
+ * Half in an integer register. On RISC-V, what is above it there may be what
+ * was above it in a floating-point register, so that is taken and dropped.
+ */
+#if defined(__riscv)
+typedef uint32_t lgrt_hf_register;
+#else
+typedef uint16_t lgrt_hf_register;
+#endif
+
+/*
+ * Workaround: Clang 17 to 19, RISC-V with a hard-float ABI, without Zfh and
+ * Zfhmin: it still takes half back in an integer register from the calls that
+ * convert a format which the ABI does not have in floating-point registers.
+ */
+#if defined(__clang__) && __clang_major__ >= 17 && __clang_major__ < 20 \
+ && defined(__riscv) && !defined(__riscv_float_abi_soft) \
+ && !defined(__riscv_zfh) && !defined(__riscv_zfhmin)
+#define LGRT_HF_SOFT_RESULT_AS_INT 1
+#else
+#define LGRT_HF_SOFT_RESULT_AS_INT 0
+#endif
+
+#if defined(__FLT16_MANT_DIG__) && (!defined(__arm__) || defined(__clang__)) \
+ && (defined(__SSE2__) || (!defined(__i386__) && !defined(__x86_64__))) \
+ && (!defined(__clang__) || __clang_major__ >= 9) \
+ && !LGRT_HF_CONVERSIONS_AS_INT
+#define LGRT_SOFT_HF 1
+#define LGRT_HF_PASSED_AS_INT 0
+__extension__ typedef _Float16 lgrt_hf_value;
+#elif defined(__clang__)
+#define LGRT_SOFT_HF 1
+#define LGRT_HF_PASSED_AS_INT 1
+typedef lgrt_hf_register lgrt_hf_value;
+#else
+#define LGRT_SOFT_HF 0
+#define LGRT_HF_PASSED_AS_INT 0
+#endif
+
+#if !LGRT_HF_PASSED_AS_INT
+#define LGRT_FP16_HELPER static inline __attribute__((__unused__)) LGRT_FP_ABI
+#define LGRT_FP16_BITS(fmt, C) \
+    LGRT_FP16_HELPER uint32_t lgrt_##fmt##_to_bits(C value) { \
+        uint16_t bits; \
+        \
+        __builtin_memcpy(&bits, &value, sizeof(uint16_t)); \
+        __asm__ ("" : "+g"(bits)); \
+        return bits; \
+    } \
+    \
+    LGRT_FP16_HELPER C lgrt_##fmt##_from_bits(uint32_t bits) { \
+        uint16_t narrow = (uint16_t)bits; \
+        C value; \
+        \
+        __asm__ ("" : "+g"(narrow)); \
+        __builtin_memcpy(&value, &narrow, sizeof(uint16_t)); \
+        return value; \
+    }
+#else
+#define LGRT_FP16_HELPER static inline __attribute__((__unused__))
+#define LGRT_FP16_BITS(fmt, C) \
+    LGRT_FP16_HELPER uint32_t lgrt_##fmt##_to_bits(C value) { \
+        return (uint16_t)value; \
+    } \
+    \
+    LGRT_FP16_HELPER C lgrt_##fmt##_from_bits(uint32_t bits) { \
+        return (C)bits; \
+    }
+#endif
+
+#if defined(__arm__) || LGRT_SOFT_HF
+LGRT_FP_STICKY_SHIFT(hf, uint32_t, 10)
+LGRT_FP_ROUND_PACK(hf, uint32_t, 5, 10)
+LGRT_FP_NORMALISE(hf, uint32_t, 10)
+#endif
+
+#if defined(__arm__)
+
+/*
+ * These pass a half value in the low half of an integer register, on every
+ * procedure call standard, as they do float and double.
+ */
+LGRT_FP_EXTEND_BITS(hf, uint32_t, 5, 10, sf, uint32_t, 8, 23)
+LGRT_FP_TRUNC_BITS(hf, uint32_t, 5, 10, sf, uint32_t, 8, 23)
+LGRT_FP_TRUNC_BITS(hf, uint32_t, 5, 10, df, uint64_t, 11, 52)
+
+/*
+ * The run-time ABI has a NaN keep its sign and all of its fraction that the
+ * other format holds, with zeros below it in a wider one. Where a narrower one
+ * holds none of it, the NaN was a signaling one, and its lowest bit keeps it a
+ * signaling NaN.
+ */
+#define LGRT_HF_IEEE_TRUNC(fmt, T, E, F) \
+    static inline uint32_t lgrt_##fmt##_to_hf_ieee(T x) { \
+        uint32_t sign = (x & LGRT_FP_SIGN(T, E, F)) != 0 ? 0x8000 : 0; \
+        uint32_t kept = (uint32_t)( \
+            (x & (LGRT_FP_INT_BIT(T, F) - 1)) >> ((F) - 10) \
+        ); \
+        \
+        if ((x & (LGRT_FP_SIGN(T, E, F) - 1)) <= LGRT_FP_INF(T, E, F)) { \
+            return lgrt_##fmt##_to_hf(x); \
+        } \
+        return sign | LGRT_FP_INF(uint32_t, 5, 10) | (kept != 0 ? kept : 1); \
+    }
+
+LGRT_HF_IEEE_TRUNC(sf, uint32_t, 8, 23)
+LGRT_HF_IEEE_TRUNC(df, uint64_t, 11, 52)
+
+LGRT_AAPCS uint32_t __gnu_h2f_ieee(uint32_t a);
+LGRT_AAPCS uint32_t __gnu_h2f_ieee(uint32_t a) {
+    uint32_t x = (uint16_t)a;
+
+    if ((x & 0x7fff) > LGRT_FP_INF(uint32_t, 5, 10)) {
+        return ((x & 0x8000) << 16) | LGRT_FP_INF(uint32_t, 8, 23)
+            | ((x & 0x3ff) << 13);
+    }
+    return lgrt_sf_from_hf(x);
+}
+
+LGRT_AAPCS int16_t __gnu_f2h_ieee(uint32_t a);
+LGRT_AAPCS int16_t __gnu_f2h_ieee(uint32_t a) {
+    return (int16_t)lgrt_sf_to_hf_ieee(a);
+}
+
+LGRT_AAPCS int16_t __gnu_d2h_ieee(uint64_t a);
+LGRT_AAPCS int16_t __gnu_d2h_ieee(uint64_t a) {
+    return (int16_t)lgrt_df_to_hf_ieee(a);
+}
+
+/*
+ * The alternative format has no infinities or NaNs, and a field of 31 holds
+ * numbers too. The run-time ABI has what is too large for it, infinities
+ * included, give the largest number with its sign, and NaNs a zero with
+ * theirs.
+ */
+static inline uint32_t lgrt_hf_alt_round_pack(
+    uint32_t sign, unsigned int e, uint32_t sig
+) {
+    uint32_t bits;
+    unsigned int low;
+
+    if ((int)e > 31) {
+        return sign | 0x7fff;
+    }
+    if ((int)e <= 0) {
+        sig = lgrt_hf_sticky_shift(sig, 1 - e);
+        e = 1;
+    }
+    low = (unsigned int)sig & 7;
+    bits = ((uint32_t)(e - 1) << 10) + (sig >> 3);
+    if (low > 4 || (low == 4 && (bits & 1) != 0)) {
+        bits += 1;
+    }
+    return sign | (bits > 0x7fff ? 0x7fff : bits);
+}
+
+#define LGRT_HF_ALT_TRUNC(fmt, T, E, F) \
+    static inline uint32_t lgrt_##fmt##_to_hf_alt(T x) { \
+        T magnitude = x & (LGRT_FP_SIGN(T, E, F) - 1); \
+        uint32_t sign = (x & LGRT_FP_SIGN(T, E, F)) != 0 ? 0x8000 : 0; \
+        T sig = magnitude & (LGRT_FP_INT_BIT(T, F) - 1); \
+        T kept; \
+        unsigned int e = (unsigned int)(magnitude >> (F)); \
+        \
+        if (magnitude > LGRT_FP_INF(T, E, F)) { \
+            return sign; \
+        } \
+        if (e != 0) { \
+            sig |= LGRT_FP_INT_BIT(T, F); \
+        } else { \
+            e = 1; \
+        } \
+        kept = sig >> ((F) - 13); \
+        return lgrt_hf_alt_round_pack( \
+            sign, e + LGRT_FP_BIAS(5) - LGRT_FP_BIAS(E), \
+            (uint32_t)kept | (uint32_t)((kept << ((F) - 13)) != sig) \
+        ); \
+    }
+
+LGRT_HF_ALT_TRUNC(sf, uint32_t, 8, 23)
+LGRT_HF_ALT_TRUNC(df, uint64_t, 11, 52)
+
+LGRT_AAPCS uint32_t __gnu_h2f_alternative(uint32_t a);
+LGRT_AAPCS uint32_t __gnu_h2f_alternative(uint32_t a) {
+    uint32_t magnitude = a & 0x7fff;
+    uint32_t bits = (a & 0x8000) << 16;
+
+    if (magnitude != 0) {
+        unsigned int e;
+        uint32_t sig = lgrt_hf_normalise(magnitude, &e);
+
+        e = e + LGRT_FP_BIAS(8) - LGRT_FP_BIAS(5) - 1;
+        bits |= ((uint32_t)e << 23) + (sig << 13);
+    }
+    return bits;
+}
+
+LGRT_AAPCS int16_t __gnu_f2h_alternative(uint32_t a);
+LGRT_AAPCS int16_t __gnu_f2h_alternative(uint32_t a) {
+    return (int16_t)lgrt_sf_to_hf_alt(a);
+}
+
+LGRT_AAPCS int16_t __gnu_d2h_alternative(uint64_t a);
+LGRT_AAPCS int16_t __gnu_d2h_alternative(uint64_t a) {
+    return (int16_t)lgrt_df_to_hf_alt(a);
+}
+
+#if defined(__ARM_EABI__)
+LGRT_FP_ALIAS(uint32_t, __aeabi_h2f, "__gnu_h2f_ieee", (uint32_t a))
+LGRT_FP_ALIAS(int16_t, __aeabi_f2h, "__gnu_f2h_ieee", (uint32_t a))
+LGRT_FP_ALIAS(int16_t, __aeabi_d2h, "__gnu_d2h_ieee", (uint64_t a))
+LGRT_FP_ALIAS(uint32_t, __aeabi_h2f_alt, "__gnu_h2f_alternative", (uint32_t a))
+LGRT_FP_ALIAS(int16_t, __aeabi_f2h_alt, "__gnu_f2h_alternative", (uint32_t a))
+LGRT_FP_ALIAS(int16_t, __aeabi_d2h_alt, "__gnu_d2h_alternative", (uint64_t a))
+#endif
+
+#if defined(__clang__)
+
+#if !defined(__ARM_EABI__)
+LGRT_FP_ALIAS(int16_t, __truncdfhf2, "__gnu_d2h_ieee", (uint64_t a))
+#endif
+
+/*
+ * What only Clang calls goes by the procedure call standard in use, with
+ * floating-point registers where that has them. That is all there is from here
+ * to the end of the section.
+ */
+#undef LGRT_FP_ABI
+#define LGRT_FP_ABI
+
+LGRT_FP16_BITS(hf, lgrt_hf_value)
+LGRT_FP16_BITS(bf, lgrt_hf_value)
+LGRT_FP_STICKY_SHIFT(bf, uint32_t, 7)
+LGRT_FP_ROUND_PACK(bf, uint32_t, 8, 7)
+LGRT_FP_TRUNC_BITS(bf, uint32_t, 8, 7, sf, uint32_t, 8, 23)
+LGRT_FP_TRUNC_BITS(bf, uint32_t, 8, 7, df, uint64_t, 11, 52)
+
+lgrt_hf_value __truncsfbf2(float a);
+lgrt_hf_value __truncsfbf2(float a) {
+    uint32_t bits;
+
+    __builtin_memcpy(&bits, &a, sizeof(uint32_t));
+    __asm__ ("" : "+g"(bits));
+    return lgrt_bf_from_bits(lgrt_sf_to_bf(bits));
+}
+
+lgrt_hf_value __truncdfbf2(double a);
+lgrt_hf_value __truncdfbf2(double a) {
+    uint64_t bits;
+
+    __builtin_memcpy(&bits, &a, sizeof(uint64_t));
+    __asm__ ("" : "+g"(bits));
+    return lgrt_bf_from_bits(lgrt_df_to_bf(bits));
+}
+
+LGRT_FP_TO_INT(hf, lgrt_hf_value, uint32_t, 5, 10, di, int64_t, uint64_t, 64)
+LGRT_FP_FROM_INT(hf, lgrt_hf_value, uint32_t, 5, 10, di, int64_t, uint64_t, 64)
+
+#endif
+
+#elif LGRT_SOFT_HF
+
+LGRT_FP16_BITS(hf, lgrt_hf_value)
+LGRT_FP_EXTEND(
+    hf, lgrt_hf_value, uint32_t, 5, 10, sf, lgrt_sf_value, uint32_t, 8, 23
+)
+LGRT_FP_TRUNC(
+    hf, lgrt_hf_value, uint32_t, 5, 10, sf, lgrt_sf_value, uint32_t, 8, 23
+)
+
+/*
+ * Older releases of Clang call these for __fp16, with half in an integer
+ * register, however they pass _Float16.
+ */
+#if defined(__clang__)
+LGRT_FP_ABI lgrt_sf_value __gnu_h2f_ieee(lgrt_hf_register a);
+LGRT_FP_ABI lgrt_sf_value __gnu_h2f_ieee(lgrt_hf_register a) {
+    return lgrt_sf_from_bits(lgrt_sf_from_hf((uint16_t)a));
+}
+
+LGRT_FP_ABI uint16_t __gnu_f2h_ieee(lgrt_sf_value a);
+LGRT_FP_ABI uint16_t __gnu_f2h_ieee(lgrt_sf_value a) {
+    return (uint16_t)lgrt_sf_to_hf(lgrt_sf_to_bits(a));
+}
+#endif
+
+#if LGRT_SOFT_DOUBLE
+LGRT_FP_EXTEND(
+    hf, lgrt_hf_value, uint32_t, 5, 10, df, lgrt_df_value, uint64_t, 11, 52
+)
+#if LGRT_HF_SOFT_RESULT_AS_INT && defined(__riscv_float_abi_single)
+LGRT_FP_TRUNC_BITS(hf, uint32_t, 5, 10, df, uint64_t, 11, 52)
+
+uint16_t __truncdfhf2(lgrt_df_value a);
+uint16_t __truncdfhf2(lgrt_df_value a) {
+    return (uint16_t)lgrt_df_to_hf(lgrt_df_to_bits(a));
+}
+#else
+LGRT_FP_TRUNC(
+    hf, lgrt_hf_value, uint32_t, 5, 10, df, lgrt_df_value, uint64_t, 11, 52
+)
+#endif
+#endif
+
+#if (LGRT_SOFT_QUAD || (LGRT_QUAD_OWN_NAMES && LGRT_HAS_INT128)) \
+ && !defined(__powerpc__)
+#define LGRT_FP16_QUAD 1
+LGRT_WIDE_EXTEND(
+    hf, lgrt_hf_value, uint32_t, 5, 10, tf, lgrt_quad_value, 32767, 112
+)
+
+/*
+ * Workaround: Clang before 21, hard-float MIPS64: it calls this with the two
+ * words of the value in the integer registers that come first, in their order
+ * in memory, where the C ABI has them in floating-point registers.
+ */
+#if defined(__clang__) && __clang_major__ < 21 && defined(__mips64) \
+ && !defined(__mips_soft_float)
+
+LGRT_WIDE_TRUNC_BITS(hf, uint32_t, 5, 10, tf, 32767, 112)
+
+lgrt_hf_value __trunctfhf2(uint64_t first, uint64_t second);
+lgrt_hf_value __trunctfhf2(uint64_t first, uint64_t second) {
+    uint64_t words[2] = { first, second };
+    struct lgrt_wide x;
+
+    __builtin_memcpy(&x, words, sizeof(words));
+    return lgrt_hf_from_bits(lgrt_tf_to_hf(x));
+}
+
+#elif LGRT_HF_SOFT_RESULT_AS_INT
+
+LGRT_WIDE_TRUNC_BITS(hf, uint32_t, 5, 10, tf, 32767, 112)
+
+uint16_t __trunctfhf2(lgrt_quad_value a);
+uint16_t __trunctfhf2(lgrt_quad_value a) {
+    return (uint16_t)lgrt_tf_to_hf(lgrt_tf_to_bits(a));
+}
+
+#else
+LGRT_WIDE_TRUNC(
+    hf, lgrt_hf_value, uint32_t, 5, 10, tf, lgrt_quad_value, 32767, 112
+)
+#endif
+
+#else
+
+#define LGRT_FP16_QUAD 0
+
+/* 32-bit SPARC, as it passes its other routines of long double. */
+#if LGRT_QUAD_OWN_NAMES && LGRT_TF_IN_REGISTERS
+LGRT_WIDE_TRUNC_BITS(hf, uint32_t, 5, 10, tf, 32767, 112)
+LGRT_TF_TO(__trunctfhf2, lgrt_hf_value, lgrt_hf_from_bits(lgrt_tf_to_hf(x)))
+#elif LGRT_QUAD_OWN_NAMES
+LGRT_WIDE_TRUNC(
+    hf, lgrt_hf_value, uint32_t, 5, 10, tf, lgrt_quad_value, 32767, 112
+)
+#endif
+
+#endif
+
+#if defined(__i386__) || defined(__x86_64__)
+
+LGRT_WIDE_TRUNC(
+    hf, lgrt_hf_value, uint32_t, 5, 10, xf, LGRT_XF_PARAMETER,
+    LGRT_XF_EXP_MAX, 63
+)
+
+#if defined(__clang__)
+LGRT_WIDE_EXTEND_BITS(hf, uint32_t, 5, 10, xf, LGRT_XF_EXP_MAX, 63)
+
+void __extendhfxf2(lgrt_hf_value a);
+void __extendhfxf2(lgrt_hf_value a) {
+    lgrt_xf_return(lgrt_xf_from_hf(lgrt_hf_to_bits(a)));
+}
+#elif LGRT_XF_RETURNED
+LGRT_WIDE_EXTEND(
+    hf, lgrt_hf_value, uint32_t, 5, 10, xf, lgrt_xf_value, LGRT_XF_EXP_MAX, 63
+)
+#endif
+
+#endif
+
+#if !LGRT_HF_PASSED_AS_INT
+
+/* Arithmetic always goes through float, but for these. */
+LGRT_FP_COMPARE(hf, uint32_t, 5, 10)
+LGRT_FP_RELATION_NAMES(hf, lgrt_hf_value, uint32_t)
+LGRT_FP_UNORD_ROUTINE(hf, lgrt_hf_value, uint32_t, 5, 10)
+LGRT_FP_TO_INT(hf, lgrt_hf_value, uint32_t, 5, 10, si, int32_t, uint32_t, 32)
+LGRT_FP_TO_INT(hf, lgrt_hf_value, uint32_t, 5, 10, di, int64_t, uint64_t, 64)
+LGRT_FP_FROM_INT(hf, lgrt_hf_value, uint32_t, 5, 10, si, int32_t, uint32_t, 32)
+LGRT_FP_FROM_INT(hf, lgrt_hf_value, uint32_t, 5, 10, di, int64_t, uint64_t, 64)
+#if LGRT_HAS_INT128
+LGRT_FP_TO_INT(
+    hf, lgrt_hf_value, uint32_t, 5, 10, ti, lgrt_i128, lgrt_u128, 128
+)
+LGRT_FP_FROM_INT(
+    hf, lgrt_hf_value, uint32_t, 5, 10, ti, lgrt_i128, lgrt_u128, 128
+)
+#endif
+
+/* No macro tells of __bf16 on Clang. */
+#if defined(__BFLT16_MANT_DIG__) \
+ || (defined(__clang__) \
+  && (defined(__i386__) || defined(__x86_64__) || defined(__aarch64__) \
+   || defined(__riscv) || defined(__loongarch__)))
+
+/*
+ * bfloat16 travels as half does.
+ *
+ * Workaround: Clang 17 and 18, IA-32: __bf16 comes back on the x87 stack, as a
+ * float whose image holds its bits, so these are written with that type there.
+ */
+#if defined(__clang__) && defined(__i386__) \
+ && (__clang_major__ == 17 || __clang_major__ == 18)
+typedef __bf16 lgrt_bf_value;
+#else
+typedef lgrt_hf_value lgrt_bf_value;
+#endif
+
+LGRT_FP16_BITS(bf, lgrt_bf_value)
+LGRT_FP_STICKY_SHIFT(bf, uint32_t, 7)
+LGRT_FP_ROUND_PACK(bf, uint32_t, 8, 7)
+LGRT_FP_COMPARE(bf, uint32_t, 8, 7)
+LGRT_FP_RELATION_NAMES(bf, lgrt_bf_value, uint32_t)
+LGRT_FP_UNORD_ROUTINE(bf, lgrt_bf_value, uint32_t, 8, 7)
+LGRT_FP_FROM_INT(bf, lgrt_bf_value, uint32_t, 8, 7, si, int32_t, uint32_t, 32)
+LGRT_FP_FROM_INT(bf, lgrt_bf_value, uint32_t, 8, 7, di, int64_t, uint64_t, 64)
+#if LGRT_HAS_INT128
+LGRT_FP_FROM_INT(
+    bf, lgrt_bf_value, uint32_t, 8, 7, ti, lgrt_i128, lgrt_u128, 128
+)
+#endif
+LGRT_FP_TRUNC(
+    bf, lgrt_bf_value, uint32_t, 8, 7, sf, lgrt_sf_value, uint32_t, 8, 23
+)
+#if LGRT_SOFT_DOUBLE
+LGRT_FP_TRUNC(
+    bf, lgrt_bf_value, uint32_t, 8, 7, df, lgrt_df_value, uint64_t, 11, 52
+)
+#endif
+#if LGRT_FP16_QUAD
+LGRT_WIDE_TRUNC(
+    bf, lgrt_bf_value, uint32_t, 8, 7, tf, lgrt_quad_value, 32767, 112
+)
+#endif
+#if defined(__i386__) || defined(__x86_64__)
+LGRT_WIDE_TRUNC(
+    bf, lgrt_bf_value, uint32_t, 8, 7, xf, LGRT_XF_PARAMETER,
+    LGRT_XF_EXP_MAX, 63
+)
+#endif
+
+/* bfloat16 is the top half of float. */
+LGRT_FP_ABI lgrt_sf_value __extendbfsf2(lgrt_bf_value a);
+LGRT_FP_ABI lgrt_sf_value __extendbfsf2(lgrt_bf_value a) {
+    uint32_t x = lgrt_bf_to_bits(a);
+    uint32_t magnitude = x & (LGRT_FP_SIGN(uint32_t, 8, 7) - 1);
+
+    if (magnitude > LGRT_FP_INF(uint32_t, 8, 7)) {
+        return lgrt_sf_from_bits(LGRT_FP_NAN(uint32_t, 8, 23));
+    }
+    return lgrt_sf_from_bits(x << 16);
+}
+
+/*
+ * With its integer bit at bit 10, the significand of a half value is lined up
+ * with what the core works on for bfloat16, and all of its value is in there.
+ */
+LGRT_FP_ABI lgrt_bf_value __trunchfbf2(lgrt_hf_value a);
+LGRT_FP_ABI lgrt_bf_value __trunchfbf2(lgrt_hf_value a) {
+    uint32_t x = lgrt_hf_to_bits(a);
+    uint32_t sign = x & LGRT_FP_SIGN(uint32_t, 5, 10);
+    uint32_t magnitude = x & (LGRT_FP_SIGN(uint32_t, 5, 10) - 1);
+    uint32_t bits = sign;
+    unsigned int e;
+
+    if (magnitude > LGRT_FP_INF(uint32_t, 5, 10)) {
+        bits = LGRT_FP_NAN(uint32_t, 8, 7);
+    } else if (magnitude == LGRT_FP_INF(uint32_t, 5, 10)) {
+        bits |= LGRT_FP_INF(uint32_t, 8, 7);
+    } else if (magnitude != 0) {
+        uint32_t sig = lgrt_hf_normalise(magnitude, &e);
+
+        bits = lgrt_bf_round_pack(
+            sign, e + LGRT_FP_BIAS(8) - LGRT_FP_BIAS(5), sig
+        );
+    }
+    return lgrt_bf_from_bits(bits);
+}
+
+#endif
+
+#endif
+
+#endif
+
+#endif
+
+/*
+ * Complex multiplication and division, and powers to an int. Their arithmetic
+ * goes through lgrt_FMT_cx_add, _sub, _mul, and _div, over a type V: the type
+ * of the format, whose operators reach the FPU where the target has one and
+ * the routines above where it does not, or T where C cannot use that type.
+ *
+ * With a floating-point V, each operation stores its result in a volatile
+ * object and reads it back. Whatever their flags, that leaves compilers
+ * nothing to contract into a fused operation, to reassociate, to replace with
+ * the reciprocal of a divisor, or to gather into a power, which would be a
+ * call to these routines. It also takes off any excess precision, as on the
+ * x87, so that the bits of a result are what the next operation gets.
+ * Classifying a value, giving it a sign, and making an infinity or a NaN go on
+ * the bits in T, which no flag about floating-point values reaches.
+ */
+
+/* Below the sum of the exponents of any two nonzero values of a format. */
+#define LGRT_CX_ZERO_EXPONENT(M) \
+    ((unsigned int)0 - ((unsigned int)(M) + 1) * 4)
+
+/* Exponents are as in the core: unsigned for -ftrapv, wrapping below zero. */
+static inline __attribute__((__unused__)) unsigned int lgrt_cx_larger(
+    unsigned int a, unsigned int b
+) {
+    return (int)(a - b) < 0 ? b : a;
+}
+
+/*
+ * The bits of a format. lgrt_FMT_cx_split gives a finite value with its
+ * exponent taken out, in [1, 2). lgrt_FMT_cx_scale adds k to the exponent of a
+ * finite value, rounding a subnormal result and giving an infinity for one too
+ * large. lgrt_FMT_cx_down takes n off the exponent of a value below 4, which
+ * stays normal, or gives a zero of its sign where the value would be too small
+ * to change what it gets added to, which is at least 1.
+ */
+#define LGRT_CX_BITS(fmt, T, E, F) \
+    static inline bool lgrt_##fmt##_cx_negative(T x) { \
+        return (x & LGRT_FP_SIGN(T, E, F)) != 0; \
+    } \
+    \
+    static inline T lgrt_##fmt##_cx_magnitude(T x) { \
+        return x & (LGRT_FP_SIGN(T, E, F) - 1); \
+    } \
+    \
+    static inline T lgrt_##fmt##_cx_signed(bool negative, T magnitude) { \
+        return (negative ? LGRT_FP_SIGN(T, E, F) : 0) | magnitude; \
+    } \
+    \
+    static inline bool lgrt_##fmt##_cx_less(T a, T b) { \
+        return a < b; \
+    } \
+    \
+    LGRT_FP_HELPER T lgrt_##fmt##_cx_split(T x, unsigned int *e) { \
+        T sign = x & LGRT_FP_SIGN(T, E, F); \
+        T magnitude = x - sign; \
+        T sig; \
+        unsigned int field; \
+        \
+        if (magnitude == 0) { \
+            *e = LGRT_CX_ZERO_EXPONENT(LGRT_FP_EXP_MAX(E)); \
+            return x; \
+        } \
+        sig = lgrt_##fmt##_normalise(magnitude, &field); \
+        *e = field - LGRT_FP_BIAS(E); \
+        return sign + ((T)(LGRT_FP_BIAS(E) - 1) << (F)) + sig; \
+    } \
+    \
+    LGRT_FP_HELPER T lgrt_##fmt##_cx_down(T x, unsigned int n) { \
+        if (n > (F) + 6 || (x & (LGRT_FP_SIGN(T, E, F) - 1)) == 0) { \
+            return x & LGRT_FP_SIGN(T, E, F); \
+        } \
+        return x - ((T)n << (F)); \
+    } \
+    \
+    LGRT_FP_HELPER T lgrt_##fmt##_cx_scale(T x, unsigned int k) { \
+        T sign = x & LGRT_FP_SIGN(T, E, F); \
+        T magnitude = x - sign; \
+        T sig; \
+        unsigned int field; \
+        \
+        if (magnitude == 0) { \
+            return x; \
+        } \
+        sig = lgrt_##fmt##_normalise(magnitude, &field); \
+        return lgrt_##fmt##_round_pack(sign, field + k, sig << 3); \
+    }
+
+#define LGRT_CX_WIDE_BITS(fmt, M, F) \
+    static inline bool lgrt_##fmt##_cx_negative(struct lgrt_wide x) { \
+        return (x.high & LGRT_WIDE_SIGN) != 0; \
+    } \
+    \
+    static inline struct lgrt_wide lgrt_##fmt##_cx_magnitude( \
+        struct lgrt_wide x \
+    ) { \
+        return LGRT_WIDE_MAGNITUDE(x); \
+    } \
+    \
+    static inline struct lgrt_wide lgrt_##fmt##_cx_signed( \
+        bool negative, struct lgrt_wide magnitude \
+    ) { \
+        magnitude.high |= negative ? LGRT_WIDE_SIGN : 0; \
+        return magnitude; \
+    } \
+    \
+    static inline bool lgrt_##fmt##_cx_less( \
+        struct lgrt_wide a, struct lgrt_wide b \
+    ) { \
+        return lgrt_wide_lt(a, b); \
+    } \
+    \
+    static inline struct lgrt_wide lgrt_##fmt##_cx_split( \
+        struct lgrt_wide x, unsigned int *e \
+    ) { \
+        struct lgrt_wide sig; \
+        unsigned int field; \
+        \
+        if (lgrt_##fmt##_kind(LGRT_WIDE_MAGNITUDE(x)) == LGRT_FP_ZERO) { \
+            *e = LGRT_CX_ZERO_EXPONENT(M); \
+            return x; \
+        } \
+        sig = lgrt_##fmt##_normalise(LGRT_WIDE_MAGNITUDE(x), &field); \
+        *e = field - LGRT_WIDE_BIAS(M); \
+        sig = lgrt_wide_add( \
+            lgrt_wide_shl(lgrt_wide_make(0, LGRT_WIDE_BIAS(M) - 1), (F)), sig \
+        ); \
+        sig.high |= x.high & LGRT_WIDE_SIGN; \
+        return sig; \
+    } \
+    \
+    static inline struct lgrt_wide lgrt_##fmt##_cx_down( \
+        struct lgrt_wide x, unsigned int n \
+    ) { \
+        if (n > (F) + 6 \
+         || lgrt_##fmt##_kind(LGRT_WIDE_MAGNITUDE(x)) == LGRT_FP_ZERO) { \
+            return lgrt_wide_make(x.high & LGRT_WIDE_SIGN, 0); \
+        } \
+        return lgrt_wide_sub(x, lgrt_wide_shl(lgrt_wide_make(0, n), (F))); \
+    } \
+    \
+    static inline struct lgrt_wide lgrt_##fmt##_cx_scale( \
+        struct lgrt_wide x, unsigned int k \
+    ) { \
+        struct lgrt_wide sig; \
+        unsigned int field; \
+        \
+        if (lgrt_##fmt##_kind(LGRT_WIDE_MAGNITUDE(x)) == LGRT_FP_ZERO) { \
+            return x; \
+        } \
+        sig = lgrt_##fmt##_normalise(LGRT_WIDE_MAGNITUDE(x), &field); \
+        return lgrt_##fmt##_round_pack( \
+            x.high & LGRT_WIDE_SIGN, field + k, lgrt_wide_shl(sig, 3) \
+        ); \
+    }
+
+/* The operations over a floating-point type, and the bits of its values. */
+#define LGRT_CX_FP_LINEAR_OPERATIONS(fmt, V, T, to_bits, from_bits) \
+    static inline LGRT_FP_ABI T lgrt_##fmt##_cx_bits(V x) { \
+        return to_bits(x); \
+    } \
+    \
+    static inline LGRT_FP_ABI V lgrt_##fmt##_cx_value(T x) { \
+        return from_bits(x); \
+    } \
+    \
+    static inline LGRT_FP_ABI V lgrt_##fmt##_cx_add(V x, V y) { \
+        volatile V result = x + y; \
+        \
+        return result; \
+    } \
+    \
+    static inline LGRT_FP_ABI V lgrt_##fmt##_cx_sub(V x, V y) { \
+        volatile V result = x - y; \
+        \
+        return result; \
+    } \
+    \
+    static inline LGRT_FP_ABI V lgrt_##fmt##_cx_div(V x, V y) { \
+        volatile V divisor = y; \
+        volatile V result = x / divisor; \
+        \
+        return result; \
+    }
+
+#define LGRT_CX_FP_OPERATIONS(fmt, V, T, to_bits, from_bits) \
+    LGRT_CX_FP_LINEAR_OPERATIONS(fmt, V, T, to_bits, from_bits) \
+    \
+    static inline LGRT_FP_ABI V lgrt_##fmt##_cx_mul(V x, V y) { \
+        volatile V result = x * y; \
+        \
+        return result; \
+    }
+
+/* With V and T the same, the bits are the value. */
+#define LGRT_CX_NO_CONVERSIONS(fmt, T) \
+    static inline T lgrt_##fmt##_cx_bits(T x) { \
+        return x; \
+    } \
+    \
+    static inline T lgrt_##fmt##_cx_value(T x) { \
+        return x; \
+    }
+
+/*
+ * What the examples in Annex G of the C standard do where a part is not
+ * finite, on the bits. Their boxes are units of the smallest magnitude there
+ * is, or zeros. lgrt_FMT_cx_term stands for a product: it has its sign, is
+ * zero if the product is, and otherwise has the magnitude of its larger
+ * factor. With a box for a factor, that is the magnitude of the product.
+ * Without one, each sum of two has a zero among its factors in place of a NaN,
+ * so at most one of them is not zero.
+ */
+#define LGRT_CX_SPECIAL_VALUES(fmt, T, ZERO, UNIT, INF, QUIET) \
+    LGRT_FP_HELPER bool lgrt_##fmt##_cx_is(T x, int kind) { \
+        return lgrt_##fmt##_kind(lgrt_##fmt##_cx_magnitude(x)) == kind; \
+    } \
+    \
+    /* A box: a unit of the sign of x where x is of that kind, or a zero. */ \
+    LGRT_FP_HELPER T lgrt_##fmt##_cx_box(T x, int kind) { \
+        return lgrt_##fmt##_cx_signed( \
+            lgrt_##fmt##_cx_negative(x), \
+            lgrt_##fmt##_cx_is(x, kind) ? UNIT : ZERO \
+        ); \
+    } \
+    \
+    LGRT_FP_HELPER T lgrt_##fmt##_cx_no_nan(T x) { \
+        if (lgrt_##fmt##_cx_is(x, LGRT_FP_NOT_A_NUMBER)) { \
+            return lgrt_##fmt##_cx_signed(lgrt_##fmt##_cx_negative(x), ZERO); \
+        } \
+        return x; \
+    } \
+    \
+    LGRT_FP_HELPER T lgrt_##fmt##_cx_negated(T x) { \
+        return lgrt_##fmt##_cx_signed( \
+            !lgrt_##fmt##_cx_negative(x), lgrt_##fmt##_cx_magnitude(x) \
+        ); \
+    } \
+    \
+    LGRT_FP_HELPER T lgrt_##fmt##_cx_term(T p, T q) { \
+        T magnitude_p = lgrt_##fmt##_cx_magnitude(p); \
+        T magnitude_q = lgrt_##fmt##_cx_magnitude(q); \
+        bool negative = lgrt_##fmt##_cx_negative(p) \
+            != lgrt_##fmt##_cx_negative(q); \
+        \
+        if (lgrt_##fmt##_cx_is(p, LGRT_FP_ZERO) \
+         || lgrt_##fmt##_cx_is(q, LGRT_FP_ZERO)) { \
+            return lgrt_##fmt##_cx_signed(negative, ZERO); \
+        } \
+        return lgrt_##fmt##_cx_signed( \
+            negative, \
+            lgrt_##fmt##_cx_less(magnitude_p, magnitude_q) \
+                ? magnitude_q : magnitude_p \
+        ); \
+    } \
+    \
+    /* An infinity times the sum of two products, or a zero times it. */ \
+    LGRT_FP_HELPER T lgrt_##fmt##_cx_infinity_times(T s, T t) { \
+        T magnitude_s = lgrt_##fmt##_cx_magnitude(s); \
+        T magnitude_t = lgrt_##fmt##_cx_magnitude(t); \
+        bool below = lgrt_##fmt##_cx_less(magnitude_s, magnitude_t); \
+        \
+        if (!below && !lgrt_##fmt##_cx_less(magnitude_t, magnitude_s) \
+         && (lgrt_##fmt##_cx_is(s, LGRT_FP_ZERO) \
+          || lgrt_##fmt##_cx_negative(s) != lgrt_##fmt##_cx_negative(t))) { \
+            return QUIET; \
+        } \
+        return lgrt_##fmt##_cx_signed( \
+            lgrt_##fmt##_cx_negative(below ? t : s), INF \
+        ); \
+    } \
+    \
+    LGRT_FP_HELPER T lgrt_##fmt##_cx_zero_times(T s, T t) { \
+        T magnitude_s = lgrt_##fmt##_cx_magnitude(s); \
+        T magnitude_t = lgrt_##fmt##_cx_magnitude(t); \
+        \
+        if (lgrt_##fmt##_cx_less(magnitude_s, magnitude_t)) { \
+            return lgrt_##fmt##_cx_signed(lgrt_##fmt##_cx_negative(t), ZERO); \
+        } \
+        if (lgrt_##fmt##_cx_less(magnitude_t, magnitude_s)) { \
+            return lgrt_##fmt##_cx_signed(lgrt_##fmt##_cx_negative(s), ZERO); \
+        } \
+        return lgrt_##fmt##_cx_signed( \
+            lgrt_##fmt##_cx_negative(s) && lgrt_##fmt##_cx_negative(t), ZERO \
+        ); \
+    }
+
+/*
+ * Multiplication as in Annex G. Finite factors alone never give NaNs in both
+ * parts, as the signs of the products that would have to overflow for that
+ * disagree, so a NaN is among the factors if none is infinite.
+ */
+#define LGRT_CX_MULTIPLY(fmt, V, T) \
+    static inline LGRT_FP_ABI bool lgrt_##fmt##_cx_infinite(V x) { \
+        return lgrt_##fmt##_cx_is(lgrt_##fmt##_cx_bits(x), LGRT_FP_INFINITE); \
+    } \
+    \
+    LGRT_FP_HELPER void lgrt_##fmt##_cx_recover( \
+        T a, T b, T c, T d, bool overflowed, T *x, T *y \
+    ) { \
+        bool z_infinite = lgrt_##fmt##_cx_is(a, LGRT_FP_INFINITE) \
+            || lgrt_##fmt##_cx_is(b, LGRT_FP_INFINITE); \
+        bool w_infinite = lgrt_##fmt##_cx_is(c, LGRT_FP_INFINITE) \
+            || lgrt_##fmt##_cx_is(d, LGRT_FP_INFINITE); \
+        \
+        if (!z_infinite && !w_infinite && !overflowed) { \
+            return; \
+        } \
+        a = z_infinite \
+            ? lgrt_##fmt##_cx_box(a, LGRT_FP_INFINITE) \
+            : lgrt_##fmt##_cx_no_nan(a); \
+        b = z_infinite \
+            ? lgrt_##fmt##_cx_box(b, LGRT_FP_INFINITE) \
+            : lgrt_##fmt##_cx_no_nan(b); \
+        c = w_infinite \
+            ? lgrt_##fmt##_cx_box(c, LGRT_FP_INFINITE) \
+            : lgrt_##fmt##_cx_no_nan(c); \
+        d = w_infinite \
+            ? lgrt_##fmt##_cx_box(d, LGRT_FP_INFINITE) \
+            : lgrt_##fmt##_cx_no_nan(d); \
+        *x = lgrt_##fmt##_cx_infinity_times( \
+            lgrt_##fmt##_cx_term(a, c), \
+            lgrt_##fmt##_cx_negated(lgrt_##fmt##_cx_term(b, d)) \
+        ); \
+        *y = lgrt_##fmt##_cx_infinity_times( \
+            lgrt_##fmt##_cx_term(a, d), lgrt_##fmt##_cx_term(b, c) \
+        ); \
+    } \
+    \
+    LGRT_FP_HELPER LGRT_FP_ABI void lgrt_##fmt##_cx_multiply( \
+        V a, V b, V c, V d, V *parts \
+    ) { \
+        V ac = lgrt_##fmt##_cx_mul(a, c); \
+        V bd = lgrt_##fmt##_cx_mul(b, d); \
+        V ad = lgrt_##fmt##_cx_mul(a, d); \
+        V bc = lgrt_##fmt##_cx_mul(b, c); \
+        T x = lgrt_##fmt##_cx_bits(lgrt_##fmt##_cx_sub(ac, bd)); \
+        T y = lgrt_##fmt##_cx_bits(lgrt_##fmt##_cx_add(ad, bc)); \
+        \
+        if (lgrt_##fmt##_cx_is(x, LGRT_FP_NOT_A_NUMBER) \
+         && lgrt_##fmt##_cx_is(y, LGRT_FP_NOT_A_NUMBER)) { \
+            lgrt_##fmt##_cx_recover( \
+                lgrt_##fmt##_cx_bits(a), lgrt_##fmt##_cx_bits(b), \
+                lgrt_##fmt##_cx_bits(c), lgrt_##fmt##_cx_bits(d), \
+                lgrt_##fmt##_cx_infinite(ac) || lgrt_##fmt##_cx_infinite(bd) \
+                    || lgrt_##fmt##_cx_infinite(ad) \
+                    || lgrt_##fmt##_cx_infinite(bc), \
+                &x, &y \
+            ); \
+        } \
+        parts[0] = lgrt_##fmt##_cx_value(x); \
+        parts[1] = lgrt_##fmt##_cx_value(y); \
+    }
+
+/*
+ * Division. Scaling the denominator alone, as in the example in Annex G,
+ * leaves the numerator open to overflow and underflow, and scaling both by one
+ * factor still fails where the parts of one of them are far apart. So each
+ * part keeps an exponent of its own, as an integer without limits to reach,
+ * and the usual formula works on values in [1, 2). Two products meet in a sum
+ * once the smaller has its exponent lined up, and the exponents left over go
+ * back on the quotient at the end, the one place where a value can overflow or
+ * underflow, and then only if the result itself does.
+ *
+ * A value that is not finite, or a zero denominator, gives what the example
+ * does, but for sums of finite values that overflow there on the way to a
+ * zero, which Annex G requires, or to the infinite part of a result.
+ */
+#define LGRT_CX_DIVIDE(fmt, V, T, QUIET, ZERO) \
+    LGRT_FP_HELPER LGRT_FP_ABI T lgrt_##fmt##_cx_part( \
+        V p, V q, unsigned int e_pq, V r, V s, unsigned int e_rs, \
+        bool subtract, V denominator, unsigned int e_w \
+    ) { \
+        unsigned int top = lgrt_cx_larger(e_pq, e_rs); \
+        V pq = lgrt_##fmt##_cx_value( \
+            lgrt_##fmt##_cx_down( \
+                lgrt_##fmt##_cx_bits(lgrt_##fmt##_cx_mul(p, q)), top - e_pq \
+            ) \
+        ); \
+        V rs = lgrt_##fmt##_cx_value( \
+            lgrt_##fmt##_cx_down( \
+                lgrt_##fmt##_cx_bits(lgrt_##fmt##_cx_mul(r, s)), top - e_rs \
+            ) \
+        ); \
+        V sum = subtract \
+            ? lgrt_##fmt##_cx_sub(pq, rs) : lgrt_##fmt##_cx_add(pq, rs); \
+        \
+        if (lgrt_##fmt##_cx_is(lgrt_##fmt##_cx_bits(sum), LGRT_FP_ZERO)) { \
+            return lgrt_##fmt##_cx_bits(sum); \
+        } \
+        return lgrt_##fmt##_cx_scale( \
+            lgrt_##fmt##_cx_bits(lgrt_##fmt##_cx_div(sum, denominator)), \
+            top - e_w - e_w \
+        ); \
+    } \
+    \
+    LGRT_FP_HELPER LGRT_FP_ABI void lgrt_##fmt##_cx_quotient( \
+        T a, T b, T c, T d, T *x, T *y \
+    ) { \
+        unsigned int e_a; \
+        unsigned int e_b; \
+        unsigned int e_c; \
+        unsigned int e_d; \
+        V m_a = lgrt_##fmt##_cx_value(lgrt_##fmt##_cx_split(a, &e_a)); \
+        V m_b = lgrt_##fmt##_cx_value(lgrt_##fmt##_cx_split(b, &e_b)); \
+        T s_c = lgrt_##fmt##_cx_split(c, &e_c); \
+        T s_d = lgrt_##fmt##_cx_split(d, &e_d); \
+        V m_c = lgrt_##fmt##_cx_value(s_c); \
+        V m_d = lgrt_##fmt##_cx_value(s_d); \
+        unsigned int e_w = lgrt_cx_larger(e_c, e_d); \
+        V w_c = lgrt_##fmt##_cx_value(lgrt_##fmt##_cx_down(s_c, e_w - e_c)); \
+        V w_d = lgrt_##fmt##_cx_value(lgrt_##fmt##_cx_down(s_d, e_w - e_d)); \
+        V denominator = lgrt_##fmt##_cx_add( \
+            lgrt_##fmt##_cx_mul(w_c, w_c), lgrt_##fmt##_cx_mul(w_d, w_d) \
+        ); \
+        \
+        *x = lgrt_##fmt##_cx_part( \
+            m_a, m_c, e_a + e_c, m_b, m_d, e_b + e_d, false, denominator, e_w \
+        ); \
+        *y = lgrt_##fmt##_cx_part( \
+            m_b, m_c, e_b + e_c, m_a, m_d, e_a + e_d, true, denominator, e_w \
+        ); \
+    } \
+    \
+    LGRT_FP_HELPER LGRT_FP_ABI void lgrt_##fmt##_cx_divide( \
+        T a, T b, T c, T d, V *parts \
+    ) { \
+        bool a_finite = !lgrt_##fmt##_cx_is(a, LGRT_FP_INFINITE) \
+            && !lgrt_##fmt##_cx_is(a, LGRT_FP_NOT_A_NUMBER); \
+        bool b_finite = !lgrt_##fmt##_cx_is(b, LGRT_FP_INFINITE) \
+            && !lgrt_##fmt##_cx_is(b, LGRT_FP_NOT_A_NUMBER); \
+        T x = QUIET; \
+        T y = QUIET; \
+        \
+        if (lgrt_##fmt##_cx_is(c, LGRT_FP_INFINITE) \
+         || lgrt_##fmt##_cx_is(d, LGRT_FP_INFINITE)) { \
+            if (a_finite && b_finite) { \
+                T box_c = lgrt_##fmt##_cx_box(c, LGRT_FP_INFINITE); \
+                T box_d = lgrt_##fmt##_cx_box(d, LGRT_FP_INFINITE); \
+                \
+                x = lgrt_##fmt##_cx_zero_times( \
+                    lgrt_##fmt##_cx_term(a, box_c), \
+                    lgrt_##fmt##_cx_term(b, box_d) \
+                ); \
+                y = lgrt_##fmt##_cx_zero_times( \
+                    lgrt_##fmt##_cx_term(b, box_c), \
+                    lgrt_##fmt##_cx_negated(lgrt_##fmt##_cx_term(a, box_d)) \
+                ); \
+            } \
+        } else if (lgrt_##fmt##_cx_is(c, LGRT_FP_NOT_A_NUMBER) \
+                || lgrt_##fmt##_cx_is(d, LGRT_FP_NOT_A_NUMBER)) { \
+            /* Nothing recovers from these. */ \
+        } else if (lgrt_##fmt##_cx_is(c, LGRT_FP_ZERO) \
+                && lgrt_##fmt##_cx_is(d, LGRT_FP_ZERO)) { \
+            T box_c = lgrt_##fmt##_cx_box(c, LGRT_FP_ZERO); \
+            \
+            x = lgrt_##fmt##_cx_infinity_times( \
+                lgrt_##fmt##_cx_term(box_c, lgrt_##fmt##_cx_no_nan(a)), ZERO \
+            ); \
+            y = lgrt_##fmt##_cx_infinity_times( \
+                lgrt_##fmt##_cx_term(box_c, lgrt_##fmt##_cx_no_nan(b)), ZERO \
+            ); \
+        } else if (lgrt_##fmt##_cx_is(a, LGRT_FP_INFINITE) \
+                || lgrt_##fmt##_cx_is(b, LGRT_FP_INFINITE)) { \
+            T box_a = lgrt_##fmt##_cx_box(a, LGRT_FP_INFINITE); \
+            T box_b = lgrt_##fmt##_cx_box(b, LGRT_FP_INFINITE); \
+            T box_c = lgrt_##fmt##_cx_box(c, LGRT_FP_FINITE); \
+            T box_d = lgrt_##fmt##_cx_box(d, LGRT_FP_FINITE); \
+            \
+            x = lgrt_##fmt##_cx_infinity_times( \
+                lgrt_##fmt##_cx_term(box_a, box_c), \
+                lgrt_##fmt##_cx_term(box_b, box_d) \
+            ); \
+            y = lgrt_##fmt##_cx_infinity_times( \
+                lgrt_##fmt##_cx_term(box_b, box_c), \
+                lgrt_##fmt##_cx_negated(lgrt_##fmt##_cx_term(box_a, box_d)) \
+            ); \
+        } else if (a_finite && b_finite) { \
+            lgrt_##fmt##_cx_quotient(a, b, c, d, &x, &y); \
+        } \
+        parts[0] = lgrt_##fmt##_cx_value(x); \
+        parts[1] = lgrt_##fmt##_cx_value(y); \
+    }
+
+/*
+ * A power by repeated squaring, of the magnitude of n, which unsigned int
+ * holds for the most negative int too, whatever the width of int. Nothing
+ * squares x past what the result needs. A negative n takes the reciprocal of
+ * the power, by parts as division does, as with fast-math flags compilers can
+ * make any division an estimate that gets zeros, infinities, and the limits of
+ * the range wrong. Where the divisor is in [1, 2), that is only less exact.
+ * For the same reason, division above does not divide a zero.
+ */
+#define LGRT_CX_POWER(fmt, V, T, ZERO, INF, ONE) \
+    LGRT_FP_HELPER LGRT_FP_ABI V lgrt_##fmt##_cx_reciprocal(V x) { \
+        T bits = lgrt_##fmt##_cx_bits(x); \
+        bool negative = lgrt_##fmt##_cx_negative(bits); \
+        unsigned int e; \
+        V m; \
+        \
+        if (lgrt_##fmt##_cx_is(bits, LGRT_FP_NOT_A_NUMBER)) { \
+            return x; \
+        } \
+        if (lgrt_##fmt##_cx_is(bits, LGRT_FP_INFINITE)) { \
+            return lgrt_##fmt##_cx_value( \
+                lgrt_##fmt##_cx_signed(negative, ZERO) \
+            ); \
+        } \
+        if (lgrt_##fmt##_cx_is(bits, LGRT_FP_ZERO)) { \
+            return lgrt_##fmt##_cx_value( \
+                lgrt_##fmt##_cx_signed(negative, INF) \
+            ); \
+        } \
+        m = lgrt_##fmt##_cx_value(lgrt_##fmt##_cx_split(bits, &e)); \
+        return lgrt_##fmt##_cx_value( \
+            lgrt_##fmt##_cx_scale( \
+                lgrt_##fmt##_cx_bits( \
+                    lgrt_##fmt##_cx_div(lgrt_##fmt##_cx_value(ONE), m) \
+                ), \
+                (unsigned int)0 - e \
+            ) \
+        ); \
+    } \
+    \
+    LGRT_FP_HELPER LGRT_FP_ABI V lgrt_##fmt##_cx_power(V x, int n) { \
+        unsigned int m = n < 0 ? (unsigned int)0 - (unsigned int)n \
+            : (unsigned int)n; \
+        V result = lgrt_##fmt##_cx_value(ONE); \
+        \
+        for (;;) { \
+            if ((m & 1) != 0) { \
+                result = lgrt_##fmt##_cx_mul(result, x); \
+            } \
+            m >>= 1; \
+            if (m == 0) { \
+                break; \
+            } \
+            x = lgrt_##fmt##_cx_mul(x, x); \
+        } \
+        return n < 0 ? lgrt_##fmt##_cx_reciprocal(result) : result; \
+    }
+
+#define LGRT_CX_NARROW(fmt, V, T, E, F) \
+    LGRT_CX_BITS(fmt, T, E, F) \
+    LGRT_CX_SPECIAL_VALUES( \
+        fmt, T, (T)0, (T)1, LGRT_FP_INF(T, E, F), LGRT_FP_NAN(T, E, F) \
+    ) \
+    LGRT_CX_MULTIPLY(fmt, V, T) \
+    LGRT_CX_DIVIDE(fmt, V, T, LGRT_FP_NAN(T, E, F), (T)0) \
+    LGRT_CX_POWER( \
+        fmt, V, T, (T)0, LGRT_FP_INF(T, E, F), (T)LGRT_FP_BIAS(E) << (F) \
+    )
+
+#define LGRT_CX_WIDE(fmt, V, M, F) \
+    LGRT_CX_WIDE_BITS(fmt, M, F) \
+    LGRT_CX_SPECIAL_VALUES( \
+        fmt, struct lgrt_wide, lgrt_wide_make(0, 0), lgrt_wide_make(0, 1), \
+        LGRT_WIDE_INF(M, F), LGRT_WIDE_NAN(M, F) \
+    ) \
+    LGRT_CX_MULTIPLY(fmt, V, struct lgrt_wide) \
+    LGRT_CX_DIVIDE( \
+        fmt, V, struct lgrt_wide, LGRT_WIDE_NAN(M, F), lgrt_wide_make(0, 0) \
+    ) \
+    LGRT_CX_POWER( \
+        fmt, V, struct lgrt_wide, lgrt_wide_make(0, 0), LGRT_WIDE_INF(M, F), \
+        lgrt_wide_shl(lgrt_wide_make(0, LGRT_WIDE_BIAS(M)), (F)) \
+    )
+
+/*
+ * The type that powers take their exponent in.
+ *
+ * Workaround: Clang before 12, 64-bit RISC-V: it zero-extends the exponent for
+ * these calls, where the ABI has it sign-extended and code compiled for int
+ * relies on that. So they take all of the register there, and narrow it.
+ */
+#if defined(__clang__) && __clang_major__ < 12 && defined(__riscv) \
+ && __riscv_xlen == 64
+typedef long lgrt_powi_exponent;
+#else
+typedef int lgrt_powi_exponent;
+#endif
+
+/*
+ * The routines, with V for the parts of a value and Z for the whole of one,
+ * which goes by the rules of the target for complex values.
+ */
+#define LGRT_CX_NAMED_ROUTINES(fmt, V, Z, mul_name, div_name, powi_name) \
+    LGRT_FP_ABI Z mul_name(V a, V b, V c, V d); \
+    LGRT_FP_ABI Z mul_name(V a, V b, V c, V d) { \
+        V parts[2]; \
+        Z z; \
+        \
+        lgrt_##fmt##_cx_multiply(a, b, c, d, parts); \
+        __builtin_memcpy(&z, parts, sizeof(parts)); \
+        return z; \
+    } \
+    \
+    LGRT_FP_ABI Z div_name(V a, V b, V c, V d); \
+    LGRT_FP_ABI Z div_name(V a, V b, V c, V d) { \
+        V parts[2]; \
+        Z z; \
+        \
+        lgrt_##fmt##_cx_divide( \
+            lgrt_##fmt##_cx_bits(a), lgrt_##fmt##_cx_bits(b), \
+            lgrt_##fmt##_cx_bits(c), lgrt_##fmt##_cx_bits(d), parts \
+        ); \
+        __builtin_memcpy(&z, parts, sizeof(parts)); \
+        return z; \
+    } \
+    \
+    LGRT_FP_ABI V powi_name(V x, lgrt_powi_exponent n); \
+    LGRT_FP_ABI V powi_name(V x, lgrt_powi_exponent n) { \
+        return lgrt_##fmt##_cx_power(x, (int)n); \
+    }
+
+#define LGRT_CX_ROUTINES(fmt, cfmt, V, Z) \
+    LGRT_CX_NAMED_ROUTINES( \
+        fmt, V, Z, __mul##cfmt##3, __div##cfmt##3, __powi##fmt##2 \
+    )
+
+/*
+ * GCC declares the complex routines itself, with the complex types, as
+ * ordinary code of the target, so those that differ from that have other names
+ * in C.
+ */
+#define LGRT_CX_LABELLED_ROUTINES(fmt, cfmt, V, Z) \
+    LGRT_FP_ABI Z lgrt_mul##cfmt##3(V a, V b, V c, V d) \
+        __asm__("__mul" #cfmt "3"); \
+    LGRT_FP_ABI Z lgrt_div##cfmt##3(V a, V b, V c, V d) \
+        __asm__("__div" #cfmt "3"); \
+    LGRT_FP_ABI V lgrt_powi##fmt##2(V x, lgrt_powi_exponent n) \
+        __asm__("__powi" #fmt "2"); \
+    LGRT_CX_NAMED_ROUTINES( \
+        fmt, V, Z, lgrt_mul##cfmt##3, lgrt_div##cfmt##3, lgrt_powi##fmt##2 \
+    )
+
+/* The operations on the bits, from the core of the format. */
+#define LGRT_CX_WIDE_OPERATIONS(fmt) \
+    LGRT_CX_NO_CONVERSIONS(fmt, struct lgrt_wide) \
+    \
+    static inline struct lgrt_wide lgrt_##fmt##_cx_add( \
+        struct lgrt_wide x, struct lgrt_wide y \
+    ) { \
+        return lgrt_##fmt##_add(x, y); \
+    } \
+    \
+    static inline struct lgrt_wide lgrt_##fmt##_cx_sub( \
+        struct lgrt_wide x, struct lgrt_wide y \
+    ) { \
+        y.high ^= LGRT_WIDE_SIGN; \
+        return lgrt_##fmt##_add(x, y); \
+    } \
+    \
+    static inline struct lgrt_wide lgrt_##fmt##_cx_mul( \
+        struct lgrt_wide x, struct lgrt_wide y \
+    ) { \
+        return lgrt_##fmt##_mul(x, y); \
+    } \
+    \
+    static inline struct lgrt_wide lgrt_##fmt##_cx_div( \
+        struct lgrt_wide x, struct lgrt_wide y \
+    ) { \
+        return lgrt_##fmt##_div(x, y); \
+    }
+
+#if LGRT_SOFT_FLOAT
+
+#if LGRT_FP_PASSED_AS_INT
+
+/*
+ * These targets pass values as integers here too, and take their arithmetic
+ * from the routines above. GCC allows floating-point types on 32-bit ARM with
+ * an FPU only without -mgeneral-regs-only, with nothing to tell of that, so
+ * assembly, which that option leaves alone, reaches the FPU there. The
+ * registers it names need not be saved across calls.
+ */
+#define LGRT_CX_CALL(fmt, T, name) \
+    static inline T lgrt_##fmt##_cx_##name(T x, T y) { \
+        return __##name##fmt##3(x, y); \
+    }
+
+#define LGRT_CX_VFP_SINGLE(name, instruction) \
+    static inline uint32_t lgrt_sf_cx_##name(uint32_t x, uint32_t y) { \
+        uint32_t result; \
+        \
+        __asm__ ( \
+            "vmov s14, %1\n\t" \
+            "vmov s15, %2\n\t" \
+            instruction " s14, s14, s15\n\t" \
+            "vmov %0, s14" \
+            : "=r"(result) \
+            : "r"(x), "r"(y) \
+            : "s14", "s15" \
+        ); \
+        return result; \
+    }
+
+#define LGRT_CX_VFP_DOUBLE(name, instruction) \
+    static inline uint64_t lgrt_df_cx_##name(uint64_t x, uint64_t y) { \
+        uint64_t result; \
+        \
+        __asm__ ( \
+            "vmov d6, %Q1, %R1\n\t" \
+            "vmov d7, %Q2, %R2\n\t" \
+            instruction " d6, d6, d7\n\t" \
+            "vmov %Q0, %R0, d6" \
+            : "=r"(result) \
+            : "r"(x), "r"(y) \
+            : "d6", "d7" \
+        ); \
+        return result; \
+    }
+
+#if defined(__arm__) && !defined(__SOFTFP__) && defined(__ARM_FP) \
+ && (__ARM_FP & 4) != 0
+LGRT_CX_VFP_SINGLE(add, "vadd.f32")
+LGRT_CX_VFP_SINGLE(sub, "vsub.f32")
+LGRT_CX_VFP_SINGLE(mul, "vmul.f32")
+LGRT_CX_VFP_SINGLE(div, "vdiv.f32")
+#else
+LGRT_CX_CALL(sf, uint32_t, add)
+LGRT_CX_CALL(sf, uint32_t, sub)
+LGRT_CX_CALL(sf, uint32_t, mul)
+LGRT_CX_CALL(sf, uint32_t, div)
+#endif
+
+LGRT_CX_NO_CONVERSIONS(sf, uint32_t)
+LGRT_CX_NARROW(sf, uint32_t, uint32_t, 8, 23)
+
+#if LGRT_SOFT_DOUBLE
+#if defined(__arm__) && !defined(__SOFTFP__) && defined(__ARM_FP) \
+ && (__ARM_FP & 8) != 0
+LGRT_CX_VFP_DOUBLE(add, "vadd.f64")
+LGRT_CX_VFP_DOUBLE(sub, "vsub.f64")
+LGRT_CX_VFP_DOUBLE(mul, "vmul.f64")
+LGRT_CX_VFP_DOUBLE(div, "vdiv.f64")
+#else
+LGRT_CX_CALL(df, uint64_t, add)
+LGRT_CX_CALL(df, uint64_t, sub)
+LGRT_CX_CALL(df, uint64_t, mul)
+LGRT_CX_CALL(df, uint64_t, div)
+#endif
+
+LGRT_CX_NO_CONVERSIONS(df, uint64_t)
+LGRT_CX_NARROW(df, uint64_t, uint64_t, 11, 52)
+#endif
+
+#if defined(__ARM_PCS_VFP)
+
+/*
+ * Where floating-point registers pass values, C cannot have the types that use
+ * them, as above, so assembly moves them to memory for C to work on, and takes
+ * the results from there.
+ */
+#define LGRT_CX_VFP_ENTRY(name, symbol, frame, store, helper, load) \
+    void name(void) __asm__(symbol); \
+    __attribute__((__naked__)) void name(void) { \
+        __asm__ volatile ( \
+            ".syntax unified\n" \
+            LGRT_ASM_BTI \
+            "push {r4, lr}\n" \
+            "sub sp, sp, #" frame "\n" \
+            store \
+            "bl " helper "\n" \
+            load \
+            "add sp, sp, #" frame "\n" \
+            "pop {r4, pc}\n" \
+            LGRT_ASM_END \
+        ); \
+    }
+
+#define LGRT_CX_VFP_HELPER __attribute__((__used__, __visibility__("hidden")))
+
+#define LGRT_CX_VFP_ROUTINES(fmt, cfmt, T, frame, first, second, last) \
+    void lgrt_mul##cfmt##3_parts(T *parts); \
+    LGRT_CX_VFP_HELPER void lgrt_mul##cfmt##3_parts(T *parts) { \
+        lgrt_##fmt##_cx_multiply( \
+            parts[0], parts[1], parts[2], parts[3], parts \
+        ); \
+    } \
+    \
+    LGRT_CX_VFP_ENTRY( \
+        lgrt_mul##cfmt##3, "__mul" #cfmt "3", frame, \
+        "vstmia sp, {" first "-" last "}\n" \
+        "mov r0, sp\n", \
+        "lgrt_mul" #cfmt "3_parts", \
+        "vldmia sp, {" first "-" second "}\n" \
+    ) \
+    \
+    void lgrt_div##cfmt##3_parts(T *parts); \
+    LGRT_CX_VFP_HELPER void lgrt_div##cfmt##3_parts(T *parts) { \
+        lgrt_##fmt##_cx_divide( \
+            parts[0], parts[1], parts[2], parts[3], parts \
+        ); \
+    } \
+    \
+    LGRT_CX_VFP_ENTRY( \
+        lgrt_div##cfmt##3, "__div" #cfmt "3", frame, \
+        "vstmia sp, {" first "-" last "}\n" \
+        "mov r0, sp\n", \
+        "lgrt_div" #cfmt "3_parts", \
+        "vldmia sp, {" first "-" second "}\n" \
+    ) \
+    \
+    void lgrt_powi##fmt##2_value(T *value, int n); \
+    LGRT_CX_VFP_HELPER void lgrt_powi##fmt##2_value(T *value, int n) { \
+        *value = lgrt_##fmt##_cx_power(*value, n); \
+    } \
+    \
+    LGRT_CX_VFP_ENTRY( \
+        lgrt_powi##fmt##2, "__powi" #fmt "2", "8", \
+        "vstr " first ", [sp]\n" \
+        "mov r1, r0\n" \
+        "mov r0, sp\n", \
+        "lgrt_powi" #fmt "2_value", \
+        "vldr " first ", [sp]\n" \
+    )
+
+LGRT_CX_VFP_ROUTINES(sf, sc, uint32_t, "16", "s0", "s1", "s3")
+#if LGRT_SOFT_DOUBLE
+LGRT_CX_VFP_ROUTINES(df, dc, uint64_t, "32", "d0", "d1", "d3")
+#endif
+
+#else
+
+/*
+ * The procedure call standards of ARM return complex values in memory, as they
+ * do structures of those sizes, and so do AVR and MSP430 for 16 bytes. 8 bytes
+ * go where uint64_t does on the latter two, the real part low. ARM without
+ * those standards returns them in registers, and only has soft floating point
+ * to care about, where GCC accepts the types.
+ */
+#if defined(__ARM_EABI__) || !defined(__arm__)
+struct lgrt_dc_value {
+    uint64_t parts[2];
+};
+#if defined(__arm__)
+struct lgrt_sc_value {
+    uint32_t parts[2];
+};
+#define LGRT_SC_RETURN struct lgrt_sc_value
+#else
+#define LGRT_SC_RETURN uint64_t
+#endif
+#define LGRT_DC_RETURN struct lgrt_dc_value
+#else
+__extension__ typedef _Complex float lgrt_sc_value;
+__extension__ typedef _Complex double lgrt_dc_value;
+#define LGRT_SC_RETURN lgrt_sc_value
+#define LGRT_DC_RETURN lgrt_dc_value
+#endif
+
+LGRT_CX_LABELLED_ROUTINES(sf, sc, uint32_t, LGRT_SC_RETURN)
+#if LGRT_SOFT_DOUBLE
+LGRT_CX_LABELLED_ROUTINES(df, dc, uint64_t, LGRT_DC_RETURN)
+#endif
+
+#endif
+
+/*
+ * Half complex goes through float, as on other targets. Compilers call these
+ * only with arithmetic of that format. Each operand comes in a register of its
+ * own, and the result goes in r0, as a structure of its size does.
+ */
+#if defined(__arm__) && defined(__ARM_FEATURE_FP16_SCALAR_ARITHMETIC)
+
+static inline uint32_t lgrt_hc_packed(uint32_t *parts) {
+    uint32_t x = lgrt_sf_to_hf(parts[0]);
+    uint32_t y = lgrt_sf_to_hf(parts[1]);
+
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    return (x << 16) | y;
+#else
+    return (y << 16) | x;
+#endif
+}
+
+#define LGRT_HC_FUNCTION(name, attributes, operation, label) \
+    uint32_t name(uint32_t a, uint32_t b, uint32_t c, uint32_t d) label; \
+    attributes uint32_t name( \
+        uint32_t a, uint32_t b, uint32_t c, uint32_t d \
+    ) { \
+        uint32_t parts[2]; \
+        \
+        operation( \
+            lgrt_sf_from_hf((uint16_t)a), lgrt_sf_from_hf((uint16_t)b), \
+            lgrt_sf_from_hf((uint16_t)c), lgrt_sf_from_hf((uint16_t)d), parts \
+        ); \
+        return lgrt_hc_packed(parts); \
+    }
+
+#if defined(__ARM_PCS_VFP)
+
+#define LGRT_HC_ROUTINE(name, operation) \
+    LGRT_HC_FUNCTION(lgrt_##name##_packed, LGRT_CX_VFP_HELPER, operation, ) \
+    \
+    void lgrt_##name(void) __asm__("__" #name); \
+    __attribute__((__naked__)) void lgrt_##name(void) { \
+        __asm__ volatile ( \
+            ".syntax unified\n" \
+            LGRT_ASM_BTI \
+            "vmov r0, s0\n" \
+            "vmov r1, s1\n" \
+            "vmov r2, s2\n" \
+            "vmov r3, s3\n" \
+            "b lgrt_" #name "_packed\n" \
+            LGRT_ASM_END \
+        ); \
+    }
+
+#else
+
+#define LGRT_HC_ROUTINE(name, operation) \
+    LGRT_HC_FUNCTION(lgrt_##name, , operation, __asm__("__" #name))
+
+#endif
+
+LGRT_HC_ROUTINE(mulhc3, lgrt_sf_cx_multiply)
+LGRT_HC_ROUTINE(divhc3, lgrt_sf_cx_divide)
+
+#endif
+
+#else
+
+#if defined(__mips16) && defined(__mips_hard_float)
+#define LGRT_CX_NATIVE_ROUTINES LGRT_CX_LABELLED_ROUTINES
+#else
+#define LGRT_CX_NATIVE_ROUTINES LGRT_CX_ROUTINES
+#endif
+
+LGRT_CX_FP_OPERATIONS(
+    sf, lgrt_sf_value, uint32_t, lgrt_sf_to_bits, lgrt_sf_from_bits
+)
+LGRT_CX_NARROW(sf, lgrt_sf_value, uint32_t, 8, 23)
+
+__extension__ typedef _Complex float lgrt_sc_value;
+
+LGRT_CX_NATIVE_ROUTINES(sf, sc, lgrt_sf_value, lgrt_sc_value)
+
+#if LGRT_SOFT_DOUBLE
+/*
+ * Workaround: Clang, Hexagon V67 and later: with -Ofast or
+ * -funsafe-math-optimizations, it leaves out of a product of doubles the steps
+ * that subnormal operands need, and no macro tells of both flags. So the core
+ * makes that product there.
+ */
+#if defined(__hexagon__)
+LGRT_CX_FP_LINEAR_OPERATIONS(
+    df, lgrt_df_value, uint64_t, lgrt_df_to_bits, lgrt_df_from_bits
+)
+
+static inline lgrt_df_value lgrt_df_cx_mul(lgrt_df_value x, lgrt_df_value y) {
+    return lgrt_df_from_bits(
+        lgrt_df_mul(lgrt_df_to_bits(x), lgrt_df_to_bits(y))
+    );
+}
+#else
+LGRT_CX_FP_OPERATIONS(
+    df, lgrt_df_value, uint64_t, lgrt_df_to_bits, lgrt_df_from_bits
+)
+#endif
+LGRT_CX_NARROW(df, lgrt_df_value, uint64_t, 11, 52)
+
+#if __SIZEOF_DOUBLE__ == 8
+__extension__ typedef _Complex double lgrt_dc_value;
+#else
+__extension__ typedef _Complex long double lgrt_dc_value;
+#endif
+
+LGRT_CX_NATIVE_ROUTINES(df, dc, lgrt_df_value, lgrt_dc_value)
+#endif
+
+/*
+ * Half complex goes through float, which holds the products of its parts
+ * exactly and has the range for all that follows from them. Only the
+ * conversions back to half can overflow. Compilers go through float themselves
+ * on LoongArch, and nothing calls these there.
+ *
+ * Workaround: Clang before 14, every target with _Float16: it rejects _Complex
+ * _Float16, so it gets no such routines.
+ */
+#if LGRT_SOFT_HF && (!LGRT_HF_PASSED_AS_INT || LGRT_HF_CONVERSIONS_AS_INT) \
+ && !defined(__loongarch__) && (!defined(__clang__) || __clang_major__ >= 14)
+
+__extension__ typedef _Float16 lgrt_hc_part;
+__extension__ typedef _Complex _Float16 lgrt_hc_value;
+
+#define LGRT_HC_ROUTINE(name, operation) \
+    LGRT_FP_ABI lgrt_hc_value name( \
+        lgrt_hc_part a, lgrt_hc_part b, lgrt_hc_part c, lgrt_hc_part d \
+    ); \
+    LGRT_FP_ABI lgrt_hc_value name( \
+        lgrt_hc_part a, lgrt_hc_part b, lgrt_hc_part c, lgrt_hc_part d \
+    ) { \
+        lgrt_sf_value parts[2]; \
+        lgrt_hc_part results[2]; \
+        lgrt_hc_value z; \
+        \
+        operation; \
+        results[0] = (lgrt_hc_part)parts[0]; \
+        results[1] = (lgrt_hc_part)parts[1]; \
+        __builtin_memcpy(&z, results, sizeof(results)); \
+        return z; \
+    }
+
+LGRT_HC_ROUTINE(
+    __mulhc3,
+    lgrt_sf_cx_multiply(
+        (lgrt_sf_value)a, (lgrt_sf_value)b, (lgrt_sf_value)c, (lgrt_sf_value)d,
+        parts
+    )
+)
+LGRT_HC_ROUTINE(
+    __divhc3,
+    lgrt_sf_cx_divide(
+        lgrt_sf_cx_bits((lgrt_sf_value)a), lgrt_sf_cx_bits((lgrt_sf_value)b),
+        lgrt_sf_cx_bits((lgrt_sf_value)c), lgrt_sf_cx_bits((lgrt_sf_value)d),
+        parts
+    )
+)
+
+#endif
+
+#endif
+
+#endif
+
+#if LGRT_HAS_IBM_128
+
+/*
+ * IBM long double, in C's own operators on double, each with its volatile
+ * store as above, so that the steps that recover what rounding lost stay as
+ * they are written whatever the flags. Infinities, NaNs, zeros, and exponents
+ * go on the bits.
+ *
+ * Multiplication and division first move both values to about 1, which keeps
+ * all between them away from overflow and underflow, and the exponents go back
+ * on at the end. There a result too large for the format is an infinity, and
+ * one in the subnormal range of double has no more than double has: it is
+ * rounded once, to nearest, into the first double.
+ *
+ * By the published analyses of these sums and products, a sum of normalised
+ * values is within about 3 * 2^-106 of the exact one, in proportion to it, and
+ * a product within about 7 * 2^-106. A quotient has three rounds of long
+ * division on exact remainders, for about the same, however inexact a division
+ * of two doubles is under fast-math flags. A result has its first double as
+ * the sum of both, rounded to nearest.
+ *
+ * Infinities and NaNs have a zero for the second double, and a NaN that comes
+ * out is the default one.
+ */
+
+#define LGRT_IBM_HELPER static inline __attribute__((__unused__))
+#define LGRT_IBM_SIGN LGRT_FP_SIGN(uint64_t, 11, 52)
+#define LGRT_IBM_INF LGRT_FP_INF(uint64_t, 11, 52)
+#define LGRT_IBM_NAN LGRT_FP_NAN(uint64_t, 11, 52)
+#define LGRT_IBM_ONE ((uint64_t)LGRT_FP_BIAS(11) << 52)
+
+struct lgrt_ibm_bits {
+    uint64_t high;
+    uint64_t low;
+};
+
+LGRT_IBM_HELPER struct lgrt_ibm_bits lgrt_ibm_make(
+    uint64_t high, uint64_t low
+) {
+    struct lgrt_ibm_bits x;
+
+    x.high = high;
+    x.low = low;
+    return x;
+}
+
+LGRT_IBM_HELPER struct lgrt_ibm_bits lgrt_ibm_to_bits(lgrt_ibm_value value) {
+    struct lgrt_ibm_bits bits;
+
+    __builtin_memcpy(&bits, &value, sizeof(struct lgrt_ibm_bits));
+    __asm__ ("" : "+g"(bits.high), "+g"(bits.low));
+    return bits;
+}
+
+LGRT_IBM_HELPER lgrt_ibm_value lgrt_ibm_from_bits(struct lgrt_ibm_bits bits) {
+    lgrt_ibm_value value;
+
+    __asm__ ("" : "+g"(bits.high), "+g"(bits.low));
+    __builtin_memcpy(&value, &bits, sizeof(struct lgrt_ibm_bits));
+    return value;
+}
+
+/* The bits of two doubles, with nothing beside an infinity or a NaN. */
+LGRT_IBM_HELPER struct lgrt_ibm_bits lgrt_ibm_pair(
+    lgrt_df_value high, lgrt_df_value low
+) {
+    uint64_t first = lgrt_df_to_bits(high);
+
+    if ((first & (LGRT_IBM_SIGN - 1)) >= LGRT_IBM_INF) {
+        return lgrt_ibm_make(first, 0);
+    }
+    return lgrt_ibm_make(first, lgrt_df_to_bits(low));
+}
+
+/* s + e is exactly a + b, with s that sum rounded. */
+LGRT_IBM_HELPER void lgrt_ibm_two_sum(
+    lgrt_df_value a, lgrt_df_value b, lgrt_df_value *s, lgrt_df_value *e
+) {
+    lgrt_df_value sum = lgrt_df_cx_add(a, b);
+    lgrt_df_value b_part = lgrt_df_cx_sub(sum, a);
+    lgrt_df_value a_part = lgrt_df_cx_sub(sum, b_part);
+
+    *e = lgrt_df_cx_add(
+        lgrt_df_cx_sub(a, a_part), lgrt_df_cx_sub(b, b_part)
+    );
+    *s = sum;
+}
+
+/* The same, for a of no smaller a magnitude than b, or a zero. */
+LGRT_IBM_HELPER void lgrt_ibm_quick_sum(
+    lgrt_df_value a, lgrt_df_value b, lgrt_df_value *s, lgrt_df_value *e
+) {
+    lgrt_df_value sum = lgrt_df_cx_add(a, b);
+
+    *e = lgrt_df_cx_sub(b, lgrt_df_cx_sub(sum, a));
+    *s = sum;
+}
+
+/* a as two doubles of 26 bits at most, for a value that can take 2^27 + 1. */
+LGRT_IBM_HELPER void lgrt_ibm_split(
+    lgrt_df_value a, lgrt_df_value *high, lgrt_df_value *low
+) {
+    lgrt_df_value factor = lgrt_df_from_bits((uint64_t)0x41a0000002000000);
+    lgrt_df_value scaled = lgrt_df_cx_mul(a, factor);
+
+    *high = lgrt_df_cx_sub(scaled, lgrt_df_cx_sub(scaled, a));
+    *low = lgrt_df_cx_sub(a, *high);
+}
+
+/* p + e is exactly a * b, with p that product rounded. */
+LGRT_IBM_HELPER void lgrt_ibm_two_product(
+    lgrt_df_value a, lgrt_df_value b, lgrt_df_value *p, lgrt_df_value *e
+) {
+    lgrt_df_value product = lgrt_df_cx_mul(a, b);
+    lgrt_df_value a_high;
+    lgrt_df_value a_low;
+    lgrt_df_value b_high;
+    lgrt_df_value b_low;
+    lgrt_df_value rest;
+
+    lgrt_ibm_split(a, &a_high, &a_low);
+    lgrt_ibm_split(b, &b_high, &b_low);
+    rest = lgrt_df_cx_sub(lgrt_df_cx_mul(a_high, b_high), product);
+    rest = lgrt_df_cx_add(rest, lgrt_df_cx_mul(a_high, b_low));
+    rest = lgrt_df_cx_add(rest, lgrt_df_cx_mul(a_low, b_high));
+    *e = lgrt_df_cx_add(rest, lgrt_df_cx_mul(a_low, b_low));
+    *p = product;
+}
+
+/* The sum of two pairs. */
+LGRT_IBM_HELPER void lgrt_ibm_sum(
+    lgrt_df_value a, lgrt_df_value b, lgrt_df_value c, lgrt_df_value d,
+    lgrt_df_value *high, lgrt_df_value *low
+) {
+    lgrt_df_value s;
+    lgrt_df_value e;
+    lgrt_df_value t;
+    lgrt_df_value f;
+
+    lgrt_ibm_two_sum(a, c, &s, &e);
+    lgrt_ibm_two_sum(b, d, &t, &f);
+    lgrt_ibm_quick_sum(s, lgrt_df_cx_add(e, t), &s, &e);
+    lgrt_ibm_quick_sum(s, lgrt_df_cx_add(e, f), high, low);
+}
+
+/* A value whose second double overlaps the first, moved to where it goes. */
+LGRT_IBM_HELPER struct lgrt_ibm_bits lgrt_ibm_tidy(struct lgrt_ibm_bits x) {
+    uint64_t magnitude = x.high & (LGRT_IBM_SIGN - 1);
+    uint64_t magnitude_low = x.low & (LGRT_IBM_SIGN - 1);
+    lgrt_df_value high;
+    lgrt_df_value low;
+
+    if (magnitude >= LGRT_IBM_INF) {
+        return lgrt_ibm_make(x.high, 0);
+    }
+    if (magnitude_low == 0 || (magnitude_low >> 52) + 52 < magnitude >> 52) {
+        return x;
+    }
+    lgrt_ibm_two_sum(
+        lgrt_df_from_bits(x.high), lgrt_df_from_bits(x.low), &high, &low
+    );
+    return lgrt_ibm_pair(high, low);
+}
+
+/*
+ * The first double of a value, with its last bit set where the second double
+ * is not zero, on the side of the value: a double of the value that rounds to
+ * any narrower format as the value does.
+ */
+LGRT_IBM_HELPER uint64_t lgrt_ibm_sticky(struct lgrt_ibm_bits x) {
+    if ((x.low & (LGRT_IBM_SIGN - 1)) == 0) {
+        return x.high;
+    }
+    if (((x.high ^ x.low) & LGRT_IBM_SIGN) != 0) {
+        return (x.high - 1) | 1;
+    }
+    return x.high | 1;
+}
+
+LGRT_IBM_HELPER bool lgrt_ibm_cx_negative(struct lgrt_ibm_bits x) {
+    return (x.high & LGRT_IBM_SIGN) != 0;
+}
+
+/* The value negated is both doubles negated. */
+LGRT_IBM_HELPER struct lgrt_ibm_bits lgrt_ibm_opposite(
+    struct lgrt_ibm_bits x
+) {
+    return lgrt_ibm_make(x.high ^ LGRT_IBM_SIGN, x.low ^ LGRT_IBM_SIGN);
+}
+
+LGRT_IBM_HELPER struct lgrt_ibm_bits lgrt_ibm_cx_magnitude(
+    struct lgrt_ibm_bits x
+) {
+    return lgrt_ibm_cx_negative(x) ? lgrt_ibm_opposite(x) : x;
+}
+
+LGRT_IBM_HELPER struct lgrt_ibm_bits lgrt_ibm_cx_signed(
+    bool negative, struct lgrt_ibm_bits magnitude
+) {
+    return negative ? lgrt_ibm_opposite(magnitude) : magnitude;
+}
+
+/* Of a value without its sign. */
+LGRT_IBM_HELPER int lgrt_ibm_kind(struct lgrt_ibm_bits magnitude) {
+    if (magnitude.high == 0 && (magnitude.low & (LGRT_IBM_SIGN - 1)) != 0) {
+        return LGRT_FP_FINITE;
+    }
+    return lgrt_df_kind(magnitude.high);
+}
+
+/*
+ * As lgrt_FMT_compare: -1, 0, or 1, or unordered if either value is a NaN.
+ */
+LGRT_IBM_HELPER int lgrt_ibm_compare(
+    struct lgrt_ibm_bits a, struct lgrt_ibm_bits b, int unordered
+) {
+    struct lgrt_ibm_bits x = lgrt_ibm_tidy(a);
+    struct lgrt_ibm_bits y = lgrt_ibm_tidy(b);
+    int order = lgrt_df_compare(x.high, y.high, 2);
+
+    if (order == 0) {
+        order = lgrt_df_compare(x.low, y.low, 2);
+    }
+    return order == 2 ? unordered : order;
+}
+
+LGRT_IBM_HELPER bool lgrt_ibm_cx_less(
+    struct lgrt_ibm_bits a, struct lgrt_ibm_bits b
+) {
+    return lgrt_ibm_compare(a, b, 0) < 0;
+}
+
+/*
+ * Adds k to the exponent of a finite value. One that reaches the subnormal
+ * range of double rounds once, into the first double.
+ */
+LGRT_IBM_HELPER struct lgrt_ibm_bits lgrt_ibm_cx_scale(
+    struct lgrt_ibm_bits x, unsigned int k
+) {
+    unsigned int field = (unsigned int)(
+        (x.high & (LGRT_IBM_SIGN - 1)) >> 52
+    );
+    uint64_t high;
+
+    if ((int)(field + k) <= 0) {
+        return lgrt_ibm_make(lgrt_df_cx_scale(lgrt_ibm_sticky(x), k), 0);
+    }
+    high = lgrt_df_cx_scale(x.high, k);
+    if ((high & (LGRT_IBM_SIGN - 1)) == LGRT_IBM_INF) {
+        return lgrt_ibm_make(high, 0);
+    }
+    return lgrt_ibm_make(high, lgrt_df_cx_scale(x.low, k));
+}
+
+/* The value over the exponent of its first double, which goes in [1, 2). */
+LGRT_IBM_HELPER struct lgrt_ibm_bits lgrt_ibm_cx_split(
+    struct lgrt_ibm_bits x, unsigned int *e
+) {
+    uint64_t high;
+
+    if (lgrt_ibm_kind(lgrt_ibm_cx_magnitude(x)) == LGRT_FP_ZERO) {
+        *e = LGRT_CX_ZERO_EXPONENT(LGRT_FP_EXP_MAX(11));
+        return x;
+    }
+    high = lgrt_df_cx_split(x.high, e);
+    return lgrt_ibm_make(high, lgrt_df_cx_scale(x.low, (unsigned int)0 - *e));
+}
+
+/* As lgrt_FMT_cx_down above, for this format's 106 bits. */
+LGRT_IBM_HELPER struct lgrt_ibm_bits lgrt_ibm_cx_down(
+    struct lgrt_ibm_bits x, unsigned int n
+) {
+    if (n > 106 + 6
+     || lgrt_ibm_kind(lgrt_ibm_cx_magnitude(x)) == LGRT_FP_ZERO) {
+        return lgrt_ibm_make(x.high & LGRT_IBM_SIGN, 0);
+    }
+    return lgrt_ibm_cx_scale(x, (unsigned int)0 - n);
+}
+
+LGRT_IBM_HELPER struct lgrt_ibm_bits lgrt_ibm_finite_sum(
+    struct lgrt_ibm_bits x, struct lgrt_ibm_bits y
+) {
+    lgrt_df_value high;
+    lgrt_df_value low;
+
+    lgrt_ibm_sum(
+        lgrt_df_from_bits(x.high), lgrt_df_from_bits(x.low),
+        lgrt_df_from_bits(y.high), lgrt_df_from_bits(y.low), &high, &low
+    );
+    return lgrt_ibm_pair(high, low);
+}
+
+/*
+ * A sum can overflow on the way where a value reaches 2^1023, so both are
+ * halved there, which loses nothing that the sum can show.
+ */
+LGRT_IBM_HELPER struct lgrt_ibm_bits lgrt_ibm_add(
+    struct lgrt_ibm_bits x, struct lgrt_ibm_bits y
+) {
+    uint64_t top = (uint64_t)(LGRT_FP_EXP_MAX(11) - 1) << 52;
+    int kind_x = lgrt_ibm_kind(lgrt_ibm_cx_magnitude(x));
+    int kind_y = lgrt_ibm_kind(lgrt_ibm_cx_magnitude(y));
+
+    if (kind_x == LGRT_FP_NOT_A_NUMBER || kind_y == LGRT_FP_NOT_A_NUMBER
+     || (kind_x == LGRT_FP_INFINITE && kind_y == LGRT_FP_INFINITE
+      && lgrt_ibm_cx_negative(x) != lgrt_ibm_cx_negative(y))) {
+        return lgrt_ibm_make(LGRT_IBM_NAN, 0);
+    }
+    if (kind_x == LGRT_FP_INFINITE) {
+        return lgrt_ibm_make(x.high, 0);
+    }
+    if (kind_y == LGRT_FP_INFINITE) {
+        return lgrt_ibm_make(y.high, 0);
+    }
+    if (kind_x == LGRT_FP_ZERO && kind_y == LGRT_FP_ZERO) {
+        return lgrt_ibm_make(x.high & y.high & LGRT_IBM_SIGN, 0);
+    }
+    if ((x.high & (LGRT_IBM_SIGN - 1)) >= top
+     || (y.high & (LGRT_IBM_SIGN - 1)) >= top) {
+        return lgrt_ibm_cx_scale(
+            lgrt_ibm_finite_sum(
+                lgrt_ibm_cx_scale(x, (unsigned int)0 - 1),
+                lgrt_ibm_cx_scale(y, (unsigned int)0 - 1)
+            ),
+            1
+        );
+    }
+    return lgrt_ibm_finite_sum(x, y);
+}
+
+LGRT_IBM_HELPER struct lgrt_ibm_bits lgrt_ibm_sub(
+    struct lgrt_ibm_bits x, struct lgrt_ibm_bits y
+) {
+    return lgrt_ibm_add(x, lgrt_ibm_opposite(y));
+}
+
+LGRT_IBM_HELPER struct lgrt_ibm_bits lgrt_ibm_mul(
+    struct lgrt_ibm_bits a, struct lgrt_ibm_bits b
+) {
+    struct lgrt_ibm_bits x = lgrt_ibm_tidy(a);
+    struct lgrt_ibm_bits y = lgrt_ibm_tidy(b);
+    uint64_t sign = (x.high ^ y.high) & LGRT_IBM_SIGN;
+    int kind_x = lgrt_ibm_kind(lgrt_ibm_cx_magnitude(x));
+    int kind_y = lgrt_ibm_kind(lgrt_ibm_cx_magnitude(y));
+    unsigned int e_x;
+    unsigned int e_y;
+    lgrt_df_value x_high;
+    lgrt_df_value x_low;
+    lgrt_df_value y_high;
+    lgrt_df_value y_low;
+    lgrt_df_value product;
+    lgrt_df_value rest;
+    lgrt_df_value high;
+    lgrt_df_value low;
+
+    if (kind_x == LGRT_FP_NOT_A_NUMBER || kind_y == LGRT_FP_NOT_A_NUMBER) {
+        return lgrt_ibm_make(LGRT_IBM_NAN, 0);
+    }
+    if (kind_x == LGRT_FP_INFINITE || kind_y == LGRT_FP_INFINITE) {
+        if (kind_x == LGRT_FP_ZERO || kind_y == LGRT_FP_ZERO) {
+            return lgrt_ibm_make(LGRT_IBM_NAN, 0);
+        }
+        return lgrt_ibm_make(sign | LGRT_IBM_INF, 0);
+    }
+    if (kind_x == LGRT_FP_ZERO || kind_y == LGRT_FP_ZERO) {
+        return lgrt_ibm_make(sign, 0);
+    }
+    x = lgrt_ibm_cx_split(x, &e_x);
+    y = lgrt_ibm_cx_split(y, &e_y);
+    x_high = lgrt_df_from_bits(x.high);
+    x_low = lgrt_df_from_bits(x.low);
+    y_high = lgrt_df_from_bits(y.high);
+    y_low = lgrt_df_from_bits(y.low);
+    lgrt_ibm_two_product(x_high, y_high, &product, &rest);
+    rest = lgrt_df_cx_add(
+        rest,
+        lgrt_df_cx_add(
+            lgrt_df_cx_mul(x_high, y_low), lgrt_df_cx_mul(x_low, y_high)
+        )
+    );
+    lgrt_ibm_quick_sum(product, rest, &high, &low);
+    return lgrt_ibm_cx_scale(lgrt_ibm_pair(high, low), e_x + e_y);
+}
+
+/* The remainder (*r_high, *r_low) less q times the divisor, for the next q. */
+LGRT_IBM_HELPER void lgrt_ibm_remainder(
+    lgrt_df_value q, lgrt_df_value c, lgrt_df_value d, lgrt_df_value *r_high,
+    lgrt_df_value *r_low
+) {
+    lgrt_df_value p;
+    lgrt_df_value e;
+    uint64_t sign = LGRT_IBM_SIGN;
+
+    lgrt_ibm_two_product(q, c, &p, &e);
+    e = lgrt_df_cx_add(e, lgrt_df_cx_mul(q, d));
+    lgrt_ibm_quick_sum(p, e, &p, &e);
+    lgrt_ibm_sum(
+        *r_high, *r_low, lgrt_df_from_bits(lgrt_df_to_bits(p) ^ sign),
+        lgrt_df_from_bits(lgrt_df_to_bits(e) ^ sign), r_high, r_low
+    );
+}
+
+LGRT_IBM_HELPER struct lgrt_ibm_bits lgrt_ibm_div(
+    struct lgrt_ibm_bits a, struct lgrt_ibm_bits b
+) {
+    struct lgrt_ibm_bits x = lgrt_ibm_tidy(a);
+    struct lgrt_ibm_bits y = lgrt_ibm_tidy(b);
+    uint64_t sign = (x.high ^ y.high) & LGRT_IBM_SIGN;
+    int kind_x = lgrt_ibm_kind(lgrt_ibm_cx_magnitude(x));
+    int kind_y = lgrt_ibm_kind(lgrt_ibm_cx_magnitude(y));
+    unsigned int e_x;
+    unsigned int e_y;
+    lgrt_df_value c;
+    lgrt_df_value d;
+    lgrt_df_value r_high;
+    lgrt_df_value r_low;
+    lgrt_df_value q0;
+    lgrt_df_value q1;
+    lgrt_df_value q2;
+    lgrt_df_value high;
+    lgrt_df_value low;
+
+    if (kind_x == LGRT_FP_NOT_A_NUMBER || kind_y == LGRT_FP_NOT_A_NUMBER
+     || (kind_x == kind_y && kind_x != LGRT_FP_FINITE)) {
+        return lgrt_ibm_make(LGRT_IBM_NAN, 0);
+    }
+    if (kind_x == LGRT_FP_INFINITE || kind_y == LGRT_FP_ZERO) {
+        return lgrt_ibm_make(sign | LGRT_IBM_INF, 0);
+    }
+    if (kind_y == LGRT_FP_INFINITE || kind_x == LGRT_FP_ZERO) {
+        return lgrt_ibm_make(sign, 0);
+    }
+    x = lgrt_ibm_cx_split(x, &e_x);
+    y = lgrt_ibm_cx_split(y, &e_y);
+    c = lgrt_df_from_bits(y.high);
+    d = lgrt_df_from_bits(y.low);
+    r_high = lgrt_df_from_bits(x.high);
+    r_low = lgrt_df_from_bits(x.low);
+    q0 = lgrt_df_cx_div(r_high, c);
+    lgrt_ibm_remainder(q0, c, d, &r_high, &r_low);
+    q1 = lgrt_df_cx_div(r_high, c);
+    lgrt_ibm_remainder(q1, c, d, &r_high, &r_low);
+    q2 = lgrt_df_cx_div(r_high, c);
+    lgrt_ibm_quick_sum(q0, q1, &high, &low);
+    lgrt_ibm_sum(
+        high, low, q2, lgrt_df_from_bits((uint64_t)0), &high, &low
+    );
+    return lgrt_ibm_cx_scale(lgrt_ibm_pair(high, low), e_x - e_y);
+}
+
+#define LGRT_IBM_BINARY(name, operation) \
+    lgrt_ibm_value name( \
+        lgrt_df_value a, lgrt_df_value b, lgrt_df_value c, lgrt_df_value d \
+    ); \
+    lgrt_ibm_value name( \
+        lgrt_df_value a, lgrt_df_value b, lgrt_df_value c, lgrt_df_value d \
+    ) { \
+        return lgrt_ibm_from_bits( \
+            operation( \
+                lgrt_ibm_make(lgrt_df_to_bits(a), lgrt_df_to_bits(b)), \
+                lgrt_ibm_make(lgrt_df_to_bits(c), lgrt_df_to_bits(d)) \
+            ) \
+        ); \
+    }
+
+LGRT_IBM_BINARY(__gcc_qadd, lgrt_ibm_add)
+LGRT_IBM_BINARY(__gcc_qsub, lgrt_ibm_sub)
+LGRT_IBM_BINARY(__gcc_qmul, lgrt_ibm_mul)
+LGRT_IBM_BINARY(__gcc_qdiv, lgrt_ibm_div)
+
+/* GCC calls these by those other names with -mxl-compat. */
+#define LGRT_IBM_BINARY_ALIAS(name, target) \
+    LGRT_FP_ALIAS( \
+        lgrt_ibm_value, name, target, \
+        (lgrt_df_value a, lgrt_df_value b, lgrt_df_value c, lgrt_df_value d) \
+    )
+
+LGRT_IBM_BINARY_ALIAS(_xlqadd, "__gcc_qadd")
+LGRT_IBM_BINARY_ALIAS(_xlqsub, "__gcc_qsub")
+LGRT_IBM_BINARY_ALIAS(_xlqmul, "__gcc_qmul")
+LGRT_IBM_BINARY_ALIAS(_xlqdiv, "__gcc_qdiv")
+
+/*
+ * The integer part of a double without its sign, modulo 2^IW, and whether
+ * there is more to it.
+ */
+LGRT_IBM_HELPER bool lgrt_ibm_has_fraction(uint64_t magnitude) {
+    unsigned int field = (unsigned int)(magnitude >> 52);
+
+    if (field < LGRT_FP_BIAS(11)) {
+        return magnitude != 0;
+    }
+    field -= LGRT_FP_BIAS(11);
+    return field < 52
+        && (magnitude & (((uint64_t)1 << (52 - field)) - 1)) != 0;
+}
+
+#define LGRT_IBM_INTEGER(mode, U, IW) \
+    LGRT_IBM_HELPER U lgrt_ibm_integer_##mode(uint64_t magnitude) { \
+        uint64_t int_bit = LGRT_FP_INT_BIT(uint64_t, 52); \
+        uint64_t sig = (magnitude & (int_bit - 1)) | int_bit; \
+        unsigned int field = (unsigned int)(magnitude >> 52); \
+        \
+        if (field < LGRT_FP_BIAS(11)) { \
+            return 0; \
+        } \
+        field -= LGRT_FP_BIAS(11); \
+        if (field >= (IW) + 52) { \
+            return 0; \
+        } \
+        if (field >= 52) { \
+            return (U)sig << (field - 52); \
+        } \
+        return (U)(sig >> (52 - field)); \
+    }
+
+/*
+ * Conversions to integers truncate the sum of both doubles. A second double
+ * opposite to the first takes off its integer part, and 1 more if that leaves
+ * a fraction, which it can only do where the first has none. These give the
+ * nearest integer of the type out of range, and zero for a NaN. In
+ * lgrt_ibm_wrap_MODE, a negative value goes as in the signed conversion, and
+ * its integer is cast to the unsigned type. A first double of 2^IW has an
+ * integer part of 0 modulo that, from which a second double takes the rest.
+ */
+#define LGRT_IBM_TO_INT(mode, I, U, IW) \
+    LGRT_IBM_INTEGER(mode, U, IW) \
+    \
+    LGRT_IBM_HELPER U lgrt_ibm_fix_##mode(struct lgrt_ibm_bits x, U limit) { \
+        uint64_t mask = LGRT_IBM_SIGN - 1; \
+        uint64_t high = x.high & mask; \
+        uint64_t low = x.low & mask; \
+        uint64_t edge = (uint64_t)(LGRT_FP_BIAS(11) + (IW)) << 52; \
+        bool below = ((x.high ^ x.low) & LGRT_IBM_SIGN) != 0 && low != 0; \
+        U value = lgrt_ibm_integer_##mode(high); \
+        \
+        if (high > LGRT_IBM_INF) { \
+            return 0; \
+        } \
+        if (high > edge || (high == edge && !below)) { \
+            return limit; \
+        } \
+        if (below) { \
+            value -= lgrt_ibm_integer_##mode(low); \
+            if (!lgrt_ibm_has_fraction(high) && lgrt_ibm_has_fraction(low)) { \
+                value -= 1; \
+            } \
+        } else { \
+            value += lgrt_ibm_integer_##mode(low); \
+        } \
+        return value > limit ? limit : value; \
+    } \
+    \
+    LGRT_IBM_HELPER I lgrt_ibm_to_##mode(struct lgrt_ibm_bits x) { \
+        U top = (U)1 << ((IW) - 1); \
+        \
+        if (lgrt_ibm_cx_negative(x)) { \
+            return (I)((U)0 - lgrt_ibm_fix_##mode(x, top)); \
+        } \
+        return (I)lgrt_ibm_fix_##mode(x, top - 1); \
+    } \
+    \
+    LGRT_IBM_HELPER U lgrt_ibm_to_uns##mode(struct lgrt_ibm_bits x) { \
+        if (lgrt_ibm_cx_negative(x)) { \
+            return 0; \
+        } \
+        return lgrt_ibm_fix_##mode(x, (U)0 - 1); \
+    } \
+    \
+    LGRT_IBM_HELPER U lgrt_ibm_wrap_##mode(struct lgrt_ibm_bits x) { \
+        if (lgrt_ibm_cx_negative(x)) { \
+            return (U)0 - lgrt_ibm_fix_##mode(x, (U)1 << ((IW) - 1)); \
+        } \
+        return lgrt_ibm_fix_##mode(x, (U)0 - 1); \
+    }
+
+/*
+ * Conversions from integers. The first double is the integer rounded, which
+ * may take it to 2^IW, so the second double is the difference modulo that, as
+ * a signed value, rounded in turn.
+ */
+#define LGRT_IBM_FROM_INT(mode, I, U, IW) \
+    LGRT_IBM_HELPER struct lgrt_ibm_bits lgrt_ibm_float_##mode( \
+        bool negative, U value \
+    ) { \
+        uint64_t high = lgrt_df_float_##mode(0, value); \
+        U rest = value - lgrt_ibm_integer_##mode(high); \
+        bool below = (rest >> ((IW) - 1)) != 0; \
+        struct lgrt_ibm_bits x = lgrt_ibm_make( \
+            high, lgrt_df_float_##mode(0, below ? (U)0 - rest : rest) \
+        ); \
+        \
+        if (below) { \
+            x.low ^= LGRT_IBM_SIGN; \
+        } \
+        if (negative) { \
+            x.high ^= LGRT_IBM_SIGN; \
+            if (rest != 0) { \
+                x.low ^= LGRT_IBM_SIGN; \
+            } \
+        } \
+        return x; \
+    } \
+    \
+    LGRT_IBM_HELPER struct lgrt_ibm_bits lgrt_ibm_from_##mode(I i) { \
+        return lgrt_ibm_float_##mode(i < 0, i < 0 ? (U)0 - (U)i : (U)i); \
+    }
+
+LGRT_IBM_TO_INT(si, int32_t, uint32_t, 32)
+LGRT_IBM_TO_INT(di, int64_t, uint64_t, 64)
+LGRT_IBM_FROM_INT(si, int32_t, uint32_t, 32)
+LGRT_IBM_FROM_INT(di, int64_t, uint64_t, 64)
+
+#define LGRT_IBM_TO_NAMED(R, name, value) \
+    R name(lgrt_ibm_value a); \
+    R name(lgrt_ibm_value a) { \
+        struct lgrt_ibm_bits x = lgrt_ibm_tidy(lgrt_ibm_to_bits(a)); \
+        \
+        return value; \
+    }
+
+#define LGRT_IBM_FROM_NAMED(P, name, value) \
+    lgrt_ibm_value name(P i); \
+    lgrt_ibm_value name(P i) { \
+        return lgrt_ibm_from_bits(value); \
+    }
+
+LGRT_IBM_TO_NAMED(int64_t, __fixtfdi, lgrt_ibm_to_di(x))
+LGRT_IBM_TO_NAMED(uint64_t, __fixunstfdi, lgrt_ibm_to_unsdi(x))
+LGRT_IBM_FROM_NAMED(int64_t, __floatditf, lgrt_ibm_from_di(i))
+LGRT_IBM_FROM_NAMED(uint64_t, __floatunditf, lgrt_ibm_float_di(false, i))
+
+#if LGRT_HAS_INT128
+LGRT_IBM_TO_INT(ti, lgrt_i128, lgrt_u128, 128)
+LGRT_IBM_FROM_INT(ti, lgrt_i128, lgrt_u128, 128)
+LGRT_IBM_TO_NAMED(lgrt_i128, __fixtfti, lgrt_ibm_to_ti(x))
+LGRT_IBM_TO_NAMED(lgrt_u128, __fixunstfti, lgrt_ibm_to_unsti(x))
+LGRT_IBM_FROM_NAMED(lgrt_i128, __floattitf, lgrt_ibm_from_ti(i))
+LGRT_IBM_FROM_NAMED(lgrt_u128, __floatuntitf, lgrt_ibm_float_ti(false, i))
+#endif
+
+/*
+ * Hard float does the rest inline. Without floating-point registers, these
+ * come as the arithmetic does, with each long double as two doubles, and their
+ * values are as the usual comparisons have them. Clang calls __gcc_qtou for
+ * signed int too, and GCC for unsigned int, so it takes the range of both.
+ */
+#if defined(__NO_FPRS__)
+
+#define LGRT_IBM_COMPARE(name, unordered) \
+    lgrt_fp_cmp name( \
+        lgrt_df_value a, lgrt_df_value b, lgrt_df_value c, lgrt_df_value d \
+    ); \
+    lgrt_fp_cmp name( \
+        lgrt_df_value a, lgrt_df_value b, lgrt_df_value c, lgrt_df_value d \
+    ) { \
+        return lgrt_ibm_compare( \
+            lgrt_ibm_make(lgrt_df_to_bits(a), lgrt_df_to_bits(b)), \
+            lgrt_ibm_make(lgrt_df_to_bits(c), lgrt_df_to_bits(d)), unordered \
+        ); \
+    }
+
+#define LGRT_IBM_COMPARE_ALIAS(name, target) \
+    LGRT_FP_ALIAS( \
+        lgrt_fp_cmp, name, target, \
+        (lgrt_df_value a, lgrt_df_value b, lgrt_df_value c, lgrt_df_value d) \
+    )
+
+LGRT_IBM_COMPARE(__gcc_qlt, 1)
+LGRT_IBM_COMPARE_ALIAS(__gcc_qle, "__gcc_qlt")
+LGRT_IBM_COMPARE_ALIAS(__gcc_qeq, "__gcc_qlt")
+LGRT_IBM_COMPARE_ALIAS(__gcc_qne, "__gcc_qlt")
+LGRT_IBM_COMPARE(__gcc_qgt, -1)
+LGRT_IBM_COMPARE_ALIAS(__gcc_qge, "__gcc_qgt")
+
+lgrt_fp_cmp __gcc_qunord(
+    lgrt_df_value a, lgrt_df_value b, lgrt_df_value c, lgrt_df_value d
+);
+lgrt_fp_cmp __gcc_qunord(
+    lgrt_df_value a, lgrt_df_value b, lgrt_df_value c, lgrt_df_value d
+) {
+    return lgrt_ibm_compare(
+        lgrt_ibm_make(lgrt_df_to_bits(a), lgrt_df_to_bits(b)),
+        lgrt_ibm_make(lgrt_df_to_bits(c), lgrt_df_to_bits(d)), 2
+    ) == 2;
+}
+
+lgrt_ibm_value __gcc_qneg(lgrt_df_value a, lgrt_df_value b);
+lgrt_ibm_value __gcc_qneg(lgrt_df_value a, lgrt_df_value b) {
+    return lgrt_ibm_from_bits(
+        lgrt_ibm_opposite(
+            lgrt_ibm_make(lgrt_df_to_bits(a), lgrt_df_to_bits(b))
+        )
+    );
+}
+
+LGRT_IBM_FROM_NAMED(
+    lgrt_sf_value, __gcc_stoq,
+    lgrt_ibm_make(lgrt_df_from_sf(lgrt_sf_to_bits(i)), 0)
+)
+LGRT_IBM_FROM_NAMED(
+    lgrt_df_value, __gcc_dtoq, lgrt_ibm_make(lgrt_df_to_bits(i), 0)
+)
+LGRT_IBM_FROM_NAMED(int32_t, __gcc_itoq, lgrt_ibm_from_si(i))
+LGRT_IBM_FROM_NAMED(
+    lgrt_fp_unsigned_si, __gcc_utoq, lgrt_ibm_float_si(false, (uint32_t)i)
+)
+
+lgrt_sf_value __gcc_qtos(lgrt_df_value a, lgrt_df_value b);
+lgrt_sf_value __gcc_qtos(lgrt_df_value a, lgrt_df_value b) {
+    struct lgrt_ibm_bits x = lgrt_ibm_tidy(
+        lgrt_ibm_make(lgrt_df_to_bits(a), lgrt_df_to_bits(b))
+    );
+
+    return lgrt_sf_from_bits(lgrt_df_to_sf(lgrt_ibm_sticky(x)));
+}
+
+lgrt_df_value __gcc_qtod(lgrt_df_value a, lgrt_df_value b);
+lgrt_df_value __gcc_qtod(lgrt_df_value a, lgrt_df_value b) {
+    if ((lgrt_df_to_bits(a) & (LGRT_IBM_SIGN - 1)) >= LGRT_IBM_INF) {
+        return a;
+    }
+    return lgrt_df_cx_add(a, b);
+}
+
+#define LGRT_IBM_TO_DOUBLES(R, name, value) \
+    R name(lgrt_df_value a, lgrt_df_value b); \
+    R name(lgrt_df_value a, lgrt_df_value b) { \
+        struct lgrt_ibm_bits x = lgrt_ibm_tidy( \
+            lgrt_ibm_make(lgrt_df_to_bits(a), lgrt_df_to_bits(b)) \
+        ); \
+        \
+        return value; \
+    }
+
+LGRT_IBM_TO_DOUBLES(int32_t, __gcc_qtoi, lgrt_ibm_to_si(x))
+LGRT_IBM_TO_DOUBLES(uint32_t, __gcc_qtou, lgrt_ibm_wrap_si(x))
+LGRT_IBM_TO_NAMED(uint32_t, __fixunstfsi, lgrt_ibm_to_unssi(x))
+
+#endif
+
+/*
+ * Complex values and powers, for long double alone. Clang also calls the first
+ * two by these names for complex __float128, which cannot be told from here.
+ */
+#if __LDBL_MANT_DIG__ == 106
+
+__extension__ typedef _Complex long double lgrt_ibm_complex;
+
+LGRT_IBM_HELPER struct lgrt_ibm_bits lgrt_ibm_tidy_bits(lgrt_ibm_value value) {
+    return lgrt_ibm_tidy(lgrt_ibm_to_bits(value));
+}
+
+LGRT_CX_FP_OPERATIONS(
+    ibm, lgrt_ibm_value, struct lgrt_ibm_bits, lgrt_ibm_tidy_bits,
+    lgrt_ibm_from_bits
+)
+LGRT_CX_SPECIAL_VALUES(
+    ibm, struct lgrt_ibm_bits, lgrt_ibm_make(0, 0), lgrt_ibm_make(1, 0),
+    lgrt_ibm_make(LGRT_IBM_INF, 0), lgrt_ibm_make(LGRT_IBM_NAN, 0)
+)
+LGRT_CX_MULTIPLY(ibm, lgrt_ibm_value, struct lgrt_ibm_bits)
+LGRT_CX_DIVIDE(
+    ibm, lgrt_ibm_value, struct lgrt_ibm_bits, lgrt_ibm_make(LGRT_IBM_NAN, 0),
+    lgrt_ibm_make(0, 0)
+)
+LGRT_CX_POWER(
+    ibm, lgrt_ibm_value, struct lgrt_ibm_bits, lgrt_ibm_make(0, 0),
+    lgrt_ibm_make(LGRT_IBM_INF, 0), lgrt_ibm_make(LGRT_IBM_ONE, 0)
+)
+LGRT_CX_NAMED_ROUTINES(
+    ibm, lgrt_ibm_value, lgrt_ibm_complex, __multc3, __divtc3, __powitf2
+)
+
+#endif
+
+#endif
+
+#if LGRT_SOFT_QUAD
+
+#if defined(__powerpc__) && defined(__FLOAT128__)
+__extension__ typedef _Complex float lgrt_quad_complex
+    __attribute__((__mode__(__KC__)));
+#elif __LDBL_MANT_DIG__ == 113
+__extension__ typedef _Complex long double lgrt_quad_complex;
+#else
+__extension__ typedef _Complex float lgrt_quad_complex
+    __attribute__((__mode__(__TC__)));
+#endif
+
+#define LGRT_QUAD_COMPLEX_ROUTINES(fmt, cfmt) \
+    LGRT_CX_FP_OPERATIONS( \
+        fmt, lgrt_quad_value, struct lgrt_wide, lgrt_##fmt##_to_bits, \
+        lgrt_##fmt##_from_bits \
+    ) \
+    LGRT_CX_WIDE(fmt, lgrt_quad_value, 32767, 112) \
+    LGRT_CX_ROUTINES(fmt, cfmt, lgrt_quad_value, lgrt_quad_complex)
+
+/* The same choice of names as the routines of the format. */
+#if defined(__powerpc__) \
+ && (defined(__FLOAT128__) || defined(__VSX__) || defined(__clang__))
+
+LGRT_QUAD_COMPLEX_ROUTINES(kf, kc)
+
+/* Clang calls these by the usual names for IEEE long double. */
+#if defined(__clang__) && defined(__LONG_DOUBLE_IEEE128__)
+#define LGRT_KC_ALIAS(name, target) \
+    LGRT_FP_ALIAS( \
+        lgrt_quad_complex, name, target, \
+        (lgrt_quad_value a, lgrt_quad_value b, lgrt_quad_value c, \
+         lgrt_quad_value d) \
+    )
+
+LGRT_KC_ALIAS(__multc3, "__mulkc3")
+LGRT_KC_ALIAS(__divtc3, "__divkc3")
+#endif
+
+#else
+
+LGRT_QUAD_COMPLEX_ROUTINES(tf, tc)
+
+#endif
+
+#elif LGRT_QUAD_OWN_NAMES
+
+/*
+ * SPARC and Alpha call routines of other names for quad arithmetic, so these
+ * go on the bits, and long double only passes through them.
+ */
+LGRT_CX_WIDE_OPERATIONS(tf)
+LGRT_CX_WIDE(tf, struct lgrt_wide, 32767, 112)
+
+__extension__ typedef _Complex long double lgrt_tc_value;
+
+#define LGRT_TC_ROUTINE(name, operation) \
+    lgrt_tc_value name( \
+        lgrt_quad_value a, lgrt_quad_value b, lgrt_quad_value c, \
+        lgrt_quad_value d \
+    ); \
+    lgrt_tc_value name( \
+        lgrt_quad_value a, lgrt_quad_value b, lgrt_quad_value c, \
+        lgrt_quad_value d \
+    ) { \
+        struct lgrt_wide parts[2]; \
+        lgrt_quad_value results[2]; \
+        lgrt_tc_value z; \
+        \
+        operation( \
+            lgrt_tf_to_bits(a), lgrt_tf_to_bits(b), lgrt_tf_to_bits(c), \
+            lgrt_tf_to_bits(d), parts \
+        ); \
+        results[0] = lgrt_tf_from_bits(parts[0]); \
+        results[1] = lgrt_tf_from_bits(parts[1]); \
+        __builtin_memcpy(&z, results, sizeof(results)); \
+        return z; \
+    }
+
+LGRT_TC_ROUTINE(__multc3, lgrt_tf_cx_multiply)
+LGRT_TC_ROUTINE(__divtc3, lgrt_tf_cx_divide)
+
+#if defined(__sparc__) && LGRT_TF_IN_REGISTERS
+
+lgrt_tf_registers __powitf2(uint64_t high, uint64_t low, int n);
+lgrt_tf_registers __powitf2(uint64_t high, uint64_t low, int n) {
+    return lgrt_tf_to_registers(
+        lgrt_tf_cx_power(lgrt_wide_make(high, low), n)
+    );
+}
+
+#else
+
+lgrt_quad_value __powitf2(lgrt_quad_value x, lgrt_powi_exponent n);
+lgrt_quad_value __powitf2(lgrt_quad_value x, lgrt_powi_exponent n) {
+    return lgrt_tf_from_bits(lgrt_tf_cx_power(lgrt_tf_to_bits(x), (int)n));
+}
+
+#endif
+
+#endif
+
+/*
+ * C has no name for a complex value of the x87 format where it is not that of
+ * long double, so there is nothing to call these for there.
+ */
+#if !LGRT_SOFT_XF || __LDBL_MANT_DIG__ != 64
+#elif LGRT_XF_RETURNED
+
+__extension__ typedef _Complex long double lgrt_xc_value;
+
+#if defined(__m68k__)
+
+static inline struct lgrt_wide lgrt_xf_value_bits(lgrt_xf_value value) {
+    struct lgrt_xf_words words;
+
+    __builtin_memcpy(&words, &value, sizeof(struct lgrt_xf_words));
+    return lgrt_xf_to_bits(words);
+}
+
+LGRT_CX_FP_OPERATIONS(
+    xf, lgrt_xf_value, struct lgrt_wide, lgrt_xf_value_bits, lgrt_xf_from_bits
+)
+
+#else
+
+LGRT_CX_FP_OPERATIONS(
+    xf, lgrt_xf_value, struct lgrt_wide, lgrt_xf_to_bits, lgrt_xf_from_bits
+)
+
+#endif
+
+LGRT_CX_WIDE(xf, lgrt_xf_value, LGRT_XF_EXP_MAX, 63)
+LGRT_CX_ROUTINES(xf, xc, lgrt_xf_value, lgrt_xc_value)
+
+#elif defined(__clang__)
+
+/*
+ * Clang has no long double to write these with, as the conversions above say,
+ * so they go on the bits. x86-64 returns a complex one on the x87 stack, its
+ * real part on top, and IA-32 in memory, as it does a structure of its size.
+ */
+LGRT_CX_WIDE_OPERATIONS(xf)
+LGRT_CX_WIDE(xf, struct lgrt_wide, LGRT_XF_EXP_MAX, 63)
+
+#if defined(__x86_64__)
+
+#define LGRT_XC_ROUTINE(name, operation) \
+    void name( \
+        LGRT_XF_PARAMETER a, lgrt_xf_argument b, lgrt_xf_argument c, \
+        lgrt_xf_argument d \
+    ); \
+    void name( \
+        LGRT_XF_PARAMETER a, lgrt_xf_argument b, lgrt_xf_argument c, \
+        lgrt_xf_argument d \
+    ) { \
+        struct lgrt_wide parts[2]; \
+        struct lgrt_wide real_part; \
+        struct lgrt_wide imaginary_part; \
+        \
+        operation( \
+            lgrt_xf_to_bits(a), lgrt_xf_to_bits(b), lgrt_xf_to_bits(c), \
+            lgrt_xf_to_bits(d), parts \
+        ); \
+        real_part = lgrt_xf_encode(parts[0]); \
+        imaginary_part = lgrt_xf_encode(parts[1]); \
+        __asm__ ( \
+            "fldt %0\n\t" \
+            "fldt %1" \
+            : \
+            : "m"(imaginary_part), "m"(real_part) \
+        ); \
+    }
+
+/* Its int goes in the first of the registers that the other routines skip. */
+void __powixf2(
+    int n, uint64_t rsi LGRT_XF_IGNORED, uint64_t rdx LGRT_XF_IGNORED,
+    uint64_t rcx LGRT_XF_IGNORED, uint64_t r8 LGRT_XF_IGNORED,
+    uint64_t r9 LGRT_XF_IGNORED, lgrt_xf_argument x
+);
+void __powixf2(
+    int n, uint64_t rsi LGRT_XF_IGNORED, uint64_t rdx LGRT_XF_IGNORED,
+    uint64_t rcx LGRT_XF_IGNORED, uint64_t r8 LGRT_XF_IGNORED,
+    uint64_t r9 LGRT_XF_IGNORED, lgrt_xf_argument x
+) {
+    lgrt_xf_return(lgrt_xf_cx_power(lgrt_xf_to_bits(x), n));
+}
+
+#else
+
+struct lgrt_xc_value {
+    lgrt_xf_argument parts[2];
+};
+
+#define LGRT_XC_ROUTINE(name, operation) \
+    struct lgrt_xc_value name( \
+        lgrt_xf_argument a, lgrt_xf_argument b, lgrt_xf_argument c, \
+        lgrt_xf_argument d \
+    ); \
+    struct lgrt_xc_value name( \
+        lgrt_xf_argument a, lgrt_xf_argument b, lgrt_xf_argument c, \
+        lgrt_xf_argument d \
+    ) { \
+        struct lgrt_wide parts[2]; \
+        struct lgrt_wide raw; \
+        struct lgrt_xc_value z; \
+        \
+        operation( \
+            lgrt_xf_to_bits(a), lgrt_xf_to_bits(b), lgrt_xf_to_bits(c), \
+            lgrt_xf_to_bits(d), parts \
+        ); \
+        raw = lgrt_xf_encode(parts[0]); \
+        __builtin_memcpy(&z.parts[0], &raw, sizeof(lgrt_xf_argument)); \
+        raw = lgrt_xf_encode(parts[1]); \
+        __builtin_memcpy(&z.parts[1], &raw, sizeof(lgrt_xf_argument)); \
+        return z; \
+    }
+
+void __powixf2(lgrt_xf_argument x, int n);
+void __powixf2(lgrt_xf_argument x, int n) {
+    lgrt_xf_return(lgrt_xf_cx_power(lgrt_xf_to_bits(x), n));
+}
+
+#endif
+
+LGRT_XC_ROUTINE(__mulxc3, lgrt_xf_cx_multiply)
+LGRT_XC_ROUTINE(__divxc3, lgrt_xf_cx_divide)
+
+#endif
 
 #endif
 
@@ -6679,6 +12471,103 @@ int32_t __mspabi_mpyl(
 ) __attribute__((__alias__("__mulsi3")));
 
 #endif
+
+/*
+ * GCC does the same for most of the floating-point routines, which this block
+ * covers for Clang. The others follow it, for both. The run-time ABI leaves
+ * the result of a comparison undefined for unordered operands, which Clang
+ * passes all the same: the first operand counts as greater, as in __ltsf2.
+ */
+#if defined(__clang__)
+
+LGRT_MSP430_FROM_64("__mspabi_addd", "__adddf3")
+LGRT_MSP430_FROM_64("__mspabi_subd", "__subdf3")
+LGRT_MSP430_FROM_64("__mspabi_mpyd", "__muldf3")
+LGRT_MSP430_FROM_64("__mspabi_divd", "__divdf3")
+
+LGRT_FP_ALIAS(uint32_t, __mspabi_addf, "__addsf3", (uint32_t a, uint32_t b))
+LGRT_FP_ALIAS(uint32_t, __mspabi_subf, "__subsf3", (uint32_t a, uint32_t b))
+LGRT_FP_ALIAS(uint32_t, __mspabi_mpyf, "__mulsf3", (uint32_t a, uint32_t b))
+LGRT_FP_ALIAS(uint32_t, __mspabi_divf, "__divsf3", (uint32_t a, uint32_t b))
+LGRT_FP_ALIAS(uint32_t, __mspabi_cvtdf, "__truncdfsf2", (uint64_t a))
+LGRT_FP_ALIAS(uint64_t, __mspabi_cvtfd, "__extendsfdf2", (uint32_t a))
+LGRT_FP_ALIAS(int32_t, __mspabi_fixdli, "__fixdfsi", (uint64_t a))
+LGRT_FP_ALIAS(int64_t, __mspabi_fixdlli, "__fixdfdi", (uint64_t a))
+LGRT_FP_ALIAS(uint32_t, __mspabi_fixdul, "__fixunsdfsi", (uint64_t a))
+LGRT_FP_ALIAS(uint64_t, __mspabi_fixdull, "__fixunsdfdi", (uint64_t a))
+LGRT_FP_ALIAS(int32_t, __mspabi_fixfli, "__fixsfsi", (uint32_t a))
+LGRT_FP_ALIAS(int64_t, __mspabi_fixflli, "__fixsfdi", (uint32_t a))
+LGRT_FP_ALIAS(uint64_t, __mspabi_fltlid, "__floatsidf", (int32_t a))
+LGRT_FP_ALIAS(uint64_t, __mspabi_fltllid, "__floatdidf", (int64_t a))
+LGRT_FP_ALIAS(uint64_t, __mspabi_fltuld, "__floatunsidf", (uint32_t a))
+LGRT_FP_ALIAS(uint64_t, __mspabi_fltulld, "__floatundidf", (uint64_t a))
+LGRT_FP_ALIAS(uint32_t, __mspabi_fltlif, "__floatsisf", (int32_t a))
+LGRT_FP_ALIAS(uint32_t, __mspabi_fltllif, "__floatdisf", (int64_t a))
+LGRT_FP_ALIAS(uint32_t, __mspabi_fltulf, "__floatunsisf", (uint32_t a))
+LGRT_FP_ALIAS(uint32_t, __mspabi_fltullf, "__floatundisf", (uint64_t a))
+
+#endif
+
+LGRT_MSP430_FROM_64("__mspabi_cmpd", "__ltdf2")
+
+LGRT_FP_ALIAS(int, __mspabi_cmpf, "__ltsf2", (uint32_t a, uint32_t b))
+LGRT_FP_ALIAS(uint32_t, __mspabi_negf, "__negsf2", (uint32_t a))
+LGRT_FP_ALIAS(uint64_t, __mspabi_negd, "__negdf2", (uint64_t a))
+LGRT_FP_ALIAS(uint32_t, __mspabi_fixful, "__fixunssfsi", (uint32_t a))
+LGRT_FP_ALIAS(uint64_t, __mspabi_fixfull, "__fixunssfdi", (uint32_t a))
+
+/* From and to integers of 16 bits, out of range the same as those of 32. */
+
+static inline int16_t lgrt_msp430_nearest_i16(int32_t a) {
+    if (a > INT16_MAX) {
+        return INT16_MAX;
+    }
+    return a < INT16_MIN ? INT16_MIN : (int16_t)a;
+}
+
+static inline uint16_t lgrt_msp430_nearest_u16(uint32_t a) {
+    return a > UINT16_MAX ? UINT16_MAX : (uint16_t)a;
+}
+
+int16_t __mspabi_fixfi(uint32_t a);
+int16_t __mspabi_fixfi(uint32_t a) {
+    return lgrt_msp430_nearest_i16(__fixsfsi(a));
+}
+
+uint16_t __mspabi_fixfu(uint32_t a);
+uint16_t __mspabi_fixfu(uint32_t a) {
+    return lgrt_msp430_nearest_u16(__fixunssfsi(a));
+}
+
+int16_t __mspabi_fixdi(uint64_t a);
+int16_t __mspabi_fixdi(uint64_t a) {
+    return lgrt_msp430_nearest_i16(__fixdfsi(a));
+}
+
+uint16_t __mspabi_fixdu(uint64_t a);
+uint16_t __mspabi_fixdu(uint64_t a) {
+    return lgrt_msp430_nearest_u16(__fixunsdfsi(a));
+}
+
+uint32_t __mspabi_fltif(int16_t a);
+uint32_t __mspabi_fltif(int16_t a) {
+    return __floatsisf(a);
+}
+
+uint32_t __mspabi_fltuf(uint16_t a);
+uint32_t __mspabi_fltuf(uint16_t a) {
+    return __floatunsisf(a);
+}
+
+uint64_t __mspabi_fltid(int16_t a);
+uint64_t __mspabi_fltid(int16_t a) {
+    return __floatsidf(a);
+}
+
+uint64_t __mspabi_fltud(uint16_t a);
+uint64_t __mspabi_fltud(uint16_t a) {
+    return __floatunsidf(a);
+}
 
 int32_t __mspabi_mpysl(int16_t a, int16_t b);
 int32_t __mspabi_mpysl(int16_t a, int16_t b) {
