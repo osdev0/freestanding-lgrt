@@ -9959,10 +9959,10 @@ LGRT_FX_PLAIN_MUL(usa, USA, 32, uint32_t, false)
 
 /*
  * What stdfix.h asks of the compiler. A count at or above the fractional bits
- * leaves all of them, as a constant count does, and one that leaves no bit of
- * value gives 0. Adding half of the last place left rounds to the nearest
- * value, with ties up, and only overflows upwards, to the limit of the type,
- * whose fractional bits stay. Otherwise the bits below that place go.
+ * leaves all of them, and a negative one that leaves no bit of value gives 0.
+ * Adding half of the last place left rounds to the nearest value, with ties
+ * up, and only overflows upwards, to the limit of the type, whose fractional
+ * bits stay. Otherwise the bits below that place go.
  */
 #define LGRT_FX_ROUNDING(N, L) \
     LGRT_FX_INLINE L lgrt_fx_round##N( \
@@ -9975,7 +9975,7 @@ LGRT_FX_PLAIN_MUL(usa, USA, 32, uint32_t, false)
         if (n >= (int)f) { \
             return x; \
         } \
-        if (count >= w - (unsigned int)is_signed) { \
+        if (n < 0 && count >= w - (unsigned int)is_signed) { \
             return 0; \
         } \
         half = (L)1 << (count - 1); \
@@ -10640,8 +10640,22 @@ LGRT_FX_SHARED_FROM_FP(64, uint64_t, df, uint64_t)
         ); \
     }
 
+/*
+ * Without saturation, a signed type of up to 16 bits is the top of a result of
+ * 32 bits, which rounds down from there, what that truncates being finer.
+ */
+#define LGRT_FX_BELOW_TOP(W) ((W) <= 16 ? 32 - (W) : 0)
+
 #define LGRT_FX_FROM_FP_ROUTINE(op, m, Wm, Fm, Sm, fmt, C, T, N, saturating) \
     lgrt_fx_##m LGRT_FX_NAME(op##fmt##m)(C a) { \
+        if ((Sm) && !(saturating) && (Wm) <= 16) { \
+            uint32_t top = (uint32_t)LGRT_FX_SHARED_FROM_FP_AT(fmt, N)( \
+                a, \
+                LGRT_FX_PACK(32, (Fm) + LGRT_FX_BELOW_TOP(Wm), true, false) \
+            ); \
+            \
+            return lgrt_fx_value_##m(top >> LGRT_FX_BELOW_TOP(Wm)); \
+        } \
         return lgrt_fx_value_##m(LGRT_FX_SHARED_FROM_FP_AT(fmt, N)( \
             a, LGRT_FX_PACK(Wm, Fm, Sm, saturating) \
         )); \
@@ -10721,6 +10735,2221 @@ LGRT_FX_CONVERSIONS(uta)
 #elif defined(__AVR__)
 LGRT_FX_CONVERSIONS(ta)
 LGRT_FX_CONVERSIONS(uta)
+#endif
+
+#endif
+
+/*
+ * Decimal floating point, which only GCC has. It stores significands as binary
+ * integers on x86 and AArch64, telling of it with __DECIMAL_BID_FORMAT__, and
+ * as densely packed decimal on PowerPC and s390. Before GCC 10, it defines
+ * __DEC32_MANT_DIG__ on all targets, whether they have these types or not.
+ * These values travel in the registers of float, so their routines go by the
+ * same condition. They round to nearest, with ties to even, and raise nothing.
+ */
+#if defined(__DECIMAL_BID_FORMAT__)
+#define LGRT_DEC_NAME(name) __bid_##name
+#elif defined(__DEC32_MANT_DIG__) \
+ && (__GNUC__ >= 10 || defined(__powerpc__) || defined(__s390__))
+#define LGRT_DEC_NAME(name) __dpd_##name
+#endif
+
+#if defined(LGRT_DEC_NAME) && LGRT_SOFT_FLOAT
+
+/* In strict modes, GCC before 10 has no keywords for these. */
+typedef float lgrt_sd_value __attribute__((__mode__(__SD__)));
+typedef float lgrt_dd_value __attribute__((__mode__(__DD__)));
+typedef float lgrt_td_value __attribute__((__mode__(__TD__)));
+
+/* All arithmetic stays within 32 bits with limbs of 4 digits. */
+#define LGRT_DEC_BASE ((uint32_t)10000)
+#define LGRT_DEC_LIMBS 9
+#define LGRT_DEC_WIDE_LIMBS 18
+
+#define LGRT_DEC_FINITE 0
+#define LGRT_DEC_INFINITE 1
+#define LGRT_DEC_QUIET 2
+#define LGRT_DEC_SIGNALLING 3
+
+/*
+ * A finite number is (-1)^negative * coefficient * 10^exponent, with the limbs
+ * of the coefficient little end first. A NaN's coefficient is its payload.
+ */
+struct lgrt_dec {
+    int kind;
+    int32_t exponent;
+    uint32_t coefficient[LGRT_DEC_LIMBS];
+    bool negative;
+};
+
+/* A format is known by how many words of 32 bits it has: 1, 2, or 4. */
+static size_t lgrt_dec_precision(size_t words) {
+    return 9 * words - 2;
+}
+
+static size_t lgrt_dec_limbs(size_t words) {
+    return (lgrt_dec_precision(words) + 3) >> 2;
+}
+
+/*
+ * Limbs that hold all that an operation works on before it rounds: twice the
+ * precision and 2 digits, with 1 digit more for a carry.
+ */
+static size_t lgrt_dec_wide_limbs(size_t words) {
+    return (2 * lgrt_dec_precision(words) + 6) >> 2;
+}
+
+/* The bits of the exponent continuation. */
+static size_t lgrt_dec_continuation(size_t words) {
+    return words == 4 ? 12 : 4 + 2 * words;
+}
+
+/* The bias, which is also minus the lowest exponent. */
+static int32_t lgrt_dec_bias(size_t words) {
+    int32_t emax = (int32_t)3 << (lgrt_dec_continuation(words) - 1);
+
+    return emax + (int32_t)lgrt_dec_precision(words) - 2;
+}
+
+static int32_t lgrt_dec_highest_exponent(size_t words) {
+    int32_t limit = (int32_t)3 << lgrt_dec_continuation(words);
+
+    return limit - 1 - lgrt_dec_bias(words);
+}
+
+static uint32_t lgrt_dec_power(size_t count) {
+    return count == 0 ? 1 : count == 1 ? 10 : count == 2 ? 100 : 1000;
+}
+
+static size_t lgrt_dec_digits(const uint32_t *c, size_t n) {
+    for (size_t i = n; i-- > 0; ) {
+        if (c[i] != 0) {
+            return 4 * i
+                + (c[i] >= 1000 ? 4 : c[i] >= 100 ? 3 : c[i] >= 10 ? 2 : 1);
+        }
+    }
+    return 0;
+}
+
+/* Multiplies by 10^count a number that stays within n limbs. */
+static void lgrt_dec_scale_up(uint32_t *c, size_t n, size_t count) {
+    size_t whole = count >> 2;
+    uint32_t factor = lgrt_dec_power(count & 3);
+    uint32_t split = LGRT_DEC_BASE / factor;
+
+    if (count == 0) {
+        return;
+    }
+    for (size_t i = n; i-- > 0; ) {
+        uint32_t high = i >= whole ? c[i - whole] % split * factor : 0;
+        uint32_t low = i > whole ? c[i - whole - 1] / split : 0;
+
+        c[i] = high + low;
+    }
+}
+
+/* Divides by 10^count, leaving out the remainder. */
+static void lgrt_dec_scale_down(uint32_t *c, size_t n, size_t count) {
+    size_t whole = count >> 2;
+    uint32_t factor = lgrt_dec_power(count & 3);
+    uint32_t split = LGRT_DEC_BASE / factor;
+
+    if (count == 0) {
+        return;
+    }
+    for (size_t i = 0; i < n; i++) {
+        uint32_t low = i + whole < n ? c[i + whole] / factor : 0;
+        uint32_t high = i + whole + 1 < n
+            ? c[i + whole + 1] % factor * split
+            : 0;
+
+        c[i] = low + high;
+    }
+}
+
+static void lgrt_dec_widen(uint32_t *c, const struct lgrt_dec *x, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        c[i] = i < LGRT_DEC_LIMBS ? x->coefficient[i] : 0;
+    }
+}
+
+static void lgrt_dec_set_infinite(struct lgrt_dec *r, bool negative) {
+    for (size_t i = 0; i < LGRT_DEC_LIMBS; i++) {
+        r->coefficient[i] = 0;
+    }
+    r->kind = LGRT_DEC_INFINITE;
+    r->negative = negative;
+    r->exponent = 0;
+}
+
+/* The result of an invalid operation, which has neither sign nor payload. */
+static void lgrt_dec_set_invalid(struct lgrt_dec *r) {
+    lgrt_dec_set_infinite(r, false);
+    r->kind = LGRT_DEC_QUIET;
+}
+
+/*
+ * The first signalling NaN, else the first NaN, becomes the result, quiet, as
+ * it is.
+ */
+static bool lgrt_dec_propagate(
+    struct lgrt_dec *r, const struct lgrt_dec *a, const struct lgrt_dec *b
+) {
+    const struct lgrt_dec *source;
+
+    if (a->kind == LGRT_DEC_SIGNALLING) {
+        source = a;
+    } else if (b->kind == LGRT_DEC_SIGNALLING) {
+        source = b;
+    } else if (a->kind == LGRT_DEC_QUIET) {
+        source = a;
+    } else if (b->kind == LGRT_DEC_QUIET) {
+        source = b;
+    } else {
+        return false;
+    }
+    *r = *source;
+    r->kind = LGRT_DEC_QUIET;
+    return true;
+}
+
+/*
+ * Whether a number rounds away from zero when it loses its last count digits,
+ * with sticky telling of a further remainder below them: to nearest, with ties
+ * to even.
+ */
+static bool lgrt_dec_rounds_up(
+    const uint32_t *c, size_t n, size_t count, bool sticky
+) {
+    size_t limb = (count - 1) >> 2;
+    uint32_t unit = lgrt_dec_power((count - 1) & 3);
+    uint32_t digit = limb < n ? c[limb] / unit % 10 : 0;
+    size_t next = count >> 2;
+
+    if (digit != 5) {
+        return digit > 5;
+    }
+    if (sticky || c[limb] % unit != 0) {
+        return true;
+    }
+    for (size_t i = 0; i < limb; i++) {
+        if (c[i] != 0) {
+            return true;
+        }
+    }
+    return next < n && (c[next] / lgrt_dec_power(count & 3) & 1) != 0;
+}
+
+static void lgrt_dec_increment(uint32_t *c, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        c[i] += 1;
+        if (c[i] < LGRT_DEC_BASE) {
+            return;
+        }
+        c[i] = 0;
+    }
+}
+
+/*
+ * Makes the finite number c * 10^exponent the result, with its sign already in
+ * r, c having n limbs, at least those of the format, and sticky telling of a
+ * remainder below its last digit. All operations round here, once.
+ */
+static void lgrt_dec_round(
+    struct lgrt_dec *r, uint32_t *c, size_t n, int32_t exponent, bool sticky,
+    size_t words
+) {
+    size_t precision = lgrt_dec_precision(words);
+    int32_t lowest = -lgrt_dec_bias(words);
+    int32_t highest = lgrt_dec_highest_exponent(words);
+    size_t digits = lgrt_dec_digits(c, n);
+    int32_t drop = digits > precision ? (int32_t)(digits - precision) : 0;
+
+    if (exponent + drop < lowest) {
+        drop = lowest - exponent;
+    }
+    if (drop > 0) {
+        bool up = lgrt_dec_rounds_up(c, n, (size_t)drop, sticky);
+
+        lgrt_dec_scale_down(c, n, (size_t)drop);
+        exponent += drop;
+        if (up) {
+            lgrt_dec_increment(c, n);
+        }
+        digits = lgrt_dec_digits(c, n);
+        if (digits > precision) {
+            lgrt_dec_scale_down(c, n, 1);
+            exponent += 1;
+            digits -= 1;
+        }
+    }
+    if (digits == 0) {
+        if (exponent > highest) {
+            exponent = highest;
+        }
+    } else if (exponent + (int32_t)digits > highest + (int32_t)precision) {
+        lgrt_dec_set_infinite(r, r->negative);
+        return;
+    } else if (exponent > highest) {
+        lgrt_dec_scale_up(c, n, (size_t)(exponent - highest));
+        exponent = highest;
+    }
+    r->kind = LGRT_DEC_FINITE;
+    r->exponent = exponent;
+    for (size_t i = 0; i < LGRT_DEC_LIMBS; i++) {
+        r->coefficient[i] = i < n ? c[i] : 0;
+    }
+}
+
+/* The order of two numbers: -1, 0, or 1. */
+static int lgrt_dec_order(const uint32_t *x, const uint32_t *y, size_t n) {
+    for (size_t i = n; i-- > 0; ) {
+        if (x[i] != y[i]) {
+            return x[i] < y[i] ? -1 : 1;
+        }
+    }
+    return 0;
+}
+
+/* Adds y to x, and returns the carry out of the last limb. */
+static uint32_t lgrt_dec_add_limbs(uint32_t *x, const uint32_t *y, size_t n) {
+    uint32_t carry = 0;
+
+    for (size_t i = 0; i < n; i++) {
+        uint32_t sum = x[i] + y[i] + carry;
+
+        carry = sum >= LGRT_DEC_BASE ? 1 : 0;
+        x[i] = carry != 0 ? sum - LGRT_DEC_BASE : sum;
+    }
+    return carry;
+}
+
+/* Subtracts from x a y that is not above it. */
+static void lgrt_dec_subtract_limbs(
+    uint32_t *x, const uint32_t *y, size_t n
+) {
+    uint32_t borrow = 0;
+
+    for (size_t i = 0; i < n; i++) {
+        uint32_t difference = x[i] + LGRT_DEC_BASE - y[i] - borrow;
+
+        borrow = difference < LGRT_DEC_BASE ? 1 : 0;
+        x[i] = borrow != 0 ? difference : difference - LGRT_DEC_BASE;
+    }
+}
+
+static void lgrt_dec_add(
+    struct lgrt_dec *r, const struct lgrt_dec *a, const struct lgrt_dec *b,
+    bool subtract, size_t words
+) {
+    bool b_negative = b->negative != subtract;
+    bool swap = a->exponent < b->exponent;
+    const struct lgrt_dec *high = swap ? b : a;
+    const struct lgrt_dec *low = swap ? a : b;
+    bool high_negative = swap ? b_negative : a->negative;
+    bool low_negative = swap ? a->negative : b_negative;
+    size_t n = lgrt_dec_wide_limbs(words);
+    size_t room = 2 * lgrt_dec_precision(words) + 2;
+    uint32_t x[LGRT_DEC_WIDE_LIMBS];
+    uint32_t y[LGRT_DEC_WIDE_LIMBS];
+    size_t digits;
+    size_t gap;
+    int32_t exponent = low->exponent;
+    int order;
+
+    if (lgrt_dec_propagate(r, a, b)) {
+        return;
+    }
+    if (a->kind == LGRT_DEC_INFINITE || b->kind == LGRT_DEC_INFINITE) {
+        if (a->kind != LGRT_DEC_INFINITE) {
+            lgrt_dec_set_infinite(r, b_negative);
+        } else if (b->kind == LGRT_DEC_INFINITE && a->negative != b_negative) {
+            lgrt_dec_set_invalid(r);
+        } else {
+            lgrt_dec_set_infinite(r, a->negative);
+        }
+        return;
+    }
+    lgrt_dec_widen(x, high, n);
+    lgrt_dec_widen(y, low, n);
+    digits = lgrt_dec_digits(x, n);
+    gap = digits == 0 ? 0 : (size_t)(high->exponent - low->exponent);
+    if (digits + gap > room) {
+        /*
+         * All of the lower number lies so far below where the sum rounds that
+         * a single unit gives the same rounding.
+         */
+        bool nonzero = lgrt_dec_digits(y, n) != 0;
+
+        gap = room - digits;
+        exponent = high->exponent - (int32_t)gap;
+        for (size_t i = 0; i < n; i++) {
+            y[i] = 0;
+        }
+        y[0] = nonzero ? 1 : 0;
+    }
+    lgrt_dec_scale_up(x, n, gap);
+    if (high_negative == low_negative) {
+        lgrt_dec_add_limbs(x, y, n);
+        r->negative = high_negative;
+        lgrt_dec_round(r, x, n, exponent, false, words);
+        return;
+    }
+    order = lgrt_dec_order(x, y, n);
+    if (order < 0) {
+        lgrt_dec_subtract_limbs(y, x, n);
+        r->negative = low_negative;
+        lgrt_dec_round(r, y, n, exponent, false, words);
+        return;
+    }
+    lgrt_dec_subtract_limbs(x, y, n);
+    r->negative = order > 0 && high_negative;
+    lgrt_dec_round(r, x, n, exponent, false, words);
+}
+
+static void lgrt_dec_multiply(
+    struct lgrt_dec *r, const struct lgrt_dec *a, const struct lgrt_dec *b,
+    size_t words
+) {
+    size_t limbs = lgrt_dec_limbs(words);
+    size_t n = lgrt_dec_wide_limbs(words);
+    uint32_t c[LGRT_DEC_WIDE_LIMBS];
+    uint32_t carry = 0;
+
+    if (lgrt_dec_propagate(r, a, b)) {
+        return;
+    }
+    r->negative = a->negative != b->negative;
+    if (a->kind == LGRT_DEC_INFINITE || b->kind == LGRT_DEC_INFINITE) {
+        const struct lgrt_dec *other = a->kind == LGRT_DEC_INFINITE ? b : a;
+
+        if (other->kind == LGRT_DEC_FINITE
+         && lgrt_dec_digits(other->coefficient, limbs) == 0) {
+            lgrt_dec_set_invalid(r);
+        } else {
+            lgrt_dec_set_infinite(r, r->negative);
+        }
+        return;
+    }
+    for (size_t k = 0; k < n; k++) {
+        uint32_t sum = carry;
+
+        for (size_t i = k < limbs ? 0 : k - limbs + 1; i <= k && i < limbs;
+             i++) {
+            sum += a->coefficient[i] * b->coefficient[k - i];
+        }
+        c[k] = sum % LGRT_DEC_BASE;
+        carry = sum / LGRT_DEC_BASE;
+    }
+    lgrt_dec_round(r, c, n, a->exponent + b->exponent, false, words);
+}
+
+static void lgrt_dec_multiply_small(uint32_t *c, size_t n, uint32_t factor) {
+    uint32_t carry = 0;
+
+    for (size_t i = 0; i < n; i++) {
+        uint32_t value = c[i] * factor + carry;
+
+        c[i] = value % LGRT_DEC_BASE;
+        carry = value / LGRT_DEC_BASE;
+    }
+}
+
+/*
+ * Long division in the base of the limbs, as Knuth's Algorithm D has it, of u,
+ * of un limbs and room for one more, by v, of vn limbs, the top one not zero.
+ * Gives the limbs of the quotient in q, and whether a remainder is left.
+ */
+static bool lgrt_dec_long_divide(
+    uint32_t *q, uint32_t *u, size_t un, uint32_t *v, size_t vn
+) {
+    uint32_t factor = LGRT_DEC_BASE / (v[vn - 1] + 1);
+
+    u[un] = 0;
+    lgrt_dec_multiply_small(u, un + 1, factor);
+    lgrt_dec_multiply_small(v, vn, factor);
+    for (size_t j = un - vn + 1; j-- > 0; ) {
+        uint32_t top = u[j + vn] * LGRT_DEC_BASE + u[j + vn - 1];
+        uint32_t qhat = top / v[vn - 1];
+        uint32_t rhat = top % v[vn - 1];
+        uint32_t carry = 0;
+        uint32_t borrow = 0;
+
+        while (qhat >= LGRT_DEC_BASE
+            || (vn > 1
+             && qhat * v[vn - 2] > rhat * LGRT_DEC_BASE + u[j + vn - 2])) {
+            qhat -= 1;
+            rhat += v[vn - 1];
+            if (rhat >= LGRT_DEC_BASE) {
+                break;
+            }
+        }
+        for (size_t i = 0; i <= vn; i++) {
+            uint32_t product = (i < vn ? qhat * v[i] : 0) + carry;
+            uint32_t difference = u[i + j] + LGRT_DEC_BASE
+                - product % LGRT_DEC_BASE - borrow;
+
+            carry = product / LGRT_DEC_BASE;
+            borrow = difference < LGRT_DEC_BASE ? 1 : 0;
+            u[i + j] = borrow != 0 ? difference : difference - LGRT_DEC_BASE;
+        }
+        if (borrow != 0) {
+            carry = lgrt_dec_add_limbs(u + j, v, vn);
+            u[j + vn] = (u[j + vn] + carry) % LGRT_DEC_BASE;
+            qhat -= 1;
+        }
+        q[j] = qhat;
+    }
+    for (size_t i = 0; i <= un; i++) {
+        if (u[i] != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static size_t lgrt_dec_trailing_zeros(const uint32_t *c, size_t n) {
+    size_t count = 0;
+
+    for (size_t i = 0; i < n; i++) {
+        uint32_t limb = c[i];
+
+        if (limb != 0) {
+            while (limb % 10 == 0) {
+                limb /= 10;
+                count += 1;
+            }
+            break;
+        }
+        count += 4;
+    }
+    return count;
+}
+
+static void lgrt_dec_divide(
+    struct lgrt_dec *r, const struct lgrt_dec *a, const struct lgrt_dec *b,
+    size_t words
+) {
+    size_t limbs = lgrt_dec_limbs(words);
+    size_t n = lgrt_dec_wide_limbs(words);
+    size_t a_digits = lgrt_dec_digits(a->coefficient, limbs);
+    size_t b_digits = lgrt_dec_digits(b->coefficient, limbs);
+    int32_t exponent = a->exponent - b->exponent;
+    uint32_t q[LGRT_DEC_WIDE_LIMBS];
+    bool sticky = false;
+
+    if (lgrt_dec_propagate(r, a, b)) {
+        return;
+    }
+    r->negative = a->negative != b->negative;
+    if (a->kind == LGRT_DEC_INFINITE) {
+        if (b->kind == LGRT_DEC_INFINITE) {
+            lgrt_dec_set_invalid(r);
+        } else {
+            lgrt_dec_set_infinite(r, r->negative);
+        }
+        return;
+    }
+    if (b_digits == 0 && b->kind == LGRT_DEC_FINITE) {
+        if (a_digits == 0) {
+            lgrt_dec_set_invalid(r);
+        } else {
+            lgrt_dec_set_infinite(r, r->negative);
+        }
+        return;
+    }
+    for (size_t i = 0; i < n; i++) {
+        q[i] = 0;
+    }
+    if (b->kind == LGRT_DEC_INFINITE) {
+        /* The exponent of the divisor counts as above all others. */
+        exponent = -lgrt_dec_bias(words);
+    } else if (a_digits != 0) {
+        /*
+         * A quotient of at least one digit beyond the precision, for what
+         * rounding needs. If it comes out exact, it goes back towards the
+         * exponent wanted, which is that of the unscaled quotient.
+         */
+        size_t scale = lgrt_dec_precision(words) + 1 + b_digits - a_digits;
+        size_t un = (lgrt_dec_precision(words) + 1 + b_digits + 3) >> 2;
+        uint32_t u[LGRT_DEC_WIDE_LIMBS + 1];
+        uint32_t v[LGRT_DEC_LIMBS];
+
+        lgrt_dec_widen(u, a, n);
+        lgrt_dec_scale_up(u, n, scale);
+        for (size_t i = 0; i < limbs; i++) {
+            v[i] = b->coefficient[i];
+        }
+        exponent -= (int32_t)scale;
+        sticky = lgrt_dec_long_divide(q, u, un, v, (b_digits + 3) >> 2);
+        if (!sticky) {
+            size_t zeros = lgrt_dec_trailing_zeros(q, n);
+
+            zeros = zeros < scale ? zeros : scale;
+            lgrt_dec_scale_down(q, n, zeros);
+            exponent += (int32_t)zeros;
+        }
+    }
+    lgrt_dec_round(r, q, n, exponent, sticky, words);
+}
+
+static int lgrt_dec_sign(const struct lgrt_dec *x, size_t digits) {
+    if (x->kind == LGRT_DEC_FINITE && digits == 0) {
+        return 0;
+    }
+    return x->negative ? -1 : 1;
+}
+
+/* Below, equal, or above as -1, 0, or 1; unordered if either is a NaN. */
+static lgrt_fp_cmp lgrt_dec_compare(
+    struct lgrt_dec *a, struct lgrt_dec *b, lgrt_fp_cmp unordered, size_t words
+) {
+    size_t limbs = lgrt_dec_limbs(words);
+    size_t a_digits = lgrt_dec_digits(a->coefficient, limbs);
+    size_t b_digits = lgrt_dec_digits(b->coefficient, limbs);
+    int a_sign = lgrt_dec_sign(a, a_digits);
+    int b_sign = lgrt_dec_sign(b, b_digits);
+    int32_t a_top = a->exponent + (int32_t)a_digits;
+    int32_t b_top = b->exponent + (int32_t)b_digits;
+    int order;
+
+    if (a->kind >= LGRT_DEC_QUIET || b->kind >= LGRT_DEC_QUIET) {
+        return unordered;
+    }
+    if (a_sign != b_sign) {
+        return a_sign < b_sign ? -1 : 1;
+    }
+    if (a_sign == 0) {
+        return 0;
+    }
+    if (a->kind == LGRT_DEC_INFINITE || b->kind == LGRT_DEC_INFINITE) {
+        order = a->kind == b->kind ? 0
+            : a->kind == LGRT_DEC_INFINITE ? 1
+            : -1;
+    } else if (a_top != b_top) {
+        order = a_top < b_top ? -1 : 1;
+    } else {
+        if (a_digits < b_digits) {
+            lgrt_dec_scale_up(a->coefficient, limbs, b_digits - a_digits);
+        } else {
+            lgrt_dec_scale_up(b->coefficient, limbs, a_digits - b_digits);
+        }
+        order = lgrt_dec_order(a->coefficient, b->coefficient, limbs);
+    }
+    return a_sign < 0 ? -order : order;
+}
+
+/* Words of a format little end first, whatever its order in memory. */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define LGRT_DEC_WORD(i, words) ((words) - 1 - (i))
+#else
+#define LGRT_DEC_WORD(i, words) (i)
+#endif
+
+static void lgrt_dec_load(uint32_t *w, const void *value, size_t words) {
+    uint32_t raw[4];
+
+    __builtin_memcpy(raw, value, words * sizeof(uint32_t));
+    for (size_t i = 0; i < words; i++) {
+        w[i] = raw[LGRT_DEC_WORD(i, words)];
+    }
+}
+
+static void lgrt_dec_store(void *value, const uint32_t *w, size_t words) {
+    uint32_t raw[4];
+
+    for (size_t i = 0; i < words; i++) {
+        raw[LGRT_DEC_WORD(i, words)] = w[i];
+    }
+    __builtin_memcpy(value, raw, words * sizeof(uint32_t));
+}
+
+static uint32_t lgrt_dec_mask(size_t bits) {
+    return ((uint32_t)1 << bits) - 1;
+}
+
+/*
+ * Binary integers, in pieces of 16 bits, little end first, which keep the
+ * steps to and from limbs within 32 bits. Gives the pieces of a number that
+ * fits them.
+ */
+static void lgrt_dec_limbs_to_chunks(
+    uint32_t *chunks, size_t n, const uint32_t *c, size_t limbs
+) {
+    for (size_t i = 0; i < n; i++) {
+        chunks[i] = 0;
+    }
+    for (size_t limb = limbs; limb-- > 0; ) {
+        uint32_t carry = c[limb];
+
+        for (size_t i = 0; i < n; i++) {
+            uint32_t value = chunks[i] * LGRT_DEC_BASE + carry;
+
+            chunks[i] = value & 0xffff;
+            carry = value >> 16;
+        }
+    }
+}
+
+/* Gives the limbs of a number that fits them, using up its pieces. */
+static void lgrt_dec_chunks_to_limbs(
+    uint32_t *c, size_t limbs, uint32_t *chunks, size_t n
+) {
+    for (size_t limb = 0; limb < limbs; limb++) {
+        uint32_t remainder = 0;
+
+        /*
+         * Workaround: GCC 5 to 7, IA-32, at -O3: a loop counting down here
+         * gets a false -Warray-bounds.
+         */
+        for (size_t i = 0; i < n; i++) {
+            uint32_t value = remainder << 16 | chunks[n - 1 - i];
+
+            chunks[n - 1 - i] = value / LGRT_DEC_BASE;
+            remainder = value % LGRT_DEC_BASE;
+        }
+        while (n > 0 && chunks[n - 1] == 0) {
+            n -= 1;
+        }
+        c[limb] = remainder;
+    }
+}
+
+#if defined(__DECIMAL_BID_FORMAT__)
+
+/*
+ * The binary integer form: after the sign, an exponent of the continuation's
+ * bits and 2 more, then the coefficient. Where the first 2 bits of that
+ * exponent are both set, the exponent comes after them, and the coefficient
+ * has 2 bits less, with 100 in front of them.
+ */
+static size_t lgrt_dec_coefficient_shift(size_t words) {
+    return 25 - 2 * words;
+}
+
+/*
+ * Gives the coefficient that the low words of w and the top word high make, by
+ * pieces of 16 bits, as zero if it has more digits than the format holds.
+ */
+static void lgrt_dec_from_bits(
+    struct lgrt_dec *r, const uint32_t *w, uint32_t high, size_t digits,
+    size_t words
+) {
+    uint32_t chunks[8];
+    size_t n = 2 * words;
+
+    for (size_t i = 0; i < words; i++) {
+        uint32_t word = i == words - 1 ? high : w[i];
+
+        chunks[2 * i] = word & 0xffff;
+        chunks[2 * i + 1] = word >> 16;
+    }
+    lgrt_dec_chunks_to_limbs(r->coefficient, LGRT_DEC_LIMBS, chunks, n);
+    if (lgrt_dec_digits(r->coefficient, LGRT_DEC_LIMBS) > digits) {
+        for (size_t i = 0; i < LGRT_DEC_LIMBS; i++) {
+            r->coefficient[i] = 0;
+        }
+    }
+}
+
+static void lgrt_dec_unpack_finite(
+    struct lgrt_dec *r, const uint32_t *w, size_t words
+) {
+    uint32_t top = w[words - 1];
+    size_t shift = lgrt_dec_coefficient_shift(words);
+    uint32_t mask = lgrt_dec_mask(lgrt_dec_continuation(words) + 2);
+    uint32_t biased = (top >> shift) & mask;
+    uint32_t high = top & lgrt_dec_mask(shift);
+
+    if (((top >> 29) & 3) == 3) {
+        biased = (top >> (shift - 2)) & mask;
+        high = (top & lgrt_dec_mask(shift - 2)) | (uint32_t)1 << shift;
+    }
+    r->exponent = (int32_t)biased - lgrt_dec_bias(words);
+    lgrt_dec_from_bits(r, w, high, lgrt_dec_precision(words), words);
+}
+
+static void lgrt_dec_unpack_payload(
+    struct lgrt_dec *r, const uint32_t *w, size_t words
+) {
+    uint32_t high = w[words - 1]
+        & lgrt_dec_mask(26 - lgrt_dec_continuation(words));
+
+    lgrt_dec_from_bits(r, w, high, lgrt_dec_precision(words) - 1, words);
+}
+
+static void lgrt_dec_pack_number(
+    uint32_t *w, const struct lgrt_dec *x, size_t words
+) {
+    uint32_t chunks[8];
+
+    lgrt_dec_limbs_to_chunks(
+        chunks, 2 * words, x->coefficient, lgrt_dec_limbs(words)
+    );
+    for (size_t i = 0; i < words; i++) {
+        w[i] = chunks[2 * i] | chunks[2 * i + 1] << 16;
+    }
+    if (x->kind == LGRT_DEC_FINITE) {
+        uint32_t top = w[words - 1];
+        size_t shift = lgrt_dec_coefficient_shift(words);
+        uint32_t biased = (uint32_t)(x->exponent + lgrt_dec_bias(words));
+
+        if (top >> shift != 0) {
+            top = (uint32_t)3 << 29 | biased << (shift - 2)
+                | (top & lgrt_dec_mask(shift - 2));
+        } else {
+            top |= biased << shift;
+        }
+        w[words - 1] = top;
+    }
+}
+
+#else
+
+/*
+ * The densely packed form, as the Power ISA's appendix on it has the tables:
+ * bits, from the top, pqr stu v wxy, for digits of bits abcd efgh ijkm.
+ */
+static uint32_t lgrt_dec_declet_to_value(uint32_t declet) {
+    uint32_t pqr = (declet >> 7) & 7;
+    uint32_t pq = (declet >> 8) & 3;
+    uint32_t r = (declet >> 7) & 1;
+    uint32_t stu = (declet >> 4) & 7;
+    uint32_t st = (declet >> 5) & 3;
+    uint32_t u = (declet >> 4) & 1;
+    uint32_t y = declet & 1;
+    uint32_t first = pqr;
+    uint32_t second = stu;
+    uint32_t third = declet & 7;
+
+    if ((declet & 8) != 0) {
+        switch ((declet >> 1) & 3) {
+            case 0: {
+                third = 8 | y;
+                break;
+            }
+            case 1: {
+                second = 8 | u;
+                third = st << 1 | y;
+                break;
+            }
+            case 2: {
+                first = 8 | r;
+                third = pq << 1 | y;
+                break;
+            }
+            default: {
+                first = st == 2 ? pqr : 8 | r;
+                second = st == 1 ? pq << 1 | u : 8 | u;
+                third = st == 0 ? pq << 1 | y : 8 | y;
+                break;
+            }
+        }
+    }
+    return first * 100 + second * 10 + third;
+}
+
+static uint32_t lgrt_dec_value_to_declet(uint32_t value) {
+    uint32_t first = value / 100;
+    uint32_t second = value / 10 % 10;
+    uint32_t third = value % 10;
+    uint32_t bcd = first & 7;
+    uint32_t d = first & 1;
+    uint32_t fgh = second & 7;
+    uint32_t fg = (second >> 1) & 3;
+    uint32_t h = second & 1;
+    uint32_t jkm = third & 7;
+    uint32_t jk = (third >> 1) & 3;
+    uint32_t m = third & 1;
+
+    switch ((first >> 3) << 2 | (second >> 3) << 1 | third >> 3) {
+        case 0: {
+            return bcd << 7 | fgh << 4 | jkm;
+        }
+        case 1: {
+            return bcd << 7 | fgh << 4 | 8 | m;
+        }
+        case 2: {
+            return bcd << 7 | jk << 5 | h << 4 | 10 | m;
+        }
+        case 3: {
+            return bcd << 7 | 2 << 5 | h << 4 | 14 | m;
+        }
+        case 4: {
+            return jk << 8 | d << 7 | fgh << 4 | 12 | m;
+        }
+        case 5: {
+            return fg << 8 | d << 7 | 1 << 5 | h << 4 | 14 | m;
+        }
+        case 6: {
+            return jk << 8 | d << 7 | h << 4 | 14 | m;
+        }
+        default: {
+            return d << 7 | 3 << 5 | h << 4 | 14 | m;
+        }
+    }
+}
+
+/*
+ * The coefficient has its last digits in w, 10 bits for every 3, and the digit
+ * above them apart: 4 such groups make 3 limbs.
+ */
+static void lgrt_dec_from_declets(
+    struct lgrt_dec *r, const uint32_t *w, uint32_t top_digit, size_t words
+) {
+    size_t count = 3 * words - 1;
+    uint32_t values[12];
+
+    for (size_t i = 0; i < 12; i++) {
+        size_t word = (10 * i) >> 5;
+        size_t shift = (10 * i) & 31;
+        uint32_t bits = 0;
+
+        if (i < count) {
+            bits = w[word] >> shift;
+            if (shift > 22) {
+                bits |= w[word + 1] << (32 - shift);
+            }
+            bits = lgrt_dec_declet_to_value(bits & 0x3ff);
+        }
+        values[i] = i == count ? top_digit : bits;
+    }
+    for (size_t i = 0; i < 3; i++) {
+        uint32_t *c = r->coefficient + 3 * i;
+        const uint32_t *d = values + 4 * i;
+
+        c[0] = d[0] + d[1] % 10 * 1000;
+        c[1] = d[1] / 10 + d[2] % 100 * 100;
+        c[2] = d[2] / 100 + d[3] * 10;
+    }
+}
+
+static void lgrt_dec_unpack_finite(
+    struct lgrt_dec *r, const uint32_t *w, size_t words
+) {
+    uint32_t top = w[words - 1];
+    uint32_t combination = (top >> 26) & 31;
+    size_t continuation = lgrt_dec_continuation(words);
+    uint32_t biased = (top >> (26 - continuation))
+        & lgrt_dec_mask(continuation);
+    uint32_t high = combination >> 3;
+    uint32_t top_digit = combination & 7;
+
+    if (high == 3) {
+        high = (combination >> 1) & 3;
+        top_digit = 8 | (combination & 1);
+    }
+    biased |= high << continuation;
+    r->exponent = (int32_t)biased - lgrt_dec_bias(words);
+    lgrt_dec_from_declets(r, w, top_digit, words);
+}
+
+static void lgrt_dec_unpack_payload(
+    struct lgrt_dec *r, const uint32_t *w, size_t words
+) {
+    lgrt_dec_from_declets(r, w, 0, words);
+}
+
+static void lgrt_dec_pack_number(
+    uint32_t *w, const struct lgrt_dec *x, size_t words
+) {
+    size_t count = 3 * words - 1;
+    uint32_t values[12];
+
+    for (size_t i = 0; i < words; i++) {
+        w[i] = 0;
+    }
+    for (size_t i = 0; i < 3; i++) {
+        const uint32_t *c = x->coefficient + 3 * i;
+        uint32_t *d = values + 4 * i;
+
+        d[0] = c[0] % 1000;
+        d[1] = c[0] / 1000 + c[1] % 100 * 10;
+        d[2] = c[1] / 100 + c[2] % 10 * 100;
+        d[3] = c[2] / 10;
+    }
+    for (size_t i = 0; i < count; i++) {
+        size_t word = (10 * i) >> 5;
+        size_t shift = (10 * i) & 31;
+        uint32_t bits = lgrt_dec_value_to_declet(values[i]);
+
+        w[word] |= bits << shift;
+        if (shift > 22) {
+            w[word + 1] |= bits >> (32 - shift);
+        }
+    }
+    if (x->kind == LGRT_DEC_FINITE) {
+        size_t continuation = lgrt_dec_continuation(words);
+        uint32_t biased = (uint32_t)(x->exponent + lgrt_dec_bias(words));
+        uint32_t high = biased >> continuation;
+        uint32_t combination = values[count] >= 8
+            ? 24 | high << 1 | (values[count] & 1)
+            : high << 3 | values[count];
+
+        w[words - 1] |= combination << 26
+            | (biased & lgrt_dec_mask(continuation)) << (26 - continuation);
+    }
+}
+
+#endif
+
+static void lgrt_dec_unpack(
+    struct lgrt_dec *r, const void *value, size_t words
+) {
+    uint32_t w[4];
+    uint32_t combination;
+
+    lgrt_dec_load(w, value, words);
+    combination = (w[words - 1] >> 26) & 31;
+    r->negative = w[words - 1] >> 31 != 0;
+    r->exponent = 0;
+    if (combination == 30) {
+        lgrt_dec_set_infinite(r, r->negative);
+        return;
+    }
+    if (combination == 31) {
+        r->kind = ((w[words - 1] >> 25) & 1) != 0
+            ? LGRT_DEC_SIGNALLING
+            : LGRT_DEC_QUIET;
+        lgrt_dec_unpack_payload(r, w, words);
+        return;
+    }
+    r->kind = LGRT_DEC_FINITE;
+    lgrt_dec_unpack_finite(r, w, words);
+}
+
+static void lgrt_dec_pack(
+    void *value, const struct lgrt_dec *x, size_t words
+) {
+    uint32_t w[4];
+
+    lgrt_dec_pack_number(w, x, words);
+    if (x->kind == LGRT_DEC_INFINITE) {
+        w[words - 1] = (uint32_t)30 << 26;
+    } else if (x->kind != LGRT_DEC_FINITE) {
+        w[words - 1] |= (uint32_t)31 << 26;
+    }
+    if (x->negative) {
+        w[words - 1] |= (uint32_t)1 << 31;
+    }
+    lgrt_dec_store(value, w, words);
+}
+
+/*
+ * Workaround: GCC before 5, PowerPC: with the vector instructions of POWER8
+ * and -mno-hard-dfp, which nothing tells of, it fails to load a _Decimal32
+ * into the register that returns it, unless hardware decimal is on for the
+ * routine, which has no decimal arithmetic for that to take part in.
+ */
+#if __GNUC__ < 5 && defined(__POWER8_VECTOR__) && !defined(_SOFT_FLOAT)
+#define LGRT_DEC_RETURN __attribute__((__target__("hard-dfp")))
+#else
+#define LGRT_DEC_RETURN
+#endif
+
+#define LGRT_DEC_OPERATION(name, T, words, call) \
+    LGRT_DEC_RETURN T LGRT_DEC_NAME(name)(T a, T b) { \
+        struct lgrt_dec x; \
+        struct lgrt_dec y; \
+        struct lgrt_dec r; \
+        \
+        lgrt_dec_unpack(&x, &a, words); \
+        lgrt_dec_unpack(&y, &b, words); \
+        call; \
+        lgrt_dec_pack(&a, &r, words); \
+        return a; \
+    }
+
+#define LGRT_DEC_RELATION(name, T, words, unordered) \
+    lgrt_fp_cmp LGRT_DEC_NAME(name)(T a, T b) { \
+        struct lgrt_dec x; \
+        struct lgrt_dec y; \
+        \
+        lgrt_dec_unpack(&x, &a, words); \
+        lgrt_dec_unpack(&y, &b, words); \
+        return lgrt_dec_compare(&x, &y, unordered, words); \
+    }
+
+#define LGRT_DEC_FORMAT(fmt, T, words) \
+    LGRT_DEC_OPERATION( \
+        add##fmt##3, T, words, lgrt_dec_add(&r, &x, &y, false, words) \
+    ) \
+    LGRT_DEC_OPERATION( \
+        sub##fmt##3, T, words, lgrt_dec_add(&r, &x, &y, true, words) \
+    ) \
+    LGRT_DEC_OPERATION( \
+        mul##fmt##3, T, words, lgrt_dec_multiply(&r, &x, &y, words) \
+    ) \
+    LGRT_DEC_OPERATION( \
+        div##fmt##3, T, words, lgrt_dec_divide(&r, &x, &y, words) \
+    ) \
+    LGRT_DEC_RELATION(eq##fmt##2, T, words, 1) \
+    LGRT_DEC_RELATION(ne##fmt##2, T, words, 1) \
+    LGRT_DEC_RELATION(ge##fmt##2, T, words, -1) \
+    LGRT_DEC_RELATION(lt##fmt##2, T, words, 1) \
+    LGRT_DEC_RELATION(le##fmt##2, T, words, 1) \
+    LGRT_DEC_RELATION(gt##fmt##2, T, words, -1) \
+    \
+    lgrt_fp_cmp LGRT_DEC_NAME(unord##fmt##2)(T a, T b) { \
+        uint32_t x[4]; \
+        uint32_t y[4]; \
+        \
+        lgrt_dec_load(x, &a, words); \
+        lgrt_dec_load(y, &b, words); \
+        return ((x[words - 1] >> 26) & 31) == 31 \
+            || ((y[words - 1] >> 26) & 31) == 31; \
+    }
+
+LGRT_DEC_FORMAT(sd, lgrt_sd_value, 1)
+LGRT_DEC_FORMAT(dd, lgrt_dd_value, 2)
+LGRT_DEC_FORMAT(td, lgrt_td_value, 4)
+
+/* What the wider format holds exactly, packed with a NaN made quiet. */
+#define LGRT_DEC_EXTEND(name, S, source, T, words) \
+    LGRT_DEC_RETURN T LGRT_DEC_NAME(name)(S a) { \
+        struct lgrt_dec x; \
+        T r; \
+        \
+        lgrt_dec_unpack(&x, &a, source); \
+        lgrt_dec_pack(&r, &x, words); \
+        return r; \
+    }
+
+LGRT_DEC_EXTEND(extendsddd2, lgrt_sd_value, 1, lgrt_dd_value, 2)
+LGRT_DEC_EXTEND(extendsdtd2, lgrt_sd_value, 1, lgrt_td_value, 4)
+LGRT_DEC_EXTEND(extendddtd2, lgrt_dd_value, 2, lgrt_td_value, 4)
+
+/* A NaN keeps the last digits of its payload that the format holds. */
+static void lgrt_dec_narrow(
+    struct lgrt_dec *r, const struct lgrt_dec *x, size_t words
+) {
+    size_t digits = lgrt_dec_precision(words) - 1;
+    size_t whole = digits >> 2;
+    uint32_t c[LGRT_DEC_LIMBS];
+
+    if (x->kind != LGRT_DEC_FINITE) {
+        *r = *x;
+        r->coefficient[whole] %= lgrt_dec_power(digits & 3);
+        for (size_t i = whole + 1; i < LGRT_DEC_LIMBS; i++) {
+            r->coefficient[i] = 0;
+        }
+        return;
+    }
+    lgrt_dec_widen(c, x, LGRT_DEC_LIMBS);
+    r->negative = x->negative;
+    lgrt_dec_round(r, c, LGRT_DEC_LIMBS, x->exponent, false, words);
+}
+
+#define LGRT_DEC_TRUNCATE(name, S, source, T, words) \
+    LGRT_DEC_RETURN T LGRT_DEC_NAME(name)(S a) { \
+        struct lgrt_dec x; \
+        struct lgrt_dec y; \
+        T r; \
+        \
+        lgrt_dec_unpack(&x, &a, source); \
+        lgrt_dec_narrow(&y, &x, words); \
+        lgrt_dec_pack(&r, &y, words); \
+        return r; \
+    }
+
+LGRT_DEC_TRUNCATE(truncddsd2, lgrt_dd_value, 2, lgrt_sd_value, 1)
+LGRT_DEC_TRUNCATE(trunctdsd2, lgrt_td_value, 4, lgrt_sd_value, 1)
+LGRT_DEC_TRUNCATE(trunctddd2, lgrt_td_value, 4, lgrt_dd_value, 2)
+
+/* Limbs that hold any integer of 128 bits. */
+#define LGRT_DEC_INTEGER_LIMBS 10
+
+/* The words of a coefficient as a binary integer, little end first. */
+static void lgrt_dec_coefficient_bits(uint32_t *w, const struct lgrt_dec *x) {
+    uint32_t chunks[8];
+
+    lgrt_dec_limbs_to_chunks(chunks, 8, x->coefficient, LGRT_DEC_LIMBS);
+    for (size_t i = 0; i < 4; i++) {
+        w[i] = chunks[2 * i] | chunks[2 * i + 1] << 16;
+    }
+}
+
+/*
+ * Truncates a number towards zero into the words of an integer type, little
+ * end first. What does not fit it saturates by its sign, a NaN gives 0, and so
+ * does a negative value in an unsigned type.
+ */
+static void lgrt_dec_to_integer(
+    uint32_t *w, const void *value, size_t count, bool is_signed, size_t words
+) {
+    struct lgrt_dec x;
+    uint32_t c[LGRT_DEC_INTEGER_LIMBS];
+    uint32_t chunks[9];
+    size_t limit = count == 4 ? 39 : 10 * count;
+    size_t digits;
+    int32_t top;
+    bool over;
+
+    lgrt_dec_unpack(&x, value, words);
+    digits = lgrt_dec_digits(x.coefficient, LGRT_DEC_LIMBS);
+    top = x.exponent + (int32_t)digits;
+    for (size_t i = 0; i < count; i++) {
+        w[i] = 0;
+    }
+    if (x.kind >= LGRT_DEC_QUIET || (x.negative && !is_signed)
+     || (x.kind == LGRT_DEC_FINITE && (digits == 0 || top <= 0))) {
+        return;
+    }
+    over = x.kind == LGRT_DEC_INFINITE || top > (int32_t)limit;
+    if (!over) {
+        lgrt_dec_widen(c, &x, LGRT_DEC_INTEGER_LIMBS);
+        if (x.exponent < 0) {
+            lgrt_dec_scale_down(
+                c, LGRT_DEC_INTEGER_LIMBS, (size_t)-x.exponent
+            );
+        } else {
+            lgrt_dec_scale_up(c, LGRT_DEC_INTEGER_LIMBS, (size_t)x.exponent);
+        }
+        lgrt_dec_limbs_to_chunks(chunks, 2 * count + 1, c, (limit + 3) >> 2);
+        for (size_t i = 0; i < count; i++) {
+            w[i] = chunks[2 * i] | chunks[2 * i + 1] << 16;
+        }
+        over = chunks[2 * count] != 0
+            || (is_signed && (w[count - 1] >> 31) != 0);
+    }
+    if (over) {
+        for (size_t i = 0; i < count; i++) {
+            w[i] = x.negative ? 0 : ~(uint32_t)0;
+        }
+        if (is_signed) {
+            w[count - 1] ^= (uint32_t)1 << 31;
+        }
+    } else if (x.negative) {
+        uint32_t carry = 1;
+
+        for (size_t i = 0; i < count; i++) {
+            w[i] = ~w[i] + carry;
+            carry = carry != 0 && w[i] == 0 ? 1 : 0;
+        }
+    }
+}
+
+static void lgrt_dec_from_integer(
+    void *value, const uint32_t *w, size_t count, bool negative, size_t words
+) {
+    struct lgrt_dec r;
+    uint32_t c[LGRT_DEC_INTEGER_LIMBS];
+    uint32_t chunks[8];
+
+    for (size_t i = 0; i < count; i++) {
+        chunks[2 * i] = w[i] & 0xffff;
+        chunks[2 * i + 1] = w[i] >> 16;
+    }
+    lgrt_dec_chunks_to_limbs(c, LGRT_DEC_INTEGER_LIMBS, chunks, 2 * count);
+    r.negative = negative;
+    lgrt_dec_round(&r, c, LGRT_DEC_INTEGER_LIMBS, 0, false, words);
+    lgrt_dec_pack(value, &r, words);
+}
+
+static uint32_t lgrt_dec_to_u32(
+    const void *value, bool is_signed, size_t words
+) {
+    uint32_t w[1];
+
+    lgrt_dec_to_integer(w, value, 1, is_signed, words);
+    return w[0];
+}
+
+static uint64_t lgrt_dec_to_u64(
+    const void *value, bool is_signed, size_t words
+) {
+    uint32_t w[2];
+
+    lgrt_dec_to_integer(w, value, 2, is_signed, words);
+    return (uint64_t)w[1] << 32 | w[0];
+}
+
+static void lgrt_dec_from_u32(
+    void *value, uint32_t i, bool negative, size_t words
+) {
+    uint32_t w[1] = { i };
+
+    lgrt_dec_from_integer(value, w, 1, negative, words);
+}
+
+static void lgrt_dec_from_u64(
+    void *value, uint64_t i, bool negative, size_t words
+) {
+    uint32_t w[2] = { (uint32_t)i, (uint32_t)(i >> 32) };
+
+    lgrt_dec_from_integer(value, w, 2, negative, words);
+}
+
+#if LGRT_HAS_INT128
+static lgrt_u128 lgrt_dec_to_u128(
+    const void *value, bool is_signed, size_t words
+) {
+    uint32_t w[4];
+
+    lgrt_dec_to_integer(w, value, 4, is_signed, words);
+    return (lgrt_u128)((uint64_t)w[3] << 32 | w[2]) << 64
+        | ((uint64_t)w[1] << 32 | w[0]);
+}
+
+static void lgrt_dec_from_u128(
+    void *value, lgrt_u128 i, bool negative, size_t words
+) {
+    uint64_t low = (uint64_t)i;
+    uint64_t high = (uint64_t)(i >> 64);
+    uint32_t w[4] = {
+        (uint32_t)low, (uint32_t)(low >> 32),
+        (uint32_t)high, (uint32_t)(high >> 32)
+    };
+
+    lgrt_dec_from_integer(value, w, 4, negative, words);
+}
+#endif
+
+#define LGRT_DEC_WITH_MODE(mode, I, U, bits, fmt, T, words) \
+    I LGRT_DEC_NAME(fix##fmt##mode)(T a) { \
+        return (I)lgrt_dec_to_u##bits(&a, true, words); \
+    } \
+    \
+    U LGRT_DEC_NAME(fixuns##fmt##mode)(T a) { \
+        return lgrt_dec_to_u##bits(&a, false, words); \
+    } \
+    \
+    LGRT_DEC_RETURN T LGRT_DEC_NAME(float##mode##fmt)(I i) { \
+        U magnitude = i < 0 ? (U)0 - (U)i : (U)i; \
+        T r; \
+        \
+        lgrt_dec_from_u##bits(&r, magnitude, i < 0, words); \
+        return r; \
+    } \
+    \
+    LGRT_DEC_RETURN T LGRT_DEC_NAME(floatuns##mode##fmt)( \
+        lgrt_fp_unsigned_##mode i \
+    ) { \
+        T r; \
+        \
+        lgrt_dec_from_u##bits(&r, (U)i, false, words); \
+        return r; \
+    }
+
+#define LGRT_DEC_MODE(mode, I, U, bits) \
+    LGRT_DEC_WITH_MODE(mode, I, U, bits, sd, lgrt_sd_value, 1) \
+    LGRT_DEC_WITH_MODE(mode, I, U, bits, dd, lgrt_dd_value, 2) \
+    LGRT_DEC_WITH_MODE(mode, I, U, bits, td, lgrt_td_value, 4)
+
+LGRT_DEC_MODE(si, int32_t, uint32_t, 32)
+LGRT_DEC_MODE(di, int64_t, uint64_t, 64)
+#if LGRT_HAS_INT128
+LGRT_DEC_MODE(ti, lgrt_i128, lgrt_u128, 128)
+#endif
+
+/*
+ * What follows takes exact values between binary and decimal, which reach far,
+ * so it has binary numbers of many limbs of 32 bits, little end first, in a
+ * work area of the routine, whose size goes by the formats at hand: a product
+ * in all of it, or a power of 5 and a remainder in a half of it each. A cut on
+ * the exponents first leaves out the values that overflow or round to zero.
+ */
+#define LGRT_DEC_MAX(a, b) ((a) > (b) ? (a) : (b))
+#define LGRT_DEC_MIN(a, b) ((a) < (b) ? (a) : (b))
+
+/*
+ * The largest power of 5 that a value of a binary format of bits from 2^lo up
+ * to below 2^hi needs in the format of this many words.
+ */
+#define LGRT_DEC_POWER(hi, lo, words) \
+    LGRT_DEC_MIN( \
+        LGRT_DEC_MAX( \
+            (hi) * 302 / 1000 + 2, (1 - (lo)) * 302 / 1000 + 9 * (words) + 1 \
+        ), \
+        ((words) == 1 ? 101 : (words) == 2 ? 398 : 6176) + 9 * (words) + 3 \
+    )
+
+/* log2(5) is below 7 / 3. */
+#define LGRT_DEC_HALF(bits, hi, lo, words) \
+    ((LGRT_DEC_MAX((bits), (words) == 4 ? 113 : 27 * (words)) \
+      + LGRT_DEC_POWER(hi, lo, words) * 7 / 3) / 32 + 3)
+
+/* Multiplies by 5^count, and returns the limbs that the product has. */
+static size_t lgrt_dec_big_times_5(uint32_t *x, size_t n, size_t count) {
+    while (count != 0) {
+        size_t step = count < 13 ? count : 13;
+        uint32_t factor = 1;
+        uint32_t carry = 0;
+
+        for (size_t i = 0; i < step; i++) {
+            factor *= 5;
+        }
+        for (size_t i = 0; i < n; i++) {
+            uint64_t value = (uint64_t)x[i] * factor + carry;
+
+            x[i] = (uint32_t)value;
+            carry = (uint32_t)(value >> 32);
+        }
+        if (carry != 0) {
+            x[n] = carry;
+            n += 1;
+        }
+        count -= step;
+    }
+    return n;
+}
+
+static size_t lgrt_dec_big_length(const uint32_t *x, size_t n) {
+    for (size_t i = n; i-- > 0; ) {
+        if (x[i] != 0) {
+            return 32 * i + 32 - lgrt_clz32(x[i]);
+        }
+    }
+    return 0;
+}
+
+/* The 32 bits from bit pos up, with zeros below bit 0 and above the limbs. */
+static uint32_t lgrt_dec_big_word_at(
+    const uint32_t *x, size_t n, int32_t pos
+) {
+    size_t limb = (size_t)pos >> 5;
+    unsigned int shift = (unsigned int)pos & 31;
+    uint32_t bits;
+
+    if (pos < 0) {
+        return pos > -32 && n != 0 ? x[0] << -pos : 0;
+    }
+    bits = limb < n ? x[limb] >> shift : 0;
+    if (shift != 0 && limb + 1 < n) {
+        bits |= x[limb + 1] << (32 - shift);
+    }
+    return bits;
+}
+
+static bool lgrt_dec_big_any_below(
+    const uint32_t *x, size_t n, size_t count
+) {
+    size_t whole = count >> 5;
+    unsigned int rest = (unsigned int)count & 31;
+
+    for (size_t i = 0; i < whole && i < n; i++) {
+        if (x[i] != 0) {
+            return true;
+        }
+    }
+    return whole < n && rest != 0 && x[whole] << (32 - rest) != 0;
+}
+
+/*
+ * Gives x shifted right by shift, or left where that is negative, which fits
+ * y, and whether that lost any bits.
+ */
+static bool lgrt_dec_big_take(
+    uint32_t *y, size_t yn, const uint32_t *x, size_t n, int32_t shift
+) {
+    for (size_t i = 0; i < yn; i++) {
+        y[i] = lgrt_dec_big_word_at(x, n, shift + 32 * (int32_t)i);
+    }
+    return shift > 0 && lgrt_dec_big_any_below(x, n, (size_t)shift);
+}
+
+/* Subtracts from x, of n limbs, a y not above it, of as many limbs or less. */
+static void lgrt_dec_big_subtract(
+    uint32_t *x, size_t n, const uint32_t *y, size_t yn
+) {
+    uint32_t borrow = 0;
+
+    for (size_t i = 0; i < n; i++) {
+        uint64_t difference = (uint64_t)x[i] - (i < yn ? y[i] : 0) - borrow;
+
+        x[i] = (uint32_t)difference;
+        borrow = (uint32_t)(difference >> 32) & 1;
+    }
+}
+
+/*
+ * Gives the quotient of x * 2^shift, rounded down, by den, which fits y, and
+ * whether anything is left. It goes one bit at a time, from all the bits that
+ * the remainder can start with, so that the work is that of the bits of the
+ * quotient. rem has room for a limb more than den.
+ */
+static bool lgrt_dec_big_divide(
+    uint32_t *y, size_t yn, const uint32_t *x, size_t n, int32_t shift,
+    const uint32_t *den, size_t dn, uint32_t *rem
+) {
+    int32_t length = (int32_t)lgrt_dec_big_length(x, n);
+    int32_t total = length + shift;
+    int32_t first = (int32_t)lgrt_dec_big_length(den, dn) - 1;
+    bool left = shift < 0 && lgrt_dec_big_any_below(x, n, (size_t)-shift);
+
+    first = first < total ? first : total;
+    lgrt_dec_big_take(rem, dn + 1, x, n, length - first);
+    for (size_t i = 0; i < yn; i++) {
+        y[i] = 0;
+    }
+    for (int32_t i = total - first; i-- > 0; ) {
+        uint32_t carry = 0;
+        uint32_t bit = i - shift < 0
+            ? 0
+            : lgrt_dec_big_word_at(x, n, i - shift) & 1;
+
+        for (size_t j = 0; j <= dn; j++) {
+            uint32_t next = rem[j] >> 31;
+
+            rem[j] = rem[j] << 1 | (j == 0 ? bit : carry);
+            carry = next;
+        }
+        carry = rem[dn] != 0 || lgrt_dec_order(rem, den, dn) >= 0 ? 1 : 0;
+        if (carry != 0) {
+            lgrt_dec_big_subtract(rem, dn + 1, den, dn);
+        }
+        for (size_t j = 0; j < yn; j++) {
+            uint32_t next = y[j] >> 31;
+
+            y[j] = y[j] << 1 | carry;
+            carry = next;
+        }
+    }
+    return left || lgrt_dec_big_length(rem, dn + 1) != 0;
+}
+
+static void lgrt_dec_special(
+    void *value, int kind, bool negative, size_t words
+) {
+    struct lgrt_dec r;
+
+    lgrt_dec_set_infinite(&r, negative);
+    r.kind = kind;
+    lgrt_dec_pack(value, &r, words);
+}
+
+/*
+ * The value m * 2^e in the format of this many words. 10^l is at most the
+ * value, so that its product with 10^t, rounded down, has 2 or 3 digits more
+ * than the precision, for rounding to work on, and fits 4 limbs. Where that
+ * product is exact, it goes back towards exponent 0.
+ */
+static void lgrt_dec_from_binary(
+    void *value, const uint32_t *m, size_t mn, int32_t e, bool negative,
+    size_t words, uint32_t *work, size_t half
+) {
+    struct lgrt_dec r;
+    uint32_t y[4];
+    uint32_t chunks[8];
+    uint32_t c[LGRT_DEC_INTEGER_LIMBS];
+    int32_t precision = (int32_t)lgrt_dec_precision(words);
+    int32_t lowest = -lgrt_dec_bias(words);
+    size_t length = lgrt_dec_big_length(m, mn);
+    int32_t b = (int32_t)length + e;
+    int32_t l = b > 0
+        ? (b - 1) * 30102 / 100000
+        : -((1 - b) * 30103 / 100000) - 1;
+    int32_t t = precision + 1 - l;
+    int32_t exponent = -t;
+    bool sticky;
+
+    r.negative = negative;
+    if (l >= lgrt_dec_highest_exponent(words) + precision) {
+        lgrt_dec_special(value, LGRT_DEC_INFINITE, negative, words);
+        return;
+    }
+    for (size_t i = 0; i < LGRT_DEC_INTEGER_LIMBS; i++) {
+        c[i] = 0;
+    }
+    if (length == 0 || (b <= 0 && -b * 30102 / 100000 >= 1 - lowest)) {
+        lgrt_dec_round(
+            &r, c, LGRT_DEC_INTEGER_LIMBS, length == 0 ? 0 : lowest, false,
+            words
+        );
+        lgrt_dec_pack(value, &r, words);
+        return;
+    }
+    if (t >= 0) {
+        size_t n = (length + 31) >> 5;
+
+        for (size_t i = 0; i < n; i++) {
+            work[i] = m[i];
+        }
+        n = lgrt_dec_big_times_5(work, n, (size_t)t);
+        sticky = lgrt_dec_big_take(y, 4, work, n, -e - t);
+    } else {
+        size_t dn;
+
+        work[0] = 1;
+        dn = lgrt_dec_big_times_5(work, 1, (size_t)-t);
+        sticky = lgrt_dec_big_divide(
+            y, 4, m, mn, e + t, work, dn, work + half
+        );
+    }
+    for (size_t i = 0; i < 4; i++) {
+        chunks[2 * i] = y[i] & 0xffff;
+        chunks[2 * i + 1] = y[i] >> 16;
+    }
+    lgrt_dec_chunks_to_limbs(c, LGRT_DEC_INTEGER_LIMBS, chunks, 8);
+    if (!sticky && t > 0) {
+        size_t zeros = lgrt_dec_trailing_zeros(c, LGRT_DEC_INTEGER_LIMBS);
+
+        zeros = zeros < (size_t)t ? zeros : (size_t)t;
+        lgrt_dec_scale_down(c, LGRT_DEC_INTEGER_LIMBS, zeros);
+        exponent += (int32_t)zeros;
+    }
+    lgrt_dec_round(
+        &r, c, LGRT_DEC_INTEGER_LIMBS, exponent, sticky, words
+    );
+    lgrt_dec_pack(value, &r, words);
+}
+
+/*
+ * Gives x / 5^power, for a power of 0 too, as y * 2^exponent, the shape that
+ * the rounding of a binary format takes: y has want bits, the top one set and
+ * the last one telling of any left below them too.
+ */
+static int32_t lgrt_dec_big_top_bits(
+    uint32_t *y, size_t want, const uint32_t *x, size_t n, size_t power,
+    uint32_t *work, size_t half
+) {
+    int32_t length = (int32_t)lgrt_dec_big_length(x, n);
+    int32_t shift = length - (int32_t)want;
+    bool sticky;
+
+    if (power == 0) {
+        sticky = lgrt_dec_big_take(y, 4, x, n, shift);
+    } else {
+        uint32_t q[4];
+        size_t dn;
+        int32_t extra;
+
+        work[0] = 1;
+        dn = lgrt_dec_big_times_5(work, 1, power);
+        shift = (int32_t)want + 1 + (int32_t)lgrt_dec_big_length(work, dn)
+            - length;
+        sticky = lgrt_dec_big_divide(
+            q, 4, x, n, shift, work, dn, work + half
+        );
+        extra = (int32_t)lgrt_dec_big_length(q, 4) - (int32_t)want;
+        sticky = lgrt_dec_big_take(y, 4, q, 4, extra) || sticky;
+        shift = extra - shift;
+    }
+    if (sticky) {
+        y[0] |= 1;
+    }
+    return shift;
+}
+
+/* A kind of number for a binary format, beside those of a decimal one. */
+#define LGRT_DEC_ZERO 4
+
+/*
+ * Reads a number for a binary format whose values go from 2^lo up to below
+ * 2^hi: a finite one as lgrt_dec_big_top_bits gives it. Returns what kind of
+ * number it is, or LGRT_DEC_ZERO for zero and for what rounds to it.
+ */
+static int lgrt_dec_to_binary(
+    uint32_t *y, size_t want, int32_t *exponent, bool *negative,
+    const void *value, size_t words, int32_t hi, int32_t lo, uint32_t *work,
+    size_t half
+) {
+    struct lgrt_dec x;
+    uint32_t m[4];
+    size_t digits;
+    int32_t top;
+
+    lgrt_dec_unpack(&x, value, words);
+    *negative = x.negative;
+    if (x.kind == LGRT_DEC_SIGNALLING) {
+        return LGRT_DEC_QUIET;
+    }
+    if (x.kind != LGRT_DEC_FINITE) {
+        return x.kind;
+    }
+    digits = lgrt_dec_digits(x.coefficient, LGRT_DEC_LIMBS);
+    top = x.exponent + (int32_t)digits;
+    if (digits == 0 || (top <= 0 && -top * 3321 / 1000 >= 1 - lo)) {
+        return LGRT_DEC_ZERO;
+    }
+    if (top > 1 && (top - 1) * 3321 / 1000 >= hi) {
+        return LGRT_DEC_INFINITE;
+    }
+    lgrt_dec_coefficient_bits(m, &x);
+    if (x.exponent >= 0) {
+        size_t n = (lgrt_dec_big_length(m, 4) + 31) >> 5;
+
+        for (size_t i = 0; i < n; i++) {
+            work[i] = m[i];
+        }
+        n = lgrt_dec_big_times_5(work, n, (size_t)x.exponent);
+        *exponent = x.exponent
+            + lgrt_dec_big_top_bits(y, want, work, n, 0, work, half);
+    } else {
+        *exponent = x.exponent + lgrt_dec_big_top_bits(
+            y, want, m, 4, (size_t)-x.exponent, work, half
+        );
+    }
+    return LGRT_DEC_FINITE;
+}
+
+#define LGRT_DEC_FROM_NARROW(fmt, C, T, E, F) \
+    static void lgrt_dec_from_##fmt( \
+        void *value, C a, size_t words, uint32_t *work, size_t half \
+    ) { \
+        T bits = lgrt_##fmt##_to_bits(a); \
+        T sig = bits & (LGRT_FP_INT_BIT(T, F) - 1); \
+        int32_t field = (int32_t)(bits >> (F)) & LGRT_FP_EXP_MAX(E); \
+        bool negative = (bits & LGRT_FP_SIGN(T, E, F)) != 0; \
+        uint32_t m[2]; \
+        \
+        if (field == LGRT_FP_EXP_MAX(E)) { \
+            lgrt_dec_special( \
+                value, sig == 0 ? LGRT_DEC_INFINITE : LGRT_DEC_QUIET, \
+                negative, words \
+            ); \
+            return; \
+        } \
+        if (field != 0) { \
+            sig |= LGRT_FP_INT_BIT(T, F); \
+        } else { \
+            field = 1; \
+        } \
+        m[0] = (uint32_t)sig; \
+        m[1] = (uint32_t)((uint64_t)sig >> 32); \
+        lgrt_dec_from_binary( \
+            value, m, 2, field - LGRT_FP_BIAS(E) - (F), negative, words, \
+            work, half \
+        ); \
+    }
+
+#define LGRT_DEC_TO_NARROW(fmt, C, T, E, F, hi, lo) \
+    static C lgrt_dec_to_##fmt( \
+        const void *value, size_t words, uint32_t *work, size_t half \
+    ) { \
+        uint32_t y[4]; \
+        int32_t e = 0; \
+        bool negative; \
+        int kind = lgrt_dec_to_binary( \
+            y, (F) + 4, &e, &negative, value, words, (hi), (lo), work, half \
+        ); \
+        T bits = negative ? LGRT_FP_SIGN(T, E, F) : 0; \
+        \
+        if (kind == LGRT_DEC_INFINITE) { \
+            bits |= LGRT_FP_INF(T, E, F); \
+        } else if (kind == LGRT_DEC_QUIET) { \
+            bits |= LGRT_FP_NAN(T, E, F); \
+        } else if (kind == LGRT_DEC_FINITE) { \
+            bits = lgrt_##fmt##_round_pack( \
+                bits, (unsigned int)(e + LGRT_FP_BIAS(E) + (F) + 3), \
+                (T)((uint64_t)y[1] << 32 | y[0]) \
+            ); \
+        } \
+        return lgrt_##fmt##_from_bits(bits); \
+    }
+
+#define LGRT_DEC_FROM_WIDE(fmt, C, M, F) \
+    static void lgrt_dec_from_##fmt( \
+        void *value, C a, size_t words, uint32_t *work, size_t half \
+    ) { \
+        struct lgrt_wide x = lgrt_##fmt##_to_bits(a); \
+        struct lgrt_wide magnitude = LGRT_WIDE_MAGNITUDE(x); \
+        struct lgrt_wide sig = lgrt_wide_low_bits(magnitude, (F)); \
+        int32_t field = (int32_t)lgrt_wide_exponent(magnitude, (F)); \
+        bool negative = (x.high & LGRT_WIDE_SIGN) != 0; \
+        uint32_t m[4]; \
+        \
+        if (field == (M)) { \
+            lgrt_dec_special( \
+                value, \
+                sig.high == 0 && sig.low == 0 \
+                    ? LGRT_DEC_INFINITE \
+                    : LGRT_DEC_QUIET, \
+                negative, words \
+            ); \
+            return; \
+        } \
+        if (field != 0) { \
+            sig = lgrt_wide_or(sig, LGRT_WIDE_INT_BIT(F)); \
+        } else { \
+            field = 1; \
+        } \
+        m[0] = (uint32_t)sig.low; \
+        m[1] = (uint32_t)(sig.low >> 32); \
+        m[2] = (uint32_t)sig.high; \
+        m[3] = (uint32_t)(sig.high >> 32); \
+        lgrt_dec_from_binary( \
+            value, m, 4, field - LGRT_WIDE_BIAS(M) - (F), negative, words, \
+            work, half \
+        ); \
+    }
+
+#define LGRT_DEC_TO_WIDE(fmt, C, M, F, hi, lo) \
+    static C lgrt_dec_to_##fmt( \
+        const void *value, size_t words, uint32_t *work, size_t half \
+    ) { \
+        uint32_t y[4]; \
+        int32_t e = 0; \
+        bool negative; \
+        int kind = lgrt_dec_to_binary( \
+            y, (F) + 4, &e, &negative, value, words, (hi), (lo), work, half \
+        ); \
+        uint64_t sign = negative ? LGRT_WIDE_SIGN : 0; \
+        struct lgrt_wide bits = lgrt_wide_make(sign, 0); \
+        \
+        if (kind == LGRT_DEC_INFINITE) { \
+            bits = lgrt_wide_or(bits, LGRT_WIDE_INF(M, F)); \
+        } else if (kind == LGRT_DEC_QUIET) { \
+            bits = lgrt_wide_or(bits, LGRT_WIDE_NAN(M, F)); \
+        } else if (kind == LGRT_DEC_FINITE) { \
+            bits = lgrt_##fmt##_round_pack( \
+                sign, (unsigned int)(e + LGRT_WIDE_BIAS(M) + (F) + 3), \
+                lgrt_wide_make( \
+                    (uint64_t)y[3] << 32 | y[2], (uint64_t)y[1] << 32 | y[0] \
+                ) \
+            ); \
+        } \
+        return lgrt_##fmt##_from_bits(bits); \
+    }
+
+/* Routines of one binary type and one decimal one, by direction. */
+#define LGRT_DEC_FROM_TYPE(name, fmt, C, bits, hi, lo, T, words) \
+    LGRT_DEC_RETURN T LGRT_DEC_NAME(name)(C a) { \
+        uint32_t work[2 * LGRT_DEC_HALF(bits, hi, lo, words)]; \
+        T r; \
+        \
+        lgrt_dec_from_##fmt( \
+            &r, a, words, work, LGRT_DEC_HALF(bits, hi, lo, words) \
+        ); \
+        return r; \
+    }
+
+#define LGRT_DEC_TO_TYPE(name, fmt, C, bits, hi, lo, T, words) \
+    C LGRT_DEC_NAME(name)(T a) { \
+        uint32_t work[2 * LGRT_DEC_HALF(bits, hi, lo, words)]; \
+        \
+        return lgrt_dec_to_##fmt( \
+            &a, words, work, LGRT_DEC_HALF(bits, hi, lo, words) \
+        ); \
+    }
+
+/*
+ * The three from a binary type, given their names, whose bits and range are
+ * the rest of the arguments.
+ */
+#define LGRT_DEC_FROM_ALL(sd, dd, td, fmt, C, bits, hi, lo) \
+    LGRT_DEC_FROM_TYPE(sd, fmt, C, bits, hi, lo, lgrt_sd_value, 1) \
+    LGRT_DEC_FROM_TYPE(dd, fmt, C, bits, hi, lo, lgrt_dd_value, 2) \
+    LGRT_DEC_FROM_TYPE(td, fmt, C, bits, hi, lo, lgrt_td_value, 4)
+
+#define LGRT_DEC_TO_ALL(sd, dd, td, fmt, C, bits, hi, lo) \
+    LGRT_DEC_TO_TYPE(sd, fmt, C, bits, hi, lo, lgrt_sd_value, 1) \
+    LGRT_DEC_TO_TYPE(dd, fmt, C, bits, hi, lo, lgrt_dd_value, 2) \
+    LGRT_DEC_TO_TYPE(td, fmt, C, bits, hi, lo, lgrt_td_value, 4)
+
+LGRT_DEC_FROM_NARROW(sf, lgrt_sf_value, uint32_t, 8, 23)
+LGRT_DEC_TO_NARROW(sf, lgrt_sf_value, uint32_t, 8, 23, 128, -149)
+LGRT_DEC_FROM_ALL(
+    extendsfsd, extendsfdd, extendsftd, sf, lgrt_sf_value, 24, 128, -149
+)
+LGRT_DEC_TO_ALL(
+    truncsdsf, truncddsf, trunctdsf, sf, lgrt_sf_value, 24, 128, -149
+)
+
+#if LGRT_SOFT_DOUBLE
+LGRT_DEC_FROM_NARROW(df, lgrt_df_value, uint64_t, 11, 52)
+LGRT_DEC_TO_NARROW(df, lgrt_df_value, uint64_t, 11, 52, 1024, -1074)
+LGRT_DEC_FROM_ALL(
+    truncdfsd, extenddfdd, extenddftd, df, lgrt_df_value, 53, 1024, -1074
+)
+LGRT_DEC_TO_ALL(
+    extendsddf, truncdddf, trunctddf, df, lgrt_df_value, 53, 1024, -1074
+)
+#endif
+
+#if LGRT_SOFT_HF && !LGRT_HF_PASSED_AS_INT
+LGRT_DEC_FROM_NARROW(hf, lgrt_hf_value, uint32_t, 5, 10)
+LGRT_DEC_TO_NARROW(hf, lgrt_hf_value, uint32_t, 5, 10, 16, -24)
+LGRT_DEC_FROM_ALL(
+    extendhfsd, extendhfdd, extendhftd, hf, lgrt_hf_value, 11, 16, -24
+)
+LGRT_DEC_TO_ALL(
+    truncsdhf, truncddhf, trunctdhf, hf, lgrt_hf_value, 11, 16, -24
+)
+#endif
+
+/* Compilers take bfloat16 to the wider two through float. */
+#if defined(LGRT_SOFT_BF)
+LGRT_DEC_FROM_NARROW(bf, lgrt_bf_value, uint32_t, 8, 7)
+LGRT_DEC_TO_NARROW(bf, lgrt_bf_value, uint32_t, 8, 7, 128, -133)
+LGRT_DEC_FROM_TYPE(
+    extendbfsd, bf, lgrt_bf_value, 8, 128, -133, lgrt_sd_value, 1
+)
+LGRT_DEC_TO_ALL(
+    truncsdbf, truncddbf, trunctdbf, bf, lgrt_bf_value, 8, 128, -133
+)
+#endif
+
+/* x86-64 cannot return long double with x87 off, as LGRT_XF_RETURNED tells. */
+#if defined(__i386__) || defined(__x86_64__)
+LGRT_DEC_FROM_WIDE(xf, lgrt_xf_argument, LGRT_XF_EXP_MAX, 63)
+LGRT_DEC_FROM_ALL(
+    truncxfsd, truncxfdd, extendxftd, xf, lgrt_xf_argument, 64, 16384, -16445
+)
+#if LGRT_XF_RETURNED
+LGRT_DEC_TO_WIDE(xf, lgrt_xf_value, LGRT_XF_EXP_MAX, 63, 16384, -16445)
+LGRT_DEC_TO_ALL(
+    extendsdxf, extendddxf, trunctdxf, xf, lgrt_xf_value, 64, 16384, -16445
+)
+#endif
+#endif
+
+/* PowerPC has IEEE quad under the name kf where the file does too. */
+#if LGRT_SOFT_QUAD && defined(__powerpc__) \
+ && (defined(__FLOAT128__) || defined(__VSX__))
+LGRT_DEC_FROM_WIDE(kf, lgrt_quad_value, 32767, 112)
+LGRT_DEC_TO_WIDE(kf, lgrt_quad_value, 32767, 112, 16384, -16494)
+LGRT_DEC_FROM_ALL(
+    trunckfsd, trunckfdd, extendkftd, kf, lgrt_quad_value, 113, 16384, -16494
+)
+LGRT_DEC_TO_ALL(
+    extendsdkf, extendddkf, trunctdkf, kf, lgrt_quad_value, 113, 16384, -16494
+)
+#elif LGRT_SOFT_QUAD
+LGRT_DEC_FROM_WIDE(tf, lgrt_quad_value, 32767, 112)
+LGRT_DEC_TO_WIDE(tf, lgrt_quad_value, 32767, 112, 16384, -16494)
+LGRT_DEC_FROM_ALL(
+    trunctfsd, trunctfdd, extendtftd, tf, lgrt_quad_value, 113, 16384, -16494
+)
+LGRT_DEC_TO_ALL(
+    extendsdtf, extendddtf, trunctdtf, tf, lgrt_quad_value, 113, 16384, -16494
+)
+#endif
+
+#if LGRT_HAS_IBM_128
+
+/* An exact sum of two doubles, of bits from 2^1023 down to 2^-1074. */
+#define LGRT_DEC_IBM_SUM_LIMBS 68
+#define LGRT_DEC_IBM_SUM_BITS 2100
+
+/* What the rest of a value takes beside the first double, at most. */
+#define LGRT_DEC_IBM_REST_LIMBS 40
+
+/* Puts a value in n limbs, at a bit that leaves it room there. */
+static void lgrt_dec_big_set(
+    uint32_t *x, size_t n, uint64_t value, size_t pos
+) {
+    size_t limb = pos >> 5;
+    unsigned int shift = (unsigned int)pos & 31;
+
+    for (size_t i = 0; i < n; i++) {
+        x[i] = 0;
+    }
+    x[limb] = (uint32_t)value << shift;
+    x[limb + 1] = (uint32_t)(value >> (32 - shift));
+    if (shift != 0) {
+        x[limb + 2] = (uint32_t)((value >> 32) >> (32 - shift));
+    }
+}
+
+/* The significand of a finite double, and the exponent of its last bit. */
+static uint64_t lgrt_dec_double_sig(uint64_t bits, int32_t *e) {
+    uint64_t sig = bits & (LGRT_FP_INT_BIT(uint64_t, 52) - 1);
+    int32_t field = (int32_t)(bits >> 52) & LGRT_FP_EXP_MAX(11);
+
+    if (field != 0) {
+        sig |= LGRT_FP_INT_BIT(uint64_t, 52);
+    } else {
+        field = 1;
+    }
+    *e = field - LGRT_FP_BIAS(11) - 52;
+    return sig;
+}
+
+/*
+ * The value of a pair is the exact sum of its doubles, or its first double
+ * where that is an infinity or a NaN, as the format has it, or else its second
+ * where that is one. An exact cancellation gives +0, and two zeros the sign of
+ * the first.
+ */
+static void lgrt_dec_from_ibm(
+    void *value, lgrt_ibm_value a, size_t words, uint32_t *work, size_t half
+) {
+    struct lgrt_ibm_bits bits = lgrt_ibm_to_bits(a);
+    uint64_t mask = LGRT_IBM_SIGN - 1;
+    uint64_t special = (bits.high & mask) >= LGRT_IBM_INF
+        ? bits.high
+        : bits.low;
+    bool first_negative = (bits.high & LGRT_IBM_SIGN) != 0;
+    bool second_negative = (bits.low & LGRT_IBM_SIGN) != 0;
+    bool negative = first_negative;
+    uint32_t x[LGRT_DEC_IBM_SUM_LIMBS];
+    uint32_t y[LGRT_DEC_IBM_SUM_LIMBS];
+    const uint32_t *sum = x;
+    uint64_t sig_x;
+    uint64_t sig_y;
+    int32_t e_x;
+    int32_t e_y;
+    int32_t base;
+
+    if ((special & mask) >= LGRT_IBM_INF) {
+        lgrt_dec_special(
+            value,
+            (special & mask) == LGRT_IBM_INF
+                ? LGRT_DEC_INFINITE
+                : LGRT_DEC_QUIET,
+            (special & LGRT_IBM_SIGN) != 0, words
+        );
+        return;
+    }
+    sig_x = lgrt_dec_double_sig(bits.high, &e_x);
+    sig_y = lgrt_dec_double_sig(bits.low, &e_y);
+    base = sig_y == 0 || (sig_x != 0 && e_x < e_y) ? e_x : e_y;
+    lgrt_dec_big_set(
+        x, LGRT_DEC_IBM_SUM_LIMBS, sig_x,
+        sig_x == 0 ? 0 : (size_t)(e_x - base)
+    );
+    lgrt_dec_big_set(
+        y, LGRT_DEC_IBM_SUM_LIMBS, sig_y,
+        sig_y == 0 ? 0 : (size_t)(e_y - base)
+    );
+    if (first_negative == second_negative) {
+        uint32_t carry = 0;
+
+        for (size_t i = 0; i < LGRT_DEC_IBM_SUM_LIMBS; i++) {
+            uint64_t total = (uint64_t)x[i] + y[i] + carry;
+
+            x[i] = (uint32_t)total;
+            carry = (uint32_t)(total >> 32);
+        }
+    } else {
+        int order = lgrt_dec_order(x, y, LGRT_DEC_IBM_SUM_LIMBS);
+
+        if (order < 0) {
+            lgrt_dec_big_subtract(
+                y, LGRT_DEC_IBM_SUM_LIMBS, x, LGRT_DEC_IBM_SUM_LIMBS
+            );
+            sum = y;
+            negative = second_negative;
+        } else if (order > 0) {
+            lgrt_dec_big_subtract(
+                x, LGRT_DEC_IBM_SUM_LIMBS, y, LGRT_DEC_IBM_SUM_LIMBS
+            );
+        } else {
+            for (size_t i = 0; i < LGRT_DEC_IBM_SUM_LIMBS; i++) {
+                x[i] = 0;
+            }
+            negative = sig_x == 0 && first_negative;
+        }
+    }
+    lgrt_dec_from_binary(
+        value, sum, LGRT_DEC_IBM_SUM_LIMBS, base, negative, words, work, half
+    );
+}
+
+/*
+ * What is left of a finite number c * 10^q beside a first double h * 2^g,
+ * rounded to a double. Over 5^-q where q is negative, the difference of two
+ * integers is that of c and h, each with its power of 5 and of 2, down to
+ * 2^w.
+ */
+static uint64_t lgrt_dec_ibm_rest(
+    uint64_t first, const void *value, size_t words, uint32_t *work,
+    size_t half
+) {
+    struct lgrt_dec d;
+    uint32_t x[LGRT_DEC_IBM_REST_LIMBS];
+    uint32_t y[LGRT_DEC_IBM_REST_LIMBS];
+    uint32_t t[LGRT_DEC_IBM_REST_LIMBS];
+    uint32_t bits[4];
+    const uint32_t *rest = x;
+    uint64_t sign = first & LGRT_IBM_SIGN;
+    int32_t g;
+    uint64_t h = lgrt_dec_double_sig(first, &g);
+    int32_t q;
+    int32_t w;
+    size_t power;
+    size_t n;
+    int order;
+
+    lgrt_dec_unpack(&d, value, words);
+    lgrt_dec_coefficient_bits(bits, &d);
+    q = d.exponent;
+    w = q < g ? q : g;
+    power = q < 0 ? (size_t)-q : 0;
+    for (size_t i = 0; i < 4; i++) {
+        t[i] = bits[i];
+    }
+    n = lgrt_dec_big_times_5(t, 4, q < 0 ? 0 : (size_t)q);
+    lgrt_dec_big_take(x, LGRT_DEC_IBM_REST_LIMBS, t, n, w - q);
+    t[0] = (uint32_t)h;
+    t[1] = (uint32_t)(h >> 32);
+    n = lgrt_dec_big_times_5(t, 2, power);
+    lgrt_dec_big_take(y, LGRT_DEC_IBM_REST_LIMBS, t, n, w - g);
+    order = lgrt_dec_order(x, y, LGRT_DEC_IBM_REST_LIMBS);
+    if (order == 0) {
+        return 0;
+    }
+    if (order < 0) {
+        lgrt_dec_big_subtract(
+            y, LGRT_DEC_IBM_REST_LIMBS, x, LGRT_DEC_IBM_REST_LIMBS
+        );
+        rest = y;
+        sign ^= LGRT_IBM_SIGN;
+    } else {
+        lgrt_dec_big_subtract(
+            x, LGRT_DEC_IBM_REST_LIMBS, y, LGRT_DEC_IBM_REST_LIMBS
+        );
+    }
+    w += lgrt_dec_big_top_bits(
+        bits, 56, rest, LGRT_DEC_IBM_REST_LIMBS, power, work, half
+    );
+    return lgrt_df_round_pack(
+        sign, (unsigned int)(w + LGRT_FP_BIAS(11) + 52 + 3),
+        (uint64_t)bits[1] << 32 | bits[0]
+    );
+}
+
+static lgrt_ibm_value lgrt_dec_to_ibm(
+    const void *value, size_t words, uint32_t *work, size_t half
+) {
+    uint32_t y[4];
+    int32_t e = 0;
+    bool negative;
+    int kind = lgrt_dec_to_binary(
+        y, 56, &e, &negative, value, words, 1024, -1074, work, half
+    );
+    uint64_t first = negative ? LGRT_IBM_SIGN : 0;
+    uint64_t second = 0;
+
+    if (kind == LGRT_DEC_INFINITE) {
+        first |= LGRT_IBM_INF;
+    } else if (kind == LGRT_DEC_QUIET) {
+        first |= LGRT_IBM_NAN;
+    } else if (kind == LGRT_DEC_FINITE) {
+        uint64_t mask = LGRT_IBM_SIGN - 1;
+
+        first = lgrt_df_round_pack(
+            first, (unsigned int)(e + LGRT_FP_BIAS(11) + 52 + 3),
+            (uint64_t)y[1] << 32 | y[0]
+        );
+        if ((first & mask) != 0 && (first & mask) < LGRT_IBM_INF) {
+            second = lgrt_dec_ibm_rest(first, value, words, work, half);
+        }
+    }
+    return lgrt_ibm_from_bits(lgrt_ibm_make(first, second));
+}
+
+LGRT_DEC_FROM_ALL(
+    trunctfsd, trunctfdd, extendtftd, ibm, lgrt_ibm_value,
+    LGRT_DEC_IBM_SUM_BITS, 1024, -1074
+)
+LGRT_DEC_TO_ALL(
+    extendsdtf, extendddtf, trunctdtf, ibm, lgrt_ibm_value, 128, 1024, -1074
+)
+
+#endif
+
+#if LGRT_BITINT_GCC
+
+/*
+ * The integer part of a number into a result of the file's other conversions
+ * to _BitInt: a NaN, what is below 1, and a negative value in an unsigned type
+ * give 0, and what does not fit saturates.
+ */
+static void lgrt_dec_to_bitint(
+    lgrt_limb *r, int32_t rprec, const void *value, size_t words,
+    uint32_t *work
+) {
+    struct lgrt_dec x;
+    int32_t bits = (int32_t)lgrt_bitint_bits(rprec);
+    size_t rn = lgrt_bitint_limbs(rprec);
+    int32_t digits;
+    int32_t top;
+    int32_t length;
+    size_t n;
+
+    lgrt_dec_unpack(&x, value, words);
+    digits = (int32_t)lgrt_dec_digits(x.coefficient, LGRT_DEC_LIMBS);
+    top = x.exponent + digits;
+    if (x.kind >= LGRT_DEC_QUIET || (x.negative && rprec > 0)
+     || (x.kind == LGRT_DEC_FINITE && (digits == 0 || top <= 0))) {
+        lgrt_bitint_clear(r, rprec);
+        return;
+    }
+    if (x.kind == LGRT_DEC_INFINITE || (top - 1) * 3321 / 1000 >= bits) {
+        lgrt_bitint_saturate(r, rprec, x.negative);
+        return;
+    }
+    if (x.exponent < 0) {
+        lgrt_dec_scale_down(
+            x.coefficient, LGRT_DEC_LIMBS, (size_t)-x.exponent
+        );
+        x.exponent = 0;
+    }
+    lgrt_dec_coefficient_bits(work, &x);
+    n = lgrt_dec_big_times_5(work, 4, (size_t)x.exponent);
+    length = (int32_t)lgrt_dec_big_length(work, n) + x.exponent;
+    if (length > bits || (rprec < 0 && length == bits)) {
+        lgrt_bitint_saturate(r, rprec, x.negative);
+        return;
+    }
+    lgrt_bitint_clear(r, rprec);
+    for (size_t i = 0; i < n; i++) {
+        lgrt_bitint_set_bits(r, rn, (size_t)x.exponent + 32 * i, work[i]);
+    }
+    if (x.negative) {
+        lgrt_bitint_negate(r, rn);
+    }
+    r[LGRT_LIMB_AT(rn, rn - 1)] = lgrt_bitint_extend(
+        r[LGRT_LIMB_AT(rn, rn - 1)], rprec, rprec < 0
+    );
+}
+
+/*
+ * An operand of more limbs than m, given by the largest value that does not
+ * overflow, overflows.
+ */
+static void lgrt_dec_from_bitint(
+    void *value, const lgrt_limb *i, int32_t iprec, size_t words,
+    uint32_t *m, size_t capacity, uint32_t *work, size_t half
+) {
+    struct lgrt_bitint x;
+    size_t n = 0;
+
+    lgrt_bitint_load(&x, i, iprec);
+    if (x.count != 0 && lgrt_bitint_length(&x) > 32 * capacity) {
+        lgrt_dec_special(value, LGRT_DEC_INFINITE, x.negative, words);
+        return;
+    }
+    for (size_t limb = 0; limb < x.count; limb++) {
+        lgrt_limb magnitude = lgrt_bitint_magnitude(&x, limb);
+
+        for (size_t j = 0; j < LGRT_LIMB_BITS / 32 && n < capacity; j++) {
+            m[n] = (uint32_t)(magnitude >> (32 * j));
+            n += 1;
+        }
+    }
+    lgrt_dec_from_binary(value, m, n, 0, x.negative, words, work, half);
+}
+
+#define LGRT_DEC_BITINT_LIMBS(emax) (((emax) + 1) * 3322 / 1000 / 32 + 2)
+
+#define LGRT_DEC_BITINT(fmt, T, words, emax) \
+    void LGRT_DEC_NAME(fix##fmt##bitint)(lgrt_limb *r, int32_t rprec, T a) { \
+        uint32_t work[LGRT_DEC_HALF(0, 20416, 0, words)]; \
+        \
+        lgrt_dec_to_bitint(r, rprec, &a, words, work); \
+    } \
+    \
+    LGRT_DEC_RETURN T LGRT_DEC_NAME(floatbitint##fmt)( \
+        const lgrt_limb *i, int32_t iprec \
+    ) { \
+        uint32_t m[LGRT_DEC_BITINT_LIMBS(emax)]; \
+        uint32_t work[2 * LGRT_DEC_HALF(128, 20416, 0, words)]; \
+        T r; \
+        \
+        lgrt_dec_from_bitint( \
+            &r, i, iprec, words, m, LGRT_DEC_BITINT_LIMBS(emax), work, \
+            LGRT_DEC_HALF(128, 20416, 0, words) \
+        ); \
+        return r; \
+    }
+
+LGRT_DEC_BITINT(sd, lgrt_sd_value, 1, 96)
+LGRT_DEC_BITINT(dd, lgrt_dd_value, 2, 384)
+LGRT_DEC_BITINT(td, lgrt_td_value, 4, 6144)
+
 #endif
 
 #endif
