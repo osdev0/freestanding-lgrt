@@ -5975,6 +5975,8 @@ typedef __bf16 lgrt_bf_value;
 typedef lgrt_hf_value lgrt_bf_value;
 #endif
 
+#define LGRT_SOFT_BF 1
+
 LGRT_FP16_BITS(bf, lgrt_bf_value)
 LGRT_FP_STICKY_SHIFT(bf, uint32_t, 7)
 LGRT_FP_ROUND_PACK(bf, uint32_t, 8, 7)
@@ -8091,6 +8093,1489 @@ LGRT_XC_ROUTINE(__divxc3, lgrt_xf_cx_divide)
 #endif
 
 /*
+ * The routines of _BitInt work on arrays of limbs, whose width and order go by
+ * the target. A pointer comes with a precision, positive for an unsigned value
+ * of that many bits and negative for a signed one. The array has as many limbs
+ * as hold them. Bits above them in the top limb are not read, and are written
+ * as the extension of the value, for ABIs that want that. Compilers lower the
+ * precision of an operand where its value allows it, so operands and results
+ * differ in width. A result never overlaps an operand, while operands may
+ * overlap each other.
+ */
+#if defined(__x86_64__) || defined(__i386__) || defined(__riscv) \
+ || defined(__s390x__) || defined(__loongarch64) \
+ || (defined(__aarch64__) && !defined(__AARCH64EB__)) \
+ || (defined(__arm__) && !defined(__ARMEB__))
+#define LGRT_BITINT_GCC 1
+#else
+#define LGRT_BITINT_GCC 0
+#endif
+
+/* Clang has the type on more targets, with routines of other names. */
+#if LGRT_BITINT_GCC || defined(__aarch64__) || defined(__arm__) \
+ || defined(__mips__) || defined(__powerpc__) || defined(__sparc__) \
+ || defined(__hexagon__) || defined(__loongarch__)
+#define LGRT_BITINT 1
+#else
+#define LGRT_BITINT 0
+#endif
+
+#if LGRT_BITINT
+
+/* Not all that follows is used on every target. */
+#define LGRT_BITINT_HELPER static __attribute__((__unused__))
+
+#if defined(__x86_64__) || defined(__aarch64__) \
+ || (LGRT_64BIT && LGRT_HAS_INT128)
+#define LGRT_LIMB_BITS 64
+typedef uint64_t lgrt_limb;
+__extension__ typedef unsigned __int128 lgrt_double_limb;
+#else
+#define LGRT_LIMB_BITS 32
+typedef uint32_t lgrt_limb;
+typedef uint64_t lgrt_double_limb;
+#endif
+
+/* Where limb i of an array of n limbs is, limb 0 being the lowest. */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define LGRT_LIMB_AT(n, i) ((n) - 1 - (i))
+#else
+#define LGRT_LIMB_AT(n, i) ((void)(n), (i))
+#endif
+
+/* A shift of hi:lo left by s, from 0 to one less than a limb, keeping hi. */
+#define LGRT_LIMB_SHIFT(hi, lo, s) \
+    (((hi) << (s)) | (((lo) >> 1) >> (LGRT_LIMB_BITS - 1 - (s))))
+
+static inline uint32_t lgrt_bitint_bits(int32_t prec) {
+    return prec < 0 ? (uint32_t)0 - (uint32_t)prec : (uint32_t)prec;
+}
+
+static inline size_t lgrt_bitint_limbs(int32_t prec) {
+    return ((size_t)lgrt_bitint_bits(prec) + LGRT_LIMB_BITS - 1)
+        / LGRT_LIMB_BITS;
+}
+
+/* The top limb of a value, with the bits above its precision extended. */
+static inline lgrt_limb lgrt_bitint_extend(
+    lgrt_limb limb, int32_t prec, bool is_signed
+) {
+    unsigned int used = lgrt_bitint_bits(prec) % LGRT_LIMB_BITS;
+    lgrt_limb above;
+
+    if (used == 0) {
+        return limb;
+    }
+    above = ~(lgrt_limb)0 << used;
+    if (is_signed && ((limb >> (used - 1)) & 1) != 0) {
+        return limb | above;
+    }
+    return limb & ~above;
+}
+
+/*
+ * An operand, to be read as a sign and a magnitude. A signed value's magnitude
+ * has as many limbs as it does, however negative it is. The limbs of the
+ * magnitude are had one at a time, in any order, with nothing written: a
+ * negated limb at the lowest one that is not zero, and inverted ones above it.
+ * count is how many limbs it has without its leading zeros, 0 if it is zero.
+ */
+struct lgrt_bitint {
+    const lgrt_limb *limbs;
+    size_t stored;
+    size_t count;
+    size_t lowest;
+    lgrt_limb top;
+    bool negative;
+};
+
+static inline lgrt_limb lgrt_bitint_stored(
+    const struct lgrt_bitint *x, size_t i
+) {
+    if (i + 1 == x->stored) {
+        return x->top;
+    }
+    return x->limbs[LGRT_LIMB_AT(x->stored, i)];
+}
+
+static inline lgrt_limb lgrt_bitint_magnitude(
+    const struct lgrt_bitint *x, size_t i
+) {
+    lgrt_limb limb = lgrt_bitint_stored(x, i);
+
+    if (x->negative && i >= x->lowest) {
+        return i == x->lowest ? (lgrt_limb)0 - limb : ~limb;
+    }
+    return limb;
+}
+
+static void lgrt_bitint_load(
+    struct lgrt_bitint *x, const lgrt_limb *limbs, int32_t prec
+) {
+    lgrt_limb leading;
+
+    x->limbs = limbs;
+    x->stored = lgrt_bitint_limbs(prec);
+    x->count = 0;
+    x->lowest = 0;
+    x->top = 0;
+    x->negative = false;
+    if (x->stored == 0) {
+        return;
+    }
+    x->top = lgrt_bitint_extend(
+        limbs[LGRT_LIMB_AT(x->stored, x->stored - 1)], prec, prec < 0
+    );
+    x->negative = prec < 0 && (x->top >> (LGRT_LIMB_BITS - 1)) != 0;
+    while (x->lowest < x->stored && lgrt_bitint_stored(x, x->lowest) == 0) {
+        x->lowest += 1;
+    }
+    if (x->lowest == x->stored) {
+        return;
+    }
+    leading = x->negative ? ~(lgrt_limb)0 : 0;
+    x->count = x->stored;
+    while (x->count - 1 > x->lowest
+     && lgrt_bitint_stored(x, x->count - 1) == leading) {
+        x->count -= 1;
+    }
+}
+
+static void lgrt_bitint_negate(lgrt_limb *r, size_t rn) {
+    lgrt_limb carry = 1;
+
+    for (size_t i = 0; i < rn; i++) {
+        lgrt_limb limb = ~r[LGRT_LIMB_AT(rn, i)] + carry;
+
+        r[LGRT_LIMB_AT(rn, i)] = limb;
+        carry = (lgrt_limb)(carry != 0 && limb == 0);
+    }
+}
+
+/*
+ * The last step of a result of multiplication or division, whose precision has
+ * no sign: it can only be negative if an operand's precision was negative.
+ */
+static void lgrt_bitint_finish(
+    lgrt_limb *r, int32_t rprec, bool negate, bool any_signed
+) {
+    size_t rn = lgrt_bitint_limbs(rprec);
+
+    if (rn == 0) {
+        return;
+    }
+    if (negate) {
+        lgrt_bitint_negate(r, rn);
+    }
+    r[LGRT_LIMB_AT(rn, rn - 1)] = lgrt_bitint_extend(
+        r[LGRT_LIMB_AT(rn, rn - 1)], rprec, any_signed
+    );
+}
+
+LGRT_BITINT_HELPER void lgrt_bitint_mul(
+    lgrt_limb *ret, int32_t retprec, const lgrt_limb *u, int32_t uprec,
+    const lgrt_limb *v, int32_t vprec
+) {
+    size_t rn = lgrt_bitint_limbs(retprec);
+    struct lgrt_bitint a;
+    struct lgrt_bitint b;
+
+    lgrt_bitint_load(&a, u, uprec);
+    lgrt_bitint_load(&b, v, vprec);
+    for (size_t i = 0; i < rn; i++) {
+        ret[LGRT_LIMB_AT(rn, i)] = 0;
+    }
+    for (size_t i = 0; i < a.count && i < rn; i++) {
+        lgrt_limb x = lgrt_bitint_magnitude(&a, i);
+        lgrt_limb carry = 0;
+        size_t j;
+
+        for (j = 0; j < b.count && i + j < rn; j++) {
+            lgrt_limb *to = &ret[LGRT_LIMB_AT(rn, i + j)];
+            lgrt_double_limb t = (lgrt_double_limb)x
+                * lgrt_bitint_magnitude(&b, j) + *to + carry;
+
+            *to = (lgrt_limb)t;
+            carry = (lgrt_limb)(t >> LGRT_LIMB_BITS);
+        }
+        if (i + j < rn) {
+            ret[LGRT_LIMB_AT(rn, i + j)] = carry;
+        }
+    }
+    lgrt_bitint_finish(
+        ret, retprec, a.negative != b.negative, uprec < 0 || vprec < 0
+    );
+}
+
+/* The quotient of hi:lo by d, where hi < d, so that it fits in a limb. */
+static inline lgrt_limb lgrt_limb_divide(
+    lgrt_limb hi, lgrt_limb lo, lgrt_limb d, lgrt_limb *rem
+) {
+#if LGRT_LIMB_BITS == 64
+    return lgrt_udiv128by64(hi, lo, d, rem);
+#else
+    uint64_t r;
+    uint64_t q = lgrt_udivmod64(((uint64_t)hi << 32) | lo, d, &r);
+
+    *rem = (lgrt_limb)r;
+    return (lgrt_limb)q;
+#endif
+}
+
+static inline unsigned int lgrt_limb_clz(lgrt_limb x) {
+#if LGRT_LIMB_BITS == 64
+    return lgrt_clz64(x);
+#else
+    return lgrt_clz32(x);
+#endif
+}
+
+/*
+ * Knuth's Algorithm D, for operands of at least two limbs, with neither of
+ * them written. The divisor stays as it is: only its top two limbs, and the
+ * top three of what is being divided, are shifted, to make the estimate of a
+ * quotient digit that normalised operands would give, and the subtraction of
+ * that digit times the divisor gives the same result either way.
+ *
+ * w has room for all the limbs of u. What is being divided sits at w[k] to
+ * w[k + m], with the limbs of u still to come below it, read as they are
+ * needed, and the digit of the quotient found at k goes to w[k + m], which the
+ * subtraction has cleared. This leaves the remainder at the bottom, the digits
+ * above it, and the highest digit, which has no room, in *top_digit.
+ */
+static void lgrt_bitint_long_divide(
+    lgrt_limb *w, size_t wn, const struct lgrt_bitint *u,
+    const struct lgrt_bitint *v, lgrt_limb *top_digit
+) {
+    size_t n = u->count;
+    size_t m = v->count;
+    lgrt_limb v_top = lgrt_bitint_magnitude(v, m - 1);
+    lgrt_limb v_next = lgrt_bitint_magnitude(v, m - 2);
+    lgrt_limb v_rest = m > 2 ? lgrt_bitint_magnitude(v, m - 3) : 0;
+    unsigned int s = lgrt_limb_clz(v_top);
+    lgrt_limb d1 = LGRT_LIMB_SHIFT(v_top, v_next, s);
+    lgrt_limb d2 = LGRT_LIMB_SHIFT(v_next, v_rest, s);
+
+    for (size_t i = n - m; i < n; i++) {
+        w[LGRT_LIMB_AT(wn, i)] = lgrt_bitint_magnitude(u, i);
+    }
+    for (size_t k = n - m + 1; k-- > 0; ) {
+        lgrt_limb top = k == n - m ? 0 : w[LGRT_LIMB_AT(wn, k + m)];
+        lgrt_limb r1;
+        lgrt_limb r2;
+        lgrt_limb r3;
+        lgrt_limb n0;
+        lgrt_limb n1;
+        lgrt_limb n2;
+        lgrt_limb digit;
+        lgrt_limb rem;
+        lgrt_limb borrow = 0;
+        bool estimate_checks;
+
+        if (k != n - m) {
+            w[LGRT_LIMB_AT(wn, k)] = lgrt_bitint_magnitude(u, k);
+        }
+        r1 = w[LGRT_LIMB_AT(wn, k + m - 1)];
+        r2 = w[LGRT_LIMB_AT(wn, k + m - 2)];
+        r3 = m > 2 ? w[LGRT_LIMB_AT(wn, k + m - 3)] : 0;
+        n0 = LGRT_LIMB_SHIFT(top, r1, s);
+        n1 = LGRT_LIMB_SHIFT(r1, r2, s);
+        n2 = LGRT_LIMB_SHIFT(r2, r3, s);
+        if (n0 >= d1) {
+            digit = ~(lgrt_limb)0;
+            rem = n1 + d1;
+            estimate_checks = rem >= d1;
+        } else {
+            digit = lgrt_limb_divide(n0, n1, d1, &rem);
+            estimate_checks = true;
+        }
+        while (estimate_checks && (lgrt_double_limb)digit * d2
+         > (((lgrt_double_limb)rem << LGRT_LIMB_BITS) | n2)) {
+            digit -= 1;
+            rem += d1;
+            estimate_checks = rem >= d1;
+        }
+        for (size_t j = 0; j < m; j++) {
+            lgrt_limb *to = &w[LGRT_LIMB_AT(wn, k + j)];
+            lgrt_limb limb = *to;
+            lgrt_double_limb product = (lgrt_double_limb)digit
+                * lgrt_bitint_magnitude(v, j) + borrow;
+            lgrt_limb low = (lgrt_limb)product;
+
+            *to = limb - low;
+            borrow = (lgrt_limb)(product >> LGRT_LIMB_BITS)
+                + (lgrt_limb)(limb < low);
+        }
+        if (top < borrow) {
+            lgrt_limb carry = 0;
+
+            digit -= 1;
+            for (size_t j = 0; j < m; j++) {
+                lgrt_limb *to = &w[LGRT_LIMB_AT(wn, k + j)];
+                lgrt_double_limb sum = (lgrt_double_limb)*to
+                    + lgrt_bitint_magnitude(v, j) + carry;
+
+                *to = (lgrt_limb)sum;
+                carry = (lgrt_limb)(sum >> LGRT_LIMB_BITS);
+            }
+        }
+        if (k == n - m) {
+            *top_digit = digit;
+        } else {
+            w[LGRT_LIMB_AT(wn, k + m)] = digit;
+        }
+    }
+}
+
+/* The remainder at the bottom of w, into a result that w may be. */
+static void lgrt_bitint_move_remainder(
+    lgrt_limb *r, size_t rn, const lgrt_limb *w, size_t wn, size_t m
+) {
+    for (size_t i = 0; i < rn; i++) {
+        r[LGRT_LIMB_AT(rn, i)] = i < m ? w[LGRT_LIMB_AT(wn, i)] : 0;
+    }
+}
+
+/* The digits above the remainder, into a result that w may be. */
+static void lgrt_bitint_move_quotient(
+    lgrt_limb *q, size_t qn, const lgrt_limb *w, size_t wn, size_t digits,
+    size_t m, lgrt_limb top_digit
+) {
+    for (size_t i = 0; i < qn; i++) {
+        lgrt_limb digit = 0;
+
+        if (i < digits) {
+            digit = w[LGRT_LIMB_AT(wn, i + m)];
+        } else if (i == digits) {
+            digit = top_digit;
+        }
+        q[LGRT_LIMB_AT(qn, i)] = digit;
+    }
+}
+
+/*
+ * A division of limbs by zero, so that a zero divisor does what it does on the
+ * target: it traps where that traps, and gives this value elsewhere.
+ */
+static inline lgrt_limb lgrt_bitint_divide_by_zero(void) {
+    lgrt_limb zero = 0;
+    lgrt_limb digit;
+
+    __asm__ ("" : "+r"(zero));
+    digit = ~(lgrt_limb)0 / zero;
+    __asm__ volatile ("" : : "r"(digit));
+    return digit;
+}
+
+/*
+ * A result at least as wide as the dividend has room for all that the long
+ * division needs, and compilers always give one. Without one, there is only
+ * the stack for it, for that call alone.
+ */
+LGRT_BITINT_HELPER void lgrt_bitint_divmod(
+    lgrt_limb *q, int32_t qprec, lgrt_limb *r, int32_t rprec,
+    const lgrt_limb *u, int32_t uprec, const lgrt_limb *v, int32_t vprec
+) {
+    size_t qn = lgrt_bitint_limbs(qprec);
+    size_t rn = lgrt_bitint_limbs(rprec);
+    bool any_signed = uprec < 0 || vprec < 0;
+    struct lgrt_bitint a;
+    struct lgrt_bitint b;
+
+    lgrt_bitint_load(&a, u, uprec);
+    lgrt_bitint_load(&b, v, vprec);
+    if (b.count == 0 || a.count < b.count) {
+        lgrt_limb digit = b.count == 0 ? lgrt_bitint_divide_by_zero() : 0;
+
+        for (size_t i = 0; i < qn; i++) {
+            q[LGRT_LIMB_AT(qn, i)] = digit;
+        }
+        for (size_t i = 0; i < rn; i++) {
+            r[LGRT_LIMB_AT(rn, i)] = i < a.count
+                ? lgrt_bitint_magnitude(&a, i) : 0;
+        }
+    } else if (b.count == 1) {
+        lgrt_limb d = lgrt_bitint_magnitude(&b, 0);
+        lgrt_limb rem = 0;
+
+        for (size_t i = 0; i < qn; i++) {
+            q[LGRT_LIMB_AT(qn, i)] = 0;
+        }
+        for (size_t i = a.count; i-- > 0; ) {
+            lgrt_limb digit = lgrt_limb_divide(
+                rem, lgrt_bitint_magnitude(&a, i), d, &rem
+            );
+
+            if (i < qn) {
+                q[LGRT_LIMB_AT(qn, i)] = digit;
+            }
+        }
+        for (size_t i = 0; i < rn; i++) {
+            r[LGRT_LIMB_AT(rn, i)] = i == 0 ? rem : 0;
+        }
+    } else {
+        lgrt_limb *w = q;
+        size_t wn = qn;
+        lgrt_limb top_digit = 0;
+
+        if (qn < a.count) {
+            w = r;
+            wn = rn;
+            if (rn < a.count) {
+                wn = a.count;
+                w = __builtin_alloca(wn * sizeof(lgrt_limb));
+            }
+        }
+        lgrt_bitint_long_divide(w, wn, &a, &b, &top_digit);
+        if (w == q) {
+            lgrt_bitint_move_remainder(r, rn, w, wn, b.count);
+        }
+        lgrt_bitint_move_quotient(
+            q, qn, w, wn, a.count - b.count, b.count, top_digit
+        );
+        if (w != q) {
+            lgrt_bitint_move_remainder(r, rn, w, wn, b.count);
+        }
+    }
+    lgrt_bitint_finish(q, qprec, a.negative != b.negative, any_signed);
+    lgrt_bitint_finish(r, rprec, a.negative, any_signed);
+}
+
+#if LGRT_BITINT_GCC
+
+void __mulbitint3(
+    lgrt_limb *ret, int32_t retprec, const lgrt_limb *u, int32_t uprec,
+    const lgrt_limb *v, int32_t vprec
+);
+void __mulbitint3(
+    lgrt_limb *ret, int32_t retprec, const lgrt_limb *u, int32_t uprec,
+    const lgrt_limb *v, int32_t vprec
+) {
+    lgrt_bitint_mul(ret, retprec, u, uprec, v, vprec);
+}
+
+void __divmodbitint4(
+    lgrt_limb *q, int32_t qprec, lgrt_limb *r, int32_t rprec,
+    const lgrt_limb *u, int32_t uprec, const lgrt_limb *v, int32_t vprec
+);
+void __divmodbitint4(
+    lgrt_limb *q, int32_t qprec, lgrt_limb *r, int32_t rprec,
+    const lgrt_limb *u, int32_t uprec, const lgrt_limb *v, int32_t vprec
+) {
+    lgrt_bitint_divmod(q, qprec, r, rprec, u, uprec, v, vprec);
+}
+
+#endif
+
+/*
+ * Clang 15 calls these for what is wider than 128 bits, given an option to
+ * have such a width. The operands and the result are all as wide as bits says,
+ * a multiple of 64, and the operands are extended to that.
+ */
+#if !defined(__loongarch__)
+
+#define LGRT_BITINT_EI4(name, is_signed, is_remainder) \
+    void name( \
+        lgrt_limb *out, const lgrt_limb *a, const lgrt_limb *b, \
+        unsigned int bits \
+    ); \
+    void name( \
+        lgrt_limb *out, const lgrt_limb *a, const lgrt_limb *b, \
+        unsigned int bits \
+    ) { \
+        int32_t result = (int32_t)bits; \
+        int32_t operand = is_signed ? (int32_t)((uint32_t)0 - bits) : result; \
+        \
+        if (is_remainder) { \
+            lgrt_bitint_divmod(NULL, 0, out, result, a, operand, b, operand); \
+        } else { \
+            lgrt_bitint_divmod(out, result, NULL, 0, a, operand, b, operand); \
+        } \
+    }
+
+LGRT_BITINT_EI4(__divei4, true, false)
+LGRT_BITINT_EI4(__udivei4, false, false)
+LGRT_BITINT_EI4(__modei4, true, true)
+LGRT_BITINT_EI4(__umodei4, false, true)
+
+#endif
+
+#if LGRT_SOFT_FLOAT || LGRT_SOFT_XF
+
+LGRT_BITINT_HELPER size_t lgrt_bitint_length(const struct lgrt_bitint *x) {
+    return x->count * LGRT_LIMB_BITS
+        - lgrt_limb_clz(lgrt_bitint_magnitude(x, x->count - 1));
+}
+
+/* Up to 64 bits of a magnitude from bit pos up, zeros beyond its limbs. */
+LGRT_BITINT_HELPER uint64_t lgrt_bitint_extract(
+    const struct lgrt_bitint *x, size_t pos
+) {
+    size_t i = pos / LGRT_LIMB_BITS;
+    unsigned int s = pos % LGRT_LIMB_BITS;
+    unsigned int got = 0;
+    uint64_t value = 0;
+
+    while (got < 64 && i < x->count) {
+        value |= (uint64_t)(lgrt_bitint_magnitude(x, i) >> s) << got;
+        got += LGRT_LIMB_BITS - s;
+        s = 0;
+        i += 1;
+    }
+    return value;
+}
+
+/* Whether a magnitude has any of its n lowest bits set, n below its length. */
+LGRT_BITINT_HELPER bool lgrt_bitint_any_below(
+    const struct lgrt_bitint *x, size_t n
+) {
+    size_t i = n / LGRT_LIMB_BITS;
+    unsigned int s = n % LGRT_LIMB_BITS;
+
+    if (x->lowest != i) {
+        return x->lowest < i;
+    }
+    return s != 0
+        && (lgrt_bitint_magnitude(x, i) << (LGRT_LIMB_BITS - s)) != 0;
+}
+
+/*
+ * Rounding comes from the core of the format, as for other integers, given the
+ * top bits of the magnitude and whether any other bit is set.
+ */
+#define LGRT_BITINT_TO_FP(fmt, T, E, F) \
+    LGRT_BITINT_HELPER T lgrt_##fmt##_from_bitint( \
+        const lgrt_limb *i, int32_t iprec \
+    ) { \
+        struct lgrt_bitint x; \
+        T sign; \
+        T sig; \
+        size_t length; \
+        \
+        lgrt_bitint_load(&x, i, iprec); \
+        if (x.count == 0) { \
+            return 0; \
+        } \
+        sign = x.negative ? LGRT_FP_SIGN(T, E, F) : 0; \
+        length = lgrt_bitint_length(&x); \
+        if (length - 1 >= (size_t)(LGRT_FP_EXP_MAX(E) - LGRT_FP_BIAS(E))) { \
+            return sign | LGRT_FP_INF(T, E, F); \
+        } \
+        if (length <= (F) + 4) { \
+            sig = (T)lgrt_bitint_extract(&x, 0) << ((F) + 4 - length); \
+        } else { \
+            size_t lost = length - ((F) + 4); \
+            \
+            sig = (T)lgrt_bitint_extract(&x, lost) \
+                | (T)lgrt_bitint_any_below(&x, lost); \
+        } \
+        return lgrt_##fmt##_round_pack( \
+            sign, LGRT_FP_BIAS(E) + (unsigned int)length - 1, sig \
+        ); \
+    }
+
+LGRT_BITINT_HELPER void lgrt_bitint_clear(lgrt_limb *r, int32_t rprec) {
+    size_t rn = lgrt_bitint_limbs(rprec);
+
+    for (size_t i = 0; i < rn; i++) {
+        r[LGRT_LIMB_AT(rn, i)] = 0;
+    }
+}
+
+/* The nearest value that the result can hold, for one out of its range. */
+LGRT_BITINT_HELPER void lgrt_bitint_saturate(
+    lgrt_limb *r, int32_t rprec, bool negative
+) {
+    size_t rn = lgrt_bitint_limbs(rprec);
+    unsigned int used = lgrt_bitint_bits(rprec) % LGRT_LIMB_BITS;
+    lgrt_limb sign_bit;
+
+    if (rn == 0) {
+        return;
+    }
+    for (size_t i = 0; i < rn; i++) {
+        r[LGRT_LIMB_AT(rn, i)] = negative ? 0 : ~(lgrt_limb)0;
+    }
+    sign_bit = (lgrt_limb)1 << ((used != 0 ? used : LGRT_LIMB_BITS) - 1);
+    if (rprec > 0) {
+        r[LGRT_LIMB_AT(rn, rn - 1)] = lgrt_bitint_extend(
+            ~(lgrt_limb)0, rprec, false
+        );
+    } else {
+        r[LGRT_LIMB_AT(rn, rn - 1)] = negative
+            ? (lgrt_limb)0 - sign_bit : sign_bit - 1;
+    }
+}
+
+/* Sets bits of a result from bit pos up, as far as it has them. */
+LGRT_BITINT_HELPER void lgrt_bitint_set_bits(
+    lgrt_limb *r, size_t rn, size_t pos, uint64_t value
+) {
+    size_t i = pos / LGRT_LIMB_BITS;
+    unsigned int s = pos % LGRT_LIMB_BITS;
+
+    while (value != 0 && i < rn) {
+        unsigned int taken = LGRT_LIMB_BITS - s;
+
+        r[LGRT_LIMB_AT(rn, i)] |= (lgrt_limb)value << s;
+        value = taken < 64 ? value >> taken : 0;
+        s = 0;
+        i += 1;
+    }
+}
+
+/*
+ * A finite value of a magnitude of at least 1, negative only for a signed
+ * result, from its exponent without the bias, and high:low, its significand
+ * with the integer bit at bit f. It truncates. The most negative value of a
+ * signed result comes out of saturating too.
+ */
+LGRT_BITINT_HELPER void lgrt_bitint_fix(
+    lgrt_limb *r, int32_t rprec, bool negative, uint32_t e, uint64_t high,
+    uint64_t low, unsigned int f
+) {
+    uint32_t bits = lgrt_bitint_bits(rprec);
+    size_t rn = lgrt_bitint_limbs(rprec);
+    size_t pos = 0;
+
+    if (e >= bits || (rprec < 0 && e == bits - 1)) {
+        lgrt_bitint_saturate(r, rprec, negative);
+        return;
+    }
+    lgrt_bitint_clear(r, rprec);
+    if (e >= f) {
+        pos = e - f;
+    } else {
+        unsigned int n = f - e;
+
+        if (n >= 64) {
+            low = high >> (n - 64);
+            high = 0;
+        } else {
+            low = (low >> n) | ((high << 1) << (63 - n));
+            high >>= n;
+        }
+    }
+    lgrt_bitint_set_bits(r, rn, pos, low);
+    lgrt_bitint_set_bits(r, rn, pos + 64, high);
+    if (negative) {
+        lgrt_bitint_negate(r, rn);
+    }
+    r[LGRT_LIMB_AT(rn, rn - 1)] = lgrt_bitint_extend(
+        r[LGRT_LIMB_AT(rn, rn - 1)], rprec, rprec < 0
+    );
+}
+
+/* A NaN gives zero, and so does a negative value to an unsigned result. */
+#define LGRT_BITINT_FROM_FP(fmt, T, E, F) \
+    LGRT_BITINT_HELPER void lgrt_##fmt##_to_bitint( \
+        lgrt_limb *r, int32_t rprec, T x \
+    ) { \
+        T magnitude = x & (LGRT_FP_SIGN(T, E, F) - 1); \
+        T int_bit = LGRT_FP_INT_BIT(T, F); \
+        bool negative = (x & LGRT_FP_SIGN(T, E, F)) != 0; \
+        unsigned int e = (unsigned int)(magnitude >> (F)); \
+        \
+        if (magnitude > LGRT_FP_INF(T, E, F) || e < LGRT_FP_BIAS(E) \
+         || (negative && rprec > 0)) { \
+            lgrt_bitint_clear(r, rprec); \
+        } else if (magnitude == LGRT_FP_INF(T, E, F)) { \
+            lgrt_bitint_saturate(r, rprec, negative); \
+        } else { \
+            lgrt_bitint_fix( \
+                r, rprec, negative, e - LGRT_FP_BIAS(E), 0, \
+                (magnitude & (int_bit - 1)) | int_bit, (F) \
+            ); \
+        } \
+    }
+
+#define LGRT_BITINT_FLOAT_ROUTINE(fmt, C, out) \
+    C __floatbitint##fmt(const lgrt_limb *i, int32_t iprec); \
+    C __floatbitint##fmt(const lgrt_limb *i, int32_t iprec) { \
+        return out(lgrt_##fmt##_from_bitint(i, iprec)); \
+    }
+
+#define LGRT_BITINT_FIX_ROUTINE(fmt, C, in) \
+    void __fix##fmt##bitint(lgrt_limb *r, int32_t rprec, C a); \
+    void __fix##fmt##bitint(lgrt_limb *r, int32_t rprec, C a) { \
+        lgrt_##fmt##_to_bitint(r, rprec, in(a)); \
+    }
+
+/*
+ * GCC rejects floating-point types with -mgeneral-regs-only on ARM, with
+ * nothing to tell of it, so where the procedure call standard has them in
+ * floating-point registers, C has their bits in core registers, and assembly
+ * moves them. A branch does for an argument, which needs nothing afterwards.
+ */
+#if defined(__ARM_PCS_VFP)
+
+#define LGRT_BITINT_VFP_MOVE(name, symbol, moves, helper) \
+    void name(void) __asm__(symbol); \
+    __attribute__((__naked__)) void name(void) { \
+        __asm__ volatile ( \
+            ".syntax unified\n" \
+            LGRT_ASM_BTI \
+            moves \
+            "b " helper "\n" \
+            LGRT_ASM_END \
+        ); \
+    }
+
+#define LGRT_BITINT_VFP_FLOAT(fmt, T, load) \
+    LGRT_AAPCS T lgrt_floatbitint##fmt##_bits( \
+        const lgrt_limb *i, int32_t iprec \
+    ); \
+    LGRT_CX_VFP_HELPER LGRT_AAPCS T lgrt_floatbitint##fmt##_bits( \
+        const lgrt_limb *i, int32_t iprec \
+    ) { \
+        return lgrt_##fmt##_from_bitint(i, iprec); \
+    } \
+    \
+    LGRT_CX_VFP_ENTRY( \
+        lgrt_floatbitint##fmt, "__floatbitint" #fmt, "8", "", \
+        "lgrt_floatbitint" #fmt "_bits", load \
+    )
+
+#define LGRT_BITINT_VFP_FIX(fmt, T, moves) \
+    LGRT_AAPCS void lgrt_fix##fmt##bitint_bits( \
+        lgrt_limb *r, int32_t rprec, T a \
+    ); \
+    LGRT_CX_VFP_HELPER LGRT_AAPCS void lgrt_fix##fmt##bitint_bits( \
+        lgrt_limb *r, int32_t rprec, T a \
+    ) { \
+        lgrt_##fmt##_to_bitint(r, rprec, a); \
+    } \
+    \
+    LGRT_BITINT_VFP_MOVE( \
+        lgrt_fix##fmt##bitint, "__fix" #fmt "bitint", moves, \
+        "lgrt_fix" #fmt "bitint_bits" \
+    )
+
+#endif
+
+#if LGRT_SOFT_FLOAT
+
+LGRT_BITINT_TO_FP(sf, uint32_t, 8, 23)
+LGRT_BITINT_FROM_FP(sf, uint32_t, 8, 23)
+
+#if LGRT_BITINT_GCC
+#if defined(__ARM_PCS_VFP)
+LGRT_BITINT_VFP_FLOAT(sf, uint32_t, "vmov s0, r0\n")
+LGRT_BITINT_VFP_FIX(sf, uint32_t, "vmov r2, s0\n")
+#else
+LGRT_BITINT_FLOAT_ROUTINE(sf, lgrt_sf_value, lgrt_sf_from_bits)
+LGRT_BITINT_FIX_ROUTINE(sf, lgrt_sf_value, lgrt_sf_to_bits)
+#endif
+#endif
+
+#if LGRT_SOFT_DOUBLE
+
+LGRT_BITINT_TO_FP(df, uint64_t, 11, 52)
+LGRT_BITINT_FROM_FP(df, uint64_t, 11, 52)
+
+#if LGRT_BITINT_GCC
+#if defined(__ARM_PCS_VFP)
+LGRT_BITINT_VFP_FLOAT(df, uint64_t, "vmov d0, r0, r1\n")
+LGRT_BITINT_VFP_FIX(df, uint64_t, "vmov r2, r3, d0\n")
+#else
+LGRT_BITINT_FLOAT_ROUTINE(df, lgrt_df_value, lgrt_df_from_bits)
+LGRT_BITINT_FIX_ROUTINE(df, lgrt_df_value, lgrt_df_to_bits)
+#endif
+#endif
+
+#endif
+
+#if defined(__arm__) || LGRT_SOFT_HF
+LGRT_BITINT_TO_FP(hf, uint32_t, 5, 10)
+LGRT_BITINT_FROM_FP(hf, uint32_t, 5, 10)
+#endif
+
+/*
+ * ARM's half comes back where float does, in the low half of that. Compilers
+ * have no half to convert on LoongArch.
+ */
+#if LGRT_BITINT_GCC
+#if defined(__ARM_PCS_VFP)
+LGRT_BITINT_VFP_FLOAT(hf, uint32_t, "vmov s0, r0\n")
+#elif defined(__arm__)
+LGRT_BITINT_FLOAT_ROUTINE(hf, uint32_t, lgrt_sf_from_bits)
+#elif LGRT_SOFT_HF && !LGRT_HF_PASSED_AS_INT && !defined(__loongarch__)
+LGRT_BITINT_FLOAT_ROUTINE(hf, lgrt_hf_value, lgrt_hf_from_bits)
+#if defined(LGRT_SOFT_BF)
+LGRT_BITINT_TO_FP(bf, uint32_t, 8, 7)
+LGRT_BITINT_FLOAT_ROUTINE(bf, lgrt_bf_value, lgrt_bf_from_bits)
+#endif
+#endif
+#endif
+
+#endif
+
+#if LGRT_SOFT_WIDE
+
+/*
+ * These too are in their own core, over two words, whose significands reach
+ * beyond 64 bits in part or in all.
+ */
+#define LGRT_BITINT_WIDE_FROM_BITS(fmt, M, F) \
+    LGRT_BITINT_HELPER struct lgrt_wide lgrt_##fmt##_from_bitint( \
+        const lgrt_limb *i, int32_t iprec \
+    ) { \
+        struct lgrt_bitint x; \
+        struct lgrt_wide sig; \
+        uint64_t sign; \
+        size_t length; \
+        \
+        lgrt_bitint_load(&x, i, iprec); \
+        if (x.count == 0) { \
+            return lgrt_wide_make(0, 0); \
+        } \
+        sign = x.negative ? LGRT_WIDE_SIGN : 0; \
+        length = lgrt_bitint_length(&x); \
+        if (length - 1 >= (size_t)((M) - LGRT_WIDE_BIAS(M))) { \
+            return lgrt_##fmt##_round_pack(sign, (M), lgrt_wide_make(0, 0)); \
+        } \
+        if (length <= (F) + 4) { \
+            sig = lgrt_wide_shl( \
+                lgrt_wide_make( \
+                    lgrt_bitint_extract(&x, 64), lgrt_bitint_extract(&x, 0) \
+                ), \
+                (F) + 4 - (unsigned int)length \
+            ); \
+        } else { \
+            size_t lost = length - ((F) + 4); \
+            \
+            sig = lgrt_wide_make( \
+                lgrt_bitint_extract(&x, lost + 64), \
+                lgrt_bitint_extract(&x, lost) \
+            ); \
+            sig.low |= (uint64_t)lgrt_bitint_any_below(&x, lost); \
+        } \
+        return lgrt_##fmt##_round_pack( \
+            sign, LGRT_WIDE_BIAS(M) + (unsigned int)length - 1, sig \
+        ); \
+    }
+
+#define LGRT_BITINT_WIDE_TO_BITS(fmt, M, F) \
+    LGRT_BITINT_HELPER void lgrt_##fmt##_to_bitint( \
+        lgrt_limb *r, int32_t rprec, struct lgrt_wide x \
+    ) { \
+        struct lgrt_wide magnitude = LGRT_WIDE_MAGNITUDE(x); \
+        struct lgrt_wide inf = LGRT_WIDE_INF(M, F); \
+        struct lgrt_wide sig = lgrt_wide_or( \
+            lgrt_wide_low_bits(magnitude, (F)), LGRT_WIDE_INT_BIT(F) \
+        ); \
+        bool negative = (x.high & LGRT_WIDE_SIGN) != 0; \
+        unsigned int e = lgrt_wide_exponent(magnitude, (F)); \
+        \
+        if (lgrt_wide_lt(inf, magnitude) || e < LGRT_WIDE_BIAS(M) \
+         || (negative && rprec > 0)) { \
+            lgrt_bitint_clear(r, rprec); \
+        } else if (lgrt_wide_eq(magnitude, inf)) { \
+            lgrt_bitint_saturate(r, rprec, negative); \
+        } else { \
+            lgrt_bitint_fix( \
+                r, rprec, negative, e - LGRT_WIDE_BIAS(M), sig.high, \
+                sig.low, (F) \
+            ); \
+        } \
+    }
+
+/* PowerPC has this format under another name, and no routines here for it. */
+#if (LGRT_SOFT_QUAD || LGRT_QUAD_OWN_NAMES) && !defined(__powerpc__)
+LGRT_BITINT_WIDE_FROM_BITS(tf, 32767, 112)
+LGRT_BITINT_WIDE_TO_BITS(tf, 32767, 112)
+#endif
+
+#if LGRT_BITINT_GCC && LGRT_SOFT_QUAD
+LGRT_BITINT_FLOAT_ROUTINE(tf, lgrt_quad_value, lgrt_tf_from_bits)
+LGRT_BITINT_FIX_ROUTINE(tf, lgrt_quad_value, lgrt_tf_to_bits)
+#endif
+
+#if defined(__i386__) || defined(__x86_64__)
+
+LGRT_BITINT_WIDE_TO_BITS(xf, LGRT_XF_EXP_MAX, 63)
+
+#if defined(__clang__) || LGRT_XF_RETURNED
+LGRT_BITINT_WIDE_FROM_BITS(xf, LGRT_XF_EXP_MAX, 63)
+#endif
+
+#if defined(__clang__) && defined(__x86_64__)
+void __fixxfbitint(
+    lgrt_limb *r, int32_t rprec, uint64_t rdx LGRT_XF_IGNORED,
+    uint64_t rcx LGRT_XF_IGNORED, uint64_t r8 LGRT_XF_IGNORED,
+    uint64_t r9 LGRT_XF_IGNORED, lgrt_xf_argument a
+);
+void __fixxfbitint(
+    lgrt_limb *r, int32_t rprec, uint64_t rdx LGRT_XF_IGNORED,
+    uint64_t rcx LGRT_XF_IGNORED, uint64_t r8 LGRT_XF_IGNORED,
+    uint64_t r9 LGRT_XF_IGNORED, lgrt_xf_argument a
+) {
+    lgrt_xf_to_bitint(r, rprec, lgrt_xf_to_bits(a));
+}
+#else
+void __fixxfbitint(lgrt_limb *r, int32_t rprec, lgrt_xf_argument a);
+void __fixxfbitint(lgrt_limb *r, int32_t rprec, lgrt_xf_argument a) {
+    lgrt_xf_to_bitint(r, rprec, lgrt_xf_to_bits(a));
+}
+#endif
+
+#if defined(__clang__)
+void __floatbitintxf(const lgrt_limb *i, int32_t iprec);
+void __floatbitintxf(const lgrt_limb *i, int32_t iprec) {
+    lgrt_xf_return(lgrt_xf_from_bitint(i, iprec));
+}
+#elif LGRT_XF_RETURNED
+LGRT_BITINT_FLOAT_ROUTINE(xf, lgrt_xf_value, lgrt_xf_from_bits)
+#endif
+
+#endif
+
+#endif
+
+#endif
+
+/*
+ * Clang takes _BitInt of up to 128 bits on targets where C has no integer of
+ * that width, and calls the routines of that width for what it does not do
+ * itself, each release for its own share of them. It passes such an integer in
+ * words in their order in memory, as far as the registers for arguments go:
+ * in four of them, or by reference, or on the stack. It comes back in four
+ * registers, or in memory by a hidden pointer.
+ */
+#if !LGRT_HAS_INT128 && (!defined(__arm__) || defined(__ARM_EABI__))
+
+struct lgrt_ti {
+    lgrt_limb words[4];
+};
+
+/* Two 64-bit integers go where one of these goes, but for a structure. */
+#if defined(__mips__) || defined(__powerpc__) || defined(__sparc__) \
+ || defined(__hexagon__)
+
+#define LGRT_TI_PARAMETER(a) uint64_t a##_first, uint64_t a##_second
+#define LGRT_TI_VALUE(a) lgrt_ti_from_pair(a##_first, a##_second)
+
+static inline struct lgrt_ti lgrt_ti_from_pair(
+    uint64_t first, uint64_t second
+) {
+    uint64_t pair[2] = { first, second };
+    struct lgrt_ti x;
+
+    __builtin_memcpy(&x, pair, sizeof(pair));
+    return x;
+}
+
+#else
+
+#define LGRT_TI_PARAMETER(a) struct lgrt_ti a
+#define LGRT_TI_VALUE(a) (a)
+
+#endif
+
+/*
+ * What a compiler returns in the same place. It is a vector on ARM, where only
+ * the base procedure call standard has it in core registers, and for Clang on
+ * PowerPC, where only a vector goes in registers, which AltiVec would make its
+ * own.
+ */
+#if defined(__arm__) || (defined(__powerpc__) && defined(__clang__))
+typedef uint32_t lgrt_ti_return __attribute__((__vector_size__(16)));
+#elif defined(__mips__) || defined(__powerpc__) || defined(__sparc__)
+__extension__ typedef _Complex unsigned long long lgrt_ti_return;
+#else
+typedef struct lgrt_ti lgrt_ti_return;
+#endif
+
+/*
+ * MIPS16 code has no access to the floating-point registers that pass values,
+ * so these are not MIPS16 code, as with other routines of floating point.
+ */
+#if defined(__mips16) && defined(__mips_hard_float)
+#define LGRT_TI_FP_ABI __attribute__((__nomips16__))
+#else
+#define LGRT_TI_FP_ABI
+#endif
+
+#if defined(__arm__)
+#define LGRT_TI_ABI LGRT_AAPCS
+#else
+#define LGRT_TI_ABI LGRT_TI_FP_ABI
+#endif
+
+#if defined(__powerpc__) && defined(__clang__) && defined(__ALTIVEC__)
+#define LGRT_TI_RETURNED 0
+#else
+#define LGRT_TI_RETURNED 1
+#endif
+
+/*
+ * The result of a routine, from limbs of the target's width, 32 bits on all of
+ * these, in the same order as in memory.
+ */
+#if LGRT_TI_RETURNED
+
+static inline LGRT_TI_ABI lgrt_ti_return lgrt_ti_out(struct lgrt_ti x) {
+    lgrt_ti_return z;
+
+    __builtin_memcpy(&z, &x, sizeof(struct lgrt_ti));
+    return z;
+}
+
+#define LGRT_TI_DIVMOD(name, is_signed, is_remainder) \
+    LGRT_TI_ABI lgrt_ti_return name( \
+        LGRT_TI_PARAMETER(a), LGRT_TI_PARAMETER(b) \
+    ); \
+    LGRT_TI_ABI lgrt_ti_return name( \
+        LGRT_TI_PARAMETER(a), LGRT_TI_PARAMETER(b) \
+    ) { \
+        struct lgrt_ti x = LGRT_TI_VALUE(a); \
+        struct lgrt_ti y = LGRT_TI_VALUE(b); \
+        struct lgrt_ti result; \
+        int32_t prec = is_signed ? -128 : 128; \
+        \
+        if (is_remainder) { \
+            lgrt_bitint_divmod( \
+                NULL, 0, result.words, 128, x.words, prec, y.words, prec \
+            ); \
+        } else { \
+            lgrt_bitint_divmod( \
+                result.words, 128, NULL, 0, x.words, prec, y.words, prec \
+            ); \
+        } \
+        return lgrt_ti_out(result); \
+    }
+
+LGRT_TI_DIVMOD(__divti3, true, false)
+LGRT_TI_DIVMOD(__udivti3, false, false)
+LGRT_TI_DIVMOD(__modti3, true, true)
+LGRT_TI_DIVMOD(__umodti3, false, true)
+
+/*
+ * A signed product, whose overflow shows in the half above it not being the
+ * extension of what is below that. Clang has this inline on SPARC.
+ */
+#if !defined(__sparc__)
+LGRT_TI_ABI lgrt_ti_return __muloti4(
+    LGRT_TI_PARAMETER(a), LGRT_TI_PARAMETER(b), int *overflow
+);
+LGRT_TI_ABI lgrt_ti_return __muloti4(
+    LGRT_TI_PARAMETER(a), LGRT_TI_PARAMETER(b), int *overflow
+) {
+    struct lgrt_ti x = LGRT_TI_VALUE(a);
+    struct lgrt_ti y = LGRT_TI_VALUE(b);
+    struct lgrt_ti result;
+    lgrt_limb wide[8];
+    lgrt_limb fill;
+    bool overflowed = false;
+
+    lgrt_bitint_mul(wide, 256, x.words, -128, y.words, -128);
+    for (size_t i = 0; i < 4; i++) {
+        result.words[LGRT_LIMB_AT(4, i)] = wide[LGRT_LIMB_AT(8, i)];
+    }
+    fill = (wide[LGRT_LIMB_AT(8, 3)] >> (LGRT_LIMB_BITS - 1)) != 0
+        ? ~(lgrt_limb)0 : 0;
+    for (size_t i = 4; i < 8; i++) {
+        overflowed = overflowed || wide[LGRT_LIMB_AT(8, i)] != fill;
+    }
+    *overflow = overflowed;
+    return lgrt_ti_out(result);
+}
+#endif
+
+/* The other targets have only inline multiplication of this width. */
+#if !defined(__i386__) && !defined(__hexagon__) && !defined(__loongarch__)
+LGRT_TI_ABI lgrt_ti_return __multi3(
+    LGRT_TI_PARAMETER(a), LGRT_TI_PARAMETER(b)
+);
+LGRT_TI_ABI lgrt_ti_return __multi3(
+    LGRT_TI_PARAMETER(a), LGRT_TI_PARAMETER(b)
+) {
+    struct lgrt_ti x = LGRT_TI_VALUE(a);
+    struct lgrt_ti y = LGRT_TI_VALUE(b);
+    struct lgrt_ti result;
+
+    lgrt_bitint_mul(result.words, 128, x.words, 128, y.words, 128);
+    return lgrt_ti_out(result);
+}
+#endif
+
+/* Clang before 14 calls these on RISC-V, where it has them nowhere else. */
+#if defined(__riscv)
+
+static inline struct lgrt_ti lgrt_ti_shift_right(
+    struct lgrt_ti x, unsigned int n, lgrt_limb fill
+) {
+    struct lgrt_ti result;
+    size_t skip = n / LGRT_LIMB_BITS;
+    unsigned int s = n % LGRT_LIMB_BITS;
+
+    for (size_t i = 0; i < 4; i++) {
+        lgrt_limb lo = i + skip < 4
+            ? x.words[LGRT_LIMB_AT(4, i + skip)] : fill;
+        lgrt_limb hi = i + skip + 1 < 4
+            ? x.words[LGRT_LIMB_AT(4, i + skip + 1)] : fill;
+
+        result.words[LGRT_LIMB_AT(4, i)] = (lo >> s)
+            | ((hi << 1) << (LGRT_LIMB_BITS - 1 - s));
+    }
+    return result;
+}
+
+lgrt_ti_return __ashlti3(struct lgrt_ti a, int b);
+lgrt_ti_return __ashlti3(struct lgrt_ti a, int b) {
+    struct lgrt_ti result;
+    size_t skip = (unsigned int)b / LGRT_LIMB_BITS;
+    unsigned int s = (unsigned int)b % LGRT_LIMB_BITS;
+
+    for (size_t i = 0; i < 4; i++) {
+        lgrt_limb hi = i >= skip ? a.words[LGRT_LIMB_AT(4, i - skip)] : 0;
+        lgrt_limb lo = i >= skip + 1
+            ? a.words[LGRT_LIMB_AT(4, i - skip - 1)] : 0;
+
+        result.words[LGRT_LIMB_AT(4, i)] = LGRT_LIMB_SHIFT(hi, lo, s);
+    }
+    return result;
+}
+
+lgrt_ti_return __lshrti3(struct lgrt_ti a, int b);
+lgrt_ti_return __lshrti3(struct lgrt_ti a, int b) {
+    return lgrt_ti_shift_right(a, (unsigned int)b, 0);
+}
+
+lgrt_ti_return __ashrti3(struct lgrt_ti a, int b);
+lgrt_ti_return __ashrti3(struct lgrt_ti a, int b) {
+    lgrt_limb top = a.words[LGRT_LIMB_AT(4, 3)];
+
+    return lgrt_ti_shift_right(
+        a, (unsigned int)b,
+        (top >> (LGRT_LIMB_BITS - 1)) != 0 ? ~(lgrt_limb)0 : 0
+    );
+}
+
+#endif
+
+#endif
+
+/*
+ * Conversions, by the same helpers as _BitInt, for all but the integer in the
+ * forms above. With the integer coming back in core registers on ARM, the base
+ * standard goes for all of the routine under the other one too, and assembly
+ * moves a floating-point value.
+ */
+#define LGRT_TI_FROM_INT(fmt, C, out, signed_name, unsigned_name) \
+    LGRT_TI_FP_ABI C signed_name(LGRT_TI_PARAMETER(a)); \
+    LGRT_TI_FP_ABI C signed_name(LGRT_TI_PARAMETER(a)) { \
+        struct lgrt_ti x = LGRT_TI_VALUE(a); \
+        \
+        return out(lgrt_##fmt##_from_bitint(x.words, -128)); \
+    } \
+    \
+    LGRT_TI_FP_ABI C unsigned_name(LGRT_TI_PARAMETER(a)); \
+    LGRT_TI_FP_ABI C unsigned_name(LGRT_TI_PARAMETER(a)) { \
+        struct lgrt_ti x = LGRT_TI_VALUE(a); \
+        \
+        return out(lgrt_##fmt##_from_bitint(x.words, 128)); \
+    }
+
+#define LGRT_TI_TO_INT_NAMED(fmt, C, in, name, prec) \
+    LGRT_TI_ABI lgrt_ti_return name(C a); \
+    LGRT_TI_ABI lgrt_ti_return name(C a) { \
+        struct lgrt_ti result; \
+        \
+        lgrt_##fmt##_to_bitint(result.words, (prec), in(a)); \
+        return lgrt_ti_out(result); \
+    }
+
+#if defined(__ARM_PCS_VFP)
+
+#define LGRT_TI_VFP_TO_INT(fmt, T, name, prec, moves) \
+    LGRT_AAPCS lgrt_ti_return lgrt_##name##_bits(T a); \
+    LGRT_CX_VFP_HELPER LGRT_AAPCS lgrt_ti_return lgrt_##name##_bits(T a) { \
+        struct lgrt_ti result; \
+        \
+        lgrt_##fmt##_to_bitint(result.words, (prec), a); \
+        return lgrt_ti_out(result); \
+    } \
+    \
+    LGRT_BITINT_VFP_MOVE(lgrt_##name, "__" #name, moves, "lgrt_" #name "_bits")
+
+#define LGRT_TI_VFP_FROM_INT(fmt, T, name, prec, load) \
+    LGRT_AAPCS T lgrt_##name##_bits(struct lgrt_ti a); \
+    LGRT_CX_VFP_HELPER LGRT_AAPCS T lgrt_##name##_bits(struct lgrt_ti a) { \
+        return lgrt_##fmt##_from_bitint(a.words, (prec)); \
+    } \
+    \
+    LGRT_CX_VFP_ENTRY( \
+        lgrt_##name, "__" #name, "8", "", "lgrt_" #name "_bits", load \
+    )
+
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define LGRT_TI_VFP_DF_IN "vmov r1, r0, d0\n"
+#define LGRT_TI_VFP_DF_OUT "vmov d0, r1, r0\n"
+#else
+#define LGRT_TI_VFP_DF_IN "vmov r0, r1, d0\n"
+#define LGRT_TI_VFP_DF_OUT "vmov d0, r0, r1\n"
+#endif
+
+LGRT_TI_VFP_TO_INT(sf, uint32_t, fixsfti, -128, "vmov r0, s0\n")
+LGRT_TI_VFP_TO_INT(sf, uint32_t, fixunssfti, 128, "vmov r0, s0\n")
+LGRT_TI_VFP_TO_INT(df, uint64_t, fixdfti, -128, LGRT_TI_VFP_DF_IN)
+LGRT_TI_VFP_TO_INT(df, uint64_t, fixunsdfti, 128, LGRT_TI_VFP_DF_IN)
+LGRT_TI_VFP_FROM_INT(sf, uint32_t, floattisf, -128, "vmov s0, r0\n")
+LGRT_TI_VFP_FROM_INT(sf, uint32_t, floatuntisf, 128, "vmov s0, r0\n")
+LGRT_TI_VFP_FROM_INT(df, uint64_t, floattidf, -128, LGRT_TI_VFP_DF_OUT)
+LGRT_TI_VFP_FROM_INT(df, uint64_t, floatuntidf, 128, LGRT_TI_VFP_DF_OUT)
+
+#else
+
+#if LGRT_TI_RETURNED
+LGRT_TI_TO_INT_NAMED(sf, lgrt_sf_value, lgrt_sf_to_bits, __fixsfti, -128)
+LGRT_TI_TO_INT_NAMED(sf, lgrt_sf_value, lgrt_sf_to_bits, __fixunssfti, 128)
+#if LGRT_SOFT_DOUBLE
+LGRT_TI_TO_INT_NAMED(df, lgrt_df_value, lgrt_df_to_bits, __fixdfti, -128)
+LGRT_TI_TO_INT_NAMED(df, lgrt_df_value, lgrt_df_to_bits, __fixunsdfti, 128)
+#endif
+#endif
+
+LGRT_TI_FROM_INT(
+    sf, lgrt_sf_value, lgrt_sf_from_bits, __floattisf, __floatuntisf
+)
+#if LGRT_SOFT_DOUBLE
+LGRT_TI_FROM_INT(
+    df, lgrt_df_value, lgrt_df_from_bits, __floattidf, __floatuntidf
+)
+#endif
+
+#endif
+
+/* Hexagon has names of its own for these, from releases before 20. */
+#if defined(__hexagon__)
+LGRT_FP_ALIAS(
+    lgrt_ti_return, __hexagon_fixsfti, "__fixsfti", (lgrt_sf_value a)
+)
+LGRT_FP_ALIAS(
+    lgrt_ti_return, __hexagon_fixunssfti, "__fixunssfti", (lgrt_sf_value a)
+)
+LGRT_FP_ALIAS(
+    lgrt_ti_return, __hexagon_fixdfti, "__fixdfti", (lgrt_df_value a)
+)
+LGRT_FP_ALIAS(
+    lgrt_ti_return, __hexagon_fixunsdfti, "__fixunsdfti", (lgrt_df_value a)
+)
+LGRT_FP_ALIAS(
+    lgrt_sf_value, __hexagon_floattisf, "__floattisf",
+    (uint64_t a_first, uint64_t a_second)
+)
+LGRT_FP_ALIAS(
+    lgrt_df_value, __hexagon_floattidf, "__floattidf",
+    (uint64_t a_first, uint64_t a_second)
+)
+#endif
+
+/*
+ * On IA-32, the integer goes on the stack where this format goes, and that
+ * moved in Clang 21, along with the alignment of 16 that both now have there.
+ */
+#if LGRT_SOFT_QUAD && !defined(__powerpc__)
+#if defined(__i386__)
+#define LGRT_TI_TF_FROM_INT(name, prec) \
+    lgrt_quad_value name(lgrt_quad_value a); \
+    lgrt_quad_value name(lgrt_quad_value a) { \
+        struct lgrt_ti x; \
+        \
+        __builtin_memcpy(&x, &a, sizeof(struct lgrt_ti)); \
+        return lgrt_tf_from_bits(lgrt_tf_from_bitint(x.words, (prec))); \
+    }
+
+LGRT_TI_TF_FROM_INT(__floattitf, -128)
+LGRT_TI_TF_FROM_INT(__floatuntitf, 128)
+#else
+LGRT_TI_FROM_INT(
+    tf, lgrt_quad_value, lgrt_tf_from_bits, __floattitf, __floatuntitf
+)
+#endif
+#if LGRT_TI_RETURNED
+LGRT_TI_TO_INT_NAMED(tf, lgrt_quad_value, lgrt_tf_to_bits, __fixtfti, -128)
+LGRT_TI_TO_INT_NAMED(tf, lgrt_quad_value, lgrt_tf_to_bits, __fixunstfti, 128)
+#endif
+#endif
+
+/* SPARC passes long double in the forms of its routines of other names. */
+#if defined(__sparc__) && LGRT_QUAD_OWN_NAMES
+
+static inline lgrt_ti_return lgrt_tf_fix_ti(struct lgrt_wide x, int32_t prec) {
+    struct lgrt_ti result;
+
+    lgrt_tf_to_bitint(result.words, prec, x);
+    return lgrt_ti_out(result);
+}
+
+#if LGRT_TF_IN_REGISTERS
+LGRT_TI_FROM_INT(
+    tf, lgrt_tf_registers, lgrt_tf_to_registers, __floattitf, __floatuntitf
+)
+#else
+LGRT_TI_FROM_INT(
+    tf, lgrt_quad_value, lgrt_tf_from_bits, __floattitf, __floatuntitf
+)
+#endif
+LGRT_TF_TO(__fixtfti, lgrt_ti_return, lgrt_tf_fix_ti(x, -128))
+LGRT_TF_TO(__fixunstfti, lgrt_ti_return, lgrt_tf_fix_ti(x, 128))
+
+#endif
+
+#if defined(__i386__)
+
+#if LGRT_SOFT_HF && !LGRT_HF_PASSED_AS_INT
+LGRT_TI_FROM_INT(
+    hf, lgrt_hf_value, lgrt_hf_from_bits, __floattihf, __floatuntihf
+)
+LGRT_TI_TO_INT_NAMED(hf, lgrt_hf_value, lgrt_hf_to_bits, __fixhfti, -128)
+LGRT_TI_TO_INT_NAMED(hf, lgrt_hf_value, lgrt_hf_to_bits, __fixunshfti, 128)
+#endif
+
+LGRT_TI_TO_INT_NAMED(xf, lgrt_xf_argument, lgrt_xf_to_bits, __fixxfti, -128)
+LGRT_TI_TO_INT_NAMED(
+    xf, lgrt_xf_argument, lgrt_xf_to_bits, __fixunsxfti, 128
+)
+
+#if defined(__clang__)
+void __floattixf(struct lgrt_ti a);
+void __floattixf(struct lgrt_ti a) {
+    lgrt_xf_return(lgrt_xf_from_bitint(a.words, -128));
+}
+
+void __floatuntixf(struct lgrt_ti a);
+void __floatuntixf(struct lgrt_ti a) {
+    lgrt_xf_return(lgrt_xf_from_bitint(a.words, 128));
+}
+#elif LGRT_XF_RETURNED
+LGRT_TI_FROM_INT(
+    xf, lgrt_xf_value, lgrt_xf_from_bits, __floattixf, __floatuntixf
+)
+#endif
+
+#endif
+
+/*
+ * IBM long double. Its first double can be as large as 2^128, or more, with a
+ * second that takes it back into range, so the sums go on limbs with room for
+ * that. Clang goes through __floattitf for unsigned integers too.
+ */
+#if defined(__powerpc__) && LGRT_HAS_IBM_128
+
+#define LGRT_IBM_TI_LIMBS 6
+#define LGRT_IBM_TI_PREC 192
+
+static inline void lgrt_ibm_ti_sum(
+    lgrt_limb *r, const lgrt_limb *a, const lgrt_limb *b, bool subtract,
+    bool one_less
+) {
+    lgrt_limb carry = subtract && !one_less ? 1 : 0;
+
+    for (size_t i = 0; i < LGRT_IBM_TI_LIMBS; i++) {
+        size_t at = LGRT_LIMB_AT(LGRT_IBM_TI_LIMBS, i);
+        lgrt_double_limb sum = (lgrt_double_limb)a[at]
+            + (subtract ? ~b[at] : b[at]) + carry;
+
+        r[at] = (lgrt_limb)sum;
+        carry = (lgrt_limb)(sum >> LGRT_LIMB_BITS);
+    }
+}
+
+#if LGRT_TI_RETURNED
+
+/*
+ * As other conversions of this format do: a second double opposite to the
+ * first takes off its integer part, and 1 more if that leaves a fraction,
+ * which it can only do where the first has none.
+ */
+static inline lgrt_ti_return lgrt_ibm_fix_ti(
+    struct lgrt_ibm_bits x, int32_t prec
+) {
+    uint64_t mask = LGRT_IBM_SIGN - 1;
+    uint64_t high = x.high & mask;
+    uint64_t low = x.low & mask;
+    bool negative = lgrt_ibm_cx_negative(x);
+    bool below = ((x.high ^ x.low) & LGRT_IBM_SIGN) != 0 && low != 0;
+    lgrt_limb first[LGRT_IBM_TI_LIMBS];
+    lgrt_limb second[LGRT_IBM_TI_LIMBS];
+    lgrt_limb sum[LGRT_IBM_TI_LIMBS];
+    struct lgrt_ti result;
+
+    if (high > LGRT_IBM_INF || (negative && prec > 0)) {
+        lgrt_bitint_clear(result.words, prec);
+        return lgrt_ti_out(result);
+    }
+    lgrt_df_to_bitint(first, LGRT_IBM_TI_PREC, high);
+    lgrt_df_to_bitint(second, LGRT_IBM_TI_PREC, low);
+    lgrt_ibm_ti_sum(
+        sum, first, second, below,
+        below && !lgrt_ibm_has_fraction(high) && lgrt_ibm_has_fraction(low)
+    );
+    if (sum[LGRT_LIMB_AT(LGRT_IBM_TI_LIMBS, 4)] != 0
+     || sum[LGRT_LIMB_AT(LGRT_IBM_TI_LIMBS, 5)] != 0
+     || (prec < 0
+      && (sum[LGRT_LIMB_AT(LGRT_IBM_TI_LIMBS, 3)]
+       >> (LGRT_LIMB_BITS - 1)) != 0)) {
+        lgrt_bitint_saturate(result.words, prec, negative);
+        return lgrt_ti_out(result);
+    }
+    for (size_t i = 0; i < 4; i++) {
+        result.words[LGRT_LIMB_AT(4, i)] = sum[
+            LGRT_LIMB_AT(LGRT_IBM_TI_LIMBS, i)
+        ];
+    }
+    if (negative) {
+        lgrt_bitint_negate(result.words, 4);
+    }
+    return lgrt_ti_out(result);
+}
+
+LGRT_IBM_TO_NAMED(lgrt_ti_return, __fixtfti, lgrt_ibm_fix_ti(x, -128))
+LGRT_IBM_TO_NAMED(lgrt_ti_return, __fixunstfti, lgrt_ibm_fix_ti(x, 128))
+
+#endif
+
+/*
+ * The first double is the integer rounded, and the second what that leaves, as
+ * a signed value, rounded in turn.
+ */
+lgrt_ibm_value __floattitf(LGRT_TI_PARAMETER(a));
+lgrt_ibm_value __floattitf(LGRT_TI_PARAMETER(a)) {
+    struct lgrt_ti x = LGRT_TI_VALUE(a);
+    struct lgrt_bitint value;
+    lgrt_limb magnitude[LGRT_IBM_TI_LIMBS];
+    lgrt_limb first[LGRT_IBM_TI_LIMBS];
+    lgrt_limb rest[LGRT_IBM_TI_LIMBS];
+    uint64_t high;
+    uint64_t low;
+
+    lgrt_bitint_load(&value, x.words, -128);
+    for (size_t i = 0; i < LGRT_IBM_TI_LIMBS; i++) {
+        magnitude[LGRT_LIMB_AT(LGRT_IBM_TI_LIMBS, i)] = i < value.count
+            ? lgrt_bitint_magnitude(&value, i) : 0;
+    }
+    high = lgrt_df_from_bitint(magnitude, LGRT_IBM_TI_PREC);
+    lgrt_df_to_bitint(first, LGRT_IBM_TI_PREC, high);
+    lgrt_ibm_ti_sum(rest, magnitude, first, true, false);
+    low = lgrt_df_from_bitint(rest, -LGRT_IBM_TI_PREC);
+    if (value.negative) {
+        high ^= LGRT_IBM_SIGN;
+        if (low != 0) {
+            low ^= LGRT_IBM_SIGN;
+        }
+    }
+    return lgrt_ibm_from_bits(lgrt_ibm_make(high, low));
+}
+
+#endif
+
+#endif
+
+#endif
+
+/*
  * The atomic routines need the atomic instructions of the target, and nothing
  * but them: neither the help of an operating system, nor masked interrupts. So
  * they exist only where the compiler implements pointer-sized atomics inline
@@ -8162,6 +9647,12 @@ LGRT_XC_ROUTINE(__divxc3, lgrt_xf_cx_divide)
 #elif !defined(__clang__) && !defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4)
 /*
  * What GCC claims to be lock-free without that, it calls __sync routines for.
+ */
+#define LGRT_NO_ATOMICS 1
+#elif defined(__mips16)
+/*
+ * No ll and sc in MIPS16 code, where GCC calls __sync routines for its atomics
+ * all the same.
  */
 #define LGRT_NO_ATOMICS 1
 #elif !defined(__GCC_ATOMIC_POINTER_LOCK_FREE) \
@@ -9915,16 +11406,306 @@ void lgrt_sync_synchronize(void) LGRT_ASM_LABEL(__sync_synchronize);
 void lgrt_sync_synchronize(void) {
     lgrt_fence();
 }
-#elif defined(__mips16)
+#endif
+
+#endif
+
+/*
+ * GCC calls this at the end of a compound assignment to an _Atomic
+ * floating-point object, with the environment as it was before that, and with
+ * the status register as it was after it, of which only the flags that GCC
+ * cleared for the operation count. Nothing calls it on the other targets,
+ * which have no FPU, or do this inline, as RISC-V and PowerPC do, and Clang
+ * calls it nowhere.
+ */
+#if defined(__mips16)
+#define LGRT_FE_ABI __attribute__((__nomips16__))
+#else
+#define LGRT_FE_ABI
+#endif
+
+LGRT_FE_ABI void lgrt_atomic_feraiseexcept(int excepts) __asm__ (
+    LGRT_XSTR(__USER_LABEL_PREFIX__) "__atomic_feraiseexcept"
+);
+
+#if (defined(__i386__) || defined(__x86_64__)) \
+ && (defined(__SSE__) || !defined(_SOFT_FLOAT))
+#define LGRT_FE_ALL ((uint32_t)0x3f)
+#define LGRT_FE_INVALID ((uint32_t)0x01)
+#define LGRT_FE_DENORMAL ((uint32_t)0x02)
+#define LGRT_FE_DIVBYZERO ((uint32_t)0x04)
+#define LGRT_FE_OVERFLOW ((uint32_t)0x08)
+#define LGRT_FE_UNDERFLOW ((uint32_t)0x10)
+#define LGRT_FE_INEXACT ((uint32_t)0x20)
+#elif defined(__alpha__)
+#define LGRT_FE_ALL ((uint32_t)0x7e0000)
+#define LGRT_FE_INVALID ((uint32_t)0x020000)
+#define LGRT_FE_DIVBYZERO ((uint32_t)0x040000)
+#define LGRT_FE_OVERFLOW ((uint32_t)0x080000)
+#define LGRT_FE_UNDERFLOW ((uint32_t)0x100000)
+#define LGRT_FE_INEXACT ((uint32_t)0x200000)
+#define LGRT_FE_DENORMAL ((uint32_t)0x400000)
+#elif (defined(__aarch64__) && (defined(__ARM_FP) \
+  || (!defined(__clang__) && defined(__FP_FAST_FMAF)))) \
+ || (defined(__arm__) && defined(__ARM_FP) && !defined(__SOFTFP__) \
+  && (!defined(__thumb__) || defined(__thumb2__)))
+#define LGRT_FE_ALL ((uint32_t)0x1f)
+#define LGRT_FE_INVALID ((uint32_t)0x01)
+#define LGRT_FE_DIVBYZERO ((uint32_t)0x02)
+#define LGRT_FE_OVERFLOW ((uint32_t)0x04)
+#define LGRT_FE_UNDERFLOW ((uint32_t)0x08)
+#define LGRT_FE_INEXACT ((uint32_t)0x10)
+#elif defined(__hppa__) && !defined(__SOFTFP__)
+#define LGRT_FE_ALL ((uint32_t)0xf8000000)
+#define LGRT_FE_INVALID ((uint32_t)0x80000000)
+#define LGRT_FE_DIVBYZERO ((uint32_t)0x40000000)
+#define LGRT_FE_OVERFLOW ((uint32_t)0x20000000)
+#define LGRT_FE_UNDERFLOW ((uint32_t)0x10000000)
+#define LGRT_FE_INEXACT ((uint32_t)0x08000000)
+#elif defined(__loongarch_frlen) && __loongarch_frlen != 0
+#define LGRT_FE_ALL ((uint32_t)0x1f0000)
+#define LGRT_FE_INVALID ((uint32_t)0x100000)
+#define LGRT_FE_DIVBYZERO ((uint32_t)0x080000)
+#define LGRT_FE_OVERFLOW ((uint32_t)0x040000)
+#define LGRT_FE_UNDERFLOW ((uint32_t)0x020000)
+#define LGRT_FE_INEXACT ((uint32_t)0x010000)
+#elif (defined(__mips__) && defined(__mips_hard_float)) \
+ || defined(__SH_FPU_ANY__)
+#define LGRT_FE_ALL ((uint32_t)0x7c)
+#define LGRT_FE_INVALID ((uint32_t)0x40)
+#define LGRT_FE_DIVBYZERO ((uint32_t)0x20)
+#define LGRT_FE_OVERFLOW ((uint32_t)0x10)
+#define LGRT_FE_UNDERFLOW ((uint32_t)0x08)
+#define LGRT_FE_INEXACT ((uint32_t)0x04)
+#elif defined(__s390__) && (defined(__clang__) || defined(__FP_FAST_FMAF))
+/* GCC moves the flags to the low byte of the argument. */
+#define LGRT_FE_ALL ((uint32_t)0xf8)
+#define LGRT_FE_INVALID ((uint32_t)0x80)
+#define LGRT_FE_DIVBYZERO ((uint32_t)0x40)
+#define LGRT_FE_OVERFLOW ((uint32_t)0x20)
+#define LGRT_FE_UNDERFLOW ((uint32_t)0x10)
+#define LGRT_FE_INEXACT ((uint32_t)0x08)
+#elif defined(__sparc__) && !defined(_SOFT_FLOAT) && !defined(SOFT_FLOAT)
+#define LGRT_FE_ALL ((uint32_t)0x3e0)
+#define LGRT_FE_INVALID ((uint32_t)0x200)
+#define LGRT_FE_OVERFLOW ((uint32_t)0x100)
+#define LGRT_FE_UNDERFLOW ((uint32_t)0x080)
+#define LGRT_FE_DIVBYZERO ((uint32_t)0x040)
+#define LGRT_FE_INEXACT ((uint32_t)0x020)
+#endif
+
+#if defined(LGRT_FE_ALL)
+
+#if defined(__i386__) || defined(__x86_64__)
+
+#if defined(__SSE__)
+#define LGRT_FE_SSE(instruction, a, b) do { \
+    uint32_t lgrt_fe_a = (a); \
+    uint32_t lgrt_fe_b = (b); \
+    \
+    __asm__ volatile ( \
+        "movss %0, %%xmm0\n\t" \
+        instruction " %1, %%xmm0" \
+        : \
+        : "m"(lgrt_fe_a), "m"(lgrt_fe_b) \
+        : "cc", "xmm0" \
+    ); \
+} while (0)
+#define LGRT_FE_DIVIDE(a, b) LGRT_FE_SSE("divss", a, b)
+#define LGRT_FE_MULTIPLY(a, b) LGRT_FE_SSE("mulss", a, b)
+#define LGRT_FE_COMPARE(a, b) LGRT_FE_SSE("ucomiss", a, b)
+#endif
+
+#elif defined(__alpha__)
+
+/*
+ * These name the flags of the FP_C quadword, which only the operating system
+ * reaches, on completing an instruction with /S, as GCC compiles the operation
+ * itself: so each gets such an instruction, whatever flags this is built with.
+ */
+#define LGRT_FE_ALPHA(instruction, a, b) do { \
+    uint32_t lgrt_fe_a = (a); \
+    uint32_t lgrt_fe_b = (b); \
+    \
+    __asm__ volatile ( \
+        "lds $f10, %0\n\t" \
+        "lds $f11, %1\n\t" \
+        instruction " $f10, $f11, $f12\n\t" \
+        "trapb" \
+        : \
+        : "m"(lgrt_fe_a), "m"(lgrt_fe_b) \
+        : "$f10", "$f11", "$f12" \
+    ); \
+} while (0)
+#define LGRT_FE_DIVIDE(a, b) LGRT_FE_ALPHA("divs/sui", a, b)
+#define LGRT_FE_MULTIPLY(a, b) LGRT_FE_ALPHA("muls/su", a, b)
+#define LGRT_FE_COMPARE(a, b) LGRT_FE_ALPHA("cmpteq/su", a, b)
+
+#elif defined(__arm__)
+
+/*
+ * GCC rejects floating-point types with -mgeneral-regs-only here, with nothing
+ * to tell of it, and leaves assembly alone. A trap that some cores delay to
+ * the next instruction of the FPU comes with the last move.
+ */
+#define LGRT_FE_VFP(instruction, a, b) do { \
+    uint32_t lgrt_fe_result; \
+    \
+    __asm__ volatile ( \
+        "vmov s14, %1\n\t" \
+        "vmov s15, %2\n\t" \
+        instruction " s14, s14, s15\n\t" \
+        "vmov %0, s14" \
+        : "=r"(lgrt_fe_result) \
+        : "r"((uint32_t)(a)), "r"((uint32_t)(b)) \
+        : "s14", "s15" \
+    ); \
+    (void)lgrt_fe_result; \
+} while (0)
+#define LGRT_FE_DIVIDE(a, b) LGRT_FE_VFP("vdiv.f32", a, b)
+#define LGRT_FE_MULTIPLY(a, b) LGRT_FE_VFP("vmul.f32", a, b)
+
+#else
+
+/*
+ * Through volatile objects, the compiler can neither fold these nor drop them,
+ * whatever flags this is built with.
+ */
+union lgrt_fe_float {
+    uint32_t bits;
+    float value;
+};
+
+#define LGRT_FE_C(op, a, b) do { \
+    volatile union lgrt_fe_float lgrt_fe_a = { .bits = (a) }; \
+    volatile union lgrt_fe_float lgrt_fe_b = { .bits = (b) }; \
+    volatile float lgrt_fe_result = lgrt_fe_a.value op lgrt_fe_b.value; \
+    \
+    (void)lgrt_fe_result; \
+} while (0)
+#define LGRT_FE_MULTIPLY(a, b) LGRT_FE_C(*, a, b)
+
+/*
+ * GCC and Clang can divide through a reciprocal estimate on AArch64 and
+ * LoongArch, given -mlow-precision-div or -mrecip, whose steps raise other
+ * exceptions. Clang before 17 tells of -mgeneral-regs-only only through
+ * __ARM_NEON, and rejects this with it.
+ */
+#if defined(__aarch64__) && (!defined(__clang__) || defined(__ARM_NEON))
+#define LGRT_FE_DIVIDE(a, b) __asm__ volatile ( \
+        "fmov s30, %w0\n\t" \
+        "fmov s31, %w1\n\t" \
+        "fdiv s30, s30, s31" \
+        : \
+        : "r"((uint32_t)(a)), "r"((uint32_t)(b)) \
+        : "v30", "v31" \
+    )
+#elif defined(__loongarch__)
+#define LGRT_FE_DIVIDE(a, b) __asm__ volatile ( \
+        "movgr2fr.w $f0, %0\n\t" \
+        "movgr2fr.w $f1, %1\n\t" \
+        "fdiv.s $f0, $f0, $f1" \
+        : \
+        : "r"((uint32_t)(a)), "r"((uint32_t)(b)) \
+        : "$f0", "$f1" \
+    )
+#else
+#define LGRT_FE_DIVIDE(a, b) LGRT_FE_C(/, a, b)
+#endif
+
+#endif
+
+/* No operand here is denormal on SuperH, which traps on one. */
+#if defined(LGRT_FE_DIVIDE)
+static inline LGRT_FE_ABI void lgrt_fe_operate(uint32_t named) {
+    if ((named & LGRT_FE_INVALID) != 0) {
+        LGRT_FE_DIVIDE(0x00000000, 0x00000000);
+    }
+#if defined(LGRT_FE_DENORMAL)
+    if ((named & LGRT_FE_DENORMAL) != 0) {
+        LGRT_FE_COMPARE(0x00000001, 0x00000000);
+    }
+#endif
+    if ((named & LGRT_FE_DIVBYZERO) != 0) {
+        LGRT_FE_DIVIDE(0x3f800000, 0x00000000);
+    }
+    if ((named & LGRT_FE_OVERFLOW) != 0) {
+        LGRT_FE_MULTIPLY(0x7f000000, 0x7f000000);
+    }
+    if ((named & LGRT_FE_UNDERFLOW) != 0) {
+        LGRT_FE_MULTIPLY(0x00800000, 0x00800000);
+    }
+    if ((named & LGRT_FE_INEXACT) != 0) {
+        LGRT_FE_DIVIDE(0x3f800000, 0x40400000);
+    }
+}
+#endif
+
+LGRT_FE_ABI void lgrt_atomic_feraiseexcept(int excepts) {
+    uint32_t named = (uint32_t)excepts & LGRT_FE_ALL;
+
+    if (named == 0) {
+        return;
+    }
+
+#if defined(__i386__) || defined(__x86_64__)
+#if defined(__SSE__)
+    uint32_t mxcsr;
+
+    __asm__ volatile ("stmxcsr %0" : "=m"(mxcsr));
+    mxcsr |= named;
+    __asm__ volatile ("ldmxcsr %0" : : "m"(mxcsr));
+#endif
+
+#if !defined(_SOFT_FLOAT)
+    /*
+     * Nothing tells of -m16, which gets the 16-bit format: the status word is
+     * at byte 4 in the 32-bit format, whose bytes 2 and 3 are reserved, and at
+     * byte 2 in the 16-bit one, whose byte 4 is the low one of the tags, all
+     * empty at a call.
+     */
+    uint32_t environment[7];
+    uint32_t status = named;
+
+    __asm__ volatile ("fnstenv %0" : "=m"(environment));
+    /*
+     * The control word, at byte 0 in both, has the masks in the bits of the
+     * flags, and a flag that is to trap needs the summary flag as well.
+     */
+    if ((named & ~environment[0]) != 0) {
+        status |= (uint32_t)0x80;
+    }
+    environment[0] |= status << 16;
+    environment[1] |= status;
+    __asm__ volatile (
+        "fldenv %0\n\t"
+        "fwait"
+        :
+        : "m"(environment)
+    );
+#endif
+
+#if defined(__SSE__)
+    /* Only an operation traps, where its exception is unmasked. */
+    named &= ~(mxcsr >> 7);
+#endif
+#endif
+
+#if defined(LGRT_FE_DIVIDE)
+    lgrt_fe_operate(named);
+#endif
+}
+
+#endif
+
+#if defined(__mips16)
 /* GCC calls this for the fences of MIPS16, which no instruction does. */
 __attribute__((__nomips16__))
-void lgrt_sync_synchronize(void) LGRT_ASM_LABEL(__sync_synchronize);
+void lgrt_sync_synchronize(void) __asm__ ("__sync_synchronize");
 __attribute__((__nomips16__))
 void lgrt_sync_synchronize(void) {
     __asm__ volatile ("sync" : : : "memory");
 }
-#endif
-
 #endif
 
 #if defined(__aarch64__)
