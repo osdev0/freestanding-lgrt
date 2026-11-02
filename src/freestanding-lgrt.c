@@ -49,6 +49,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* For what only assembly calls, which compilers cannot see. */
+#define LGRT_ASM_CALLED static __attribute__((__used__))
+
 #if defined(__ARM_EABI__)
 #define LGRT_AAPCS __attribute__((__pcs__("aapcs")))
 #else
@@ -599,8 +602,7 @@ typedef int lgrt_shift_count;
  */
 #if defined(__AVR__) && !defined(__AVR_TINY__)
 #define LGRT_SHIFT_NAME(name) lgrt_avr##name
-#define LGRT_SHIFT_ATTRIBUTE \
-    __attribute__((__used__, __visibility__("hidden")))
+#define LGRT_SHIFT_ATTRIBUTE LGRT_ASM_CALLED
 #else
 #define LGRT_SHIFT_NAME(name) name
 #define LGRT_SHIFT_ATTRIBUTE
@@ -6621,7 +6623,7 @@ LGRT_CX_NARROW(df, uint64_t, uint64_t, 11, 52)
         ); \
     }
 
-#define LGRT_CX_VFP_HELPER __attribute__((__used__, __visibility__("hidden")))
+#define LGRT_CX_VFP_HELPER LGRT_ASM_CALLED
 
 #define LGRT_CX_VFP_ROUTINES(fmt, cfmt, T, frame, first, second, last) \
     LGRT_CX_VFP_HELPER void lgrt_mul##cfmt##3_parts(T *parts) { \
@@ -6725,7 +6727,9 @@ static inline uint32_t lgrt_hc_packed(uint32_t *parts) {
 }
 
 #define LGRT_HC_FUNCTION(name, attributes, operation, label) \
-    uint32_t name(uint32_t a, uint32_t b, uint32_t c, uint32_t d) label; \
+    attributes uint32_t name( \
+        uint32_t a, uint32_t b, uint32_t c, uint32_t d \
+    ) label; \
     attributes uint32_t name( \
         uint32_t a, uint32_t b, uint32_t c, uint32_t d \
     ) { \
@@ -16301,7 +16305,7 @@ __asm__ (
 #define LGRT_SH_PUSH(r) "mov.l " r ", @-r15\n"
 #define LGRT_SH_POP(r) "mov.l @r15+, " r "\n"
 
-#define LGRT_SH_HELPER __attribute__((__used__, __visibility__("hidden")))
+#define LGRT_SH_HELPER LGRT_ASM_CALLED
 
 #if defined(__SH1__)
 #define LGRT_SH_CALL "jsr @r0\n"
@@ -17005,8 +17009,7 @@ uintptr_t __canonicalize_funcptr_for_compare(uintptr_t f) {
  * file, where the compiler goes up from 1 for its own.
  */
 #define LGRT_ALPHA_DIVISION(name, sequence, T, f) \
-    __attribute__((__used__, __visibility__("hidden"))) \
-    T lgrt_alpha##name(T a, T b) { \
+    LGRT_ASM_CALLED T lgrt_alpha##name(T a, T b) { \
         if (b == 0) { \
             LGRT_TRAP(); \
         } \
@@ -17717,7 +17720,7 @@ __asm__ (
 
 #define LGRT_MSP430_CRT_HELPER \
     LGRT_NO_STACK_PROTECTOR \
-    __attribute__((__used__, __noinline__, __visibility__("hidden")))
+    LGRT_ASM_CALLED __attribute__((__noinline__))
 
 extern char __bssstart[] __attribute__((__weak__));
 extern char __bsssize[] __attribute__((__weak__));
@@ -17931,7 +17934,7 @@ void __crt0_run_array(void) {
     "sbci " r3 ", -1\n"
 
 /* What the routines in C save, for what C may change and they may not. */
-#define LGRT_AVR_HELPER __attribute__((__used__, __visibility__("hidden")))
+#define LGRT_AVR_HELPER LGRT_ASM_CALLED
 
 #define LGRT_AVR_PUSH_X_Z \
     "push r26\n" \
