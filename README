@@ -1,10 +1,12 @@
-This is a 0BSD-licensed freestanding runtime library, in a single C file, for use with GCC or Clang.
+This is a 0BSD-licensed freestanding runtime library, in a single C file, for
+use with GCC or Clang.
 
-It must be compiled with the same flags as the rest of the program, but without
-LTO (-fno-lto), and the program must provide memcpy, memmove, memset, and memcmp.
+It must be compiled as C99 or later, with the same flags as the rest of the
+program, but without LTO (-fno-lto), and the program must provide memcpy,
+memmove, memset, and memcmp.
 
 Floating point and SIMD are left out unless asked for: define
 FREESTANDING_LGRT_ENABLE_FLOAT when compiling it to add everything to do with
-floating point, and FREESTANDING_LGRT_ENABLE_SIMD to add what is written with SIMD
-instructions. Define FREESTANDING_LGRT_DISABLE_LIBC_FUNCS to leave out the functions
-of the C library, those of stdatomic.h and stdbit.h.
+floating point, and FREESTANDING_LGRT_ENABLE_SIMD to add what is written with
+SIMD instructions. Define FREESTANDING_LGRT_DISABLE_LIBC_FUNCS to leave out the
+functions of the C library, those of stdatomic.h and stdbit.h.

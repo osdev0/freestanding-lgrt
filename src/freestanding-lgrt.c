@@ -14,7 +14,11 @@
  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#if !defined(__GNUC__) && !defined(__clang__)
+#if defined(__cplusplus)
+#error "Please do not compile freestanding-lgrt as C++ code! Compile it as C99 or newer."
+#elif !defined(__STDC_VERSION__) || __STDC_VERSION__ < 199901L
+#error "freestanding-lgrt must be compiled as C99 or newer."
+#elif !defined(__GNUC__) && !defined(__clang__)
 #error "freestanding-lgrt requires GCC or Clang"
 #elif (defined(__clang__) && __clang_major__ < 6) \
    || (!defined(__clang__) \
