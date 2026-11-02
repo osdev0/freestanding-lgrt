@@ -23,6 +23,31 @@
 #endif
 
 /*
+ * Options, to define when building this file:
+ *
+ * FREESTANDING_LGRT_ENABLE_FLOAT adds all that has to do with floating point,
+ * as far as the flags of the build allow it: the routines of binary and
+ * decimal formats and of complex values, conversions of integers, fixed point,
+ * and _BitInt to and from those, __atomic_feraiseexcept, and the routines that
+ * save floating-point registers. Without it, what there is uses no
+ * floating-point type or instruction of its own, though the compiler may still
+ * choose such registers where its flags allow it.
+ *
+ * FREESTANDING_LGRT_ENABLE_SIMD adds what is written with SIMD instructions:
+ * PowerPC's routines that save the registers of AltiVec. Without it, the
+ * compiler may still choose such registers where its flags allow it, and
+ * values of floating-point types arrive in them where the ABI has them there.
+ *
+ * What needs what these add fails to link without them.
+ *
+ * FREESTANDING_LGRT_DISABLE_LIBC_FUNCS leaves out the functions of the C
+ * library: those of <stdatomic.h> and <stdbit.h>.
+ *
+ * The macros named LGRT_ are internal: they follow from these, the compiler,
+ * and the target, and are not for defining.
+ */
+
+/*
  * Known issues of compilers, and what to do about them when building this:
  *
  * Clang 12 at -Oz miscompiles code that its machine outliner factors out for
@@ -2187,7 +2212,8 @@ int64_t __aeabi_uwrite8(int64_t value, void *address) {
  * these exist there only with -msoft-float, which __GCC_IEC_559 tells of, as
  * long as finite math does not make it say the same.
  */
-#if (defined(__x86_64__) && !defined(__SSE__)) \
+#if !defined(FREESTANDING_LGRT_ENABLE_FLOAT) \
+ || (defined(__x86_64__) && !defined(__SSE__)) \
  || LGRT_AARCH64_NO_FP \
  || (defined(__alpha__) && (!defined(__GCC_IEC_559) || __GCC_IEC_559 == 0)) \
  || (defined(__hppa__) && __GNUC__ < 11 \
@@ -2202,8 +2228,9 @@ int64_t __aeabi_uwrite8(int64_t value, void *address) {
  * The format of the x87, which x86-64 has without SSE too, and that of 96 bits
  * of m68k, on all but ColdFire, whose long double is 64-bit.
  */
-#if defined(__i386__) || defined(__x86_64__) \
- || (defined(__m68k__) && __LDBL_MANT_DIG__ == 64)
+#if defined(FREESTANDING_LGRT_ENABLE_FLOAT) \
+ && (defined(__i386__) || defined(__x86_64__) \
+  || (defined(__m68k__) && __LDBL_MANT_DIG__ == 64))
 #define LGRT_SOFT_XF 1
 #else
 #define LGRT_SOFT_XF 0
@@ -2213,7 +2240,8 @@ int64_t __aeabi_uwrite8(int64_t value, void *address) {
  * The routines of long double on Alpha pass it in ways that C has no part in,
  * and so go on without float and double.
  */
-#if defined(__alpha__) && __LDBL_MANT_DIG__ == 113
+#if defined(FREESTANDING_LGRT_ENABLE_FLOAT) && defined(__alpha__) \
+ && __LDBL_MANT_DIG__ == 113
 #define LGRT_ALPHA_QUAD 1
 #else
 #define LGRT_ALPHA_QUAD 0
@@ -8802,7 +8830,12 @@ struct lgrt_ti {
 #define LGRT_TI_PARAMETER(a) uint64_t a##_first, uint64_t a##_second
 #define LGRT_TI_VALUE(a) lgrt_ti_from_pair(a##_first, a##_second)
 
-static inline struct lgrt_ti lgrt_ti_from_pair(
+/*
+ * Where neither the routines that return these nor those of floating point are
+ * there, as for Clang on PowerPC with AltiVec in a plain build, nothing uses
+ * this, which Clang warns of.
+ */
+static inline __attribute__((__unused__)) struct lgrt_ti lgrt_ti_from_pair(
     uint64_t first, uint64_t second
 ) {
     uint64_t pair[2] = { first, second };
@@ -8990,6 +9023,8 @@ lgrt_ti_return __ashrti3(struct lgrt_ti a, int b) {
 #endif
 
 #endif
+
+#if LGRT_SOFT_FLOAT
 
 /*
  * Conversions, by the same helpers as _BitInt, for all but the integer in the
@@ -9311,6 +9346,8 @@ lgrt_ibm_value __floattitf(LGRT_TI_PARAMETER(a)) {
     }
     return lgrt_ibm_from_bits(lgrt_ibm_make(high, low));
 }
+
+#endif
 
 #endif
 
@@ -14162,7 +14199,7 @@ uint32_t lgrt_atomic_load_4(const volatile void *ptr, int model) {
 }
 
 #if defined(__clang__) && __clang_major__ < 9 && defined(__i386__) \
- && !defined(_SOFT_FLOAT)
+ && !defined(_SOFT_FLOAT) && defined(FREESTANDING_LGRT_ENABLE_FLOAT)
 /*
  * Workaround: Clang before 9, IA-32: it loads 8 bytes with cmpxchg8b, which
  * writes, and so faults where the object is read-only, so there 8 bytes are
@@ -14735,7 +14772,8 @@ LGRT_FETCH_OPS(or, LGRT_OP_OR)
 LGRT_FETCH_OPS(xor, LGRT_OP_XOR)
 LGRT_FETCH_OPS(nand, LGRT_OP_NAND)
 
-#if __STDC_VERSION__ >= 201112 && defined(__has_include)
+#if !defined(FREESTANDING_LGRT_DISABLE_LIBC_FUNCS) \
+ && __STDC_VERSION__ >= 201112 && defined(__has_include)
 #if __has_include(<stdatomic.h>)
 
 #include <stdatomic.h>
@@ -14918,7 +14956,9 @@ LGRT_FE_ABI void lgrt_atomic_feraiseexcept(int excepts) __asm__ (
     LGRT_XSTR(__USER_LABEL_PREFIX__) "__atomic_feraiseexcept"
 );
 
-#if (defined(__i386__) || defined(__x86_64__)) \
+#if !defined(FREESTANDING_LGRT_ENABLE_FLOAT)
+/* Nothing to raise. */
+#elif (defined(__i386__) || defined(__x86_64__)) \
  && (defined(__SSE__) || (!defined(__clang__) && !defined(_SOFT_FLOAT) \
   && (!defined(__x86_64__) || __GNUC__ >= 5)))
 #define LGRT_FE_ALL ((uint32_t)0x3f)
@@ -15585,6 +15625,8 @@ LGRT_RISCV_ROUTINES(restore, LGRT_RISCV_RESTORE)
 
 #endif
 
+#if !defined(FREESTANDING_LGRT_DISABLE_LIBC_FUNCS)
+
 /*
  * The C23 bit utilities. Those that count or skip ones work on the complement.
  * The builtins are undefined for zero, which is handled first, and narrow
@@ -15762,6 +15804,8 @@ LGRT_STDC_TYPES(LGRT_STDC_BIT_FLOOR)
     }
 
 LGRT_STDC_TYPES(LGRT_STDC_BIT_CEIL)
+
+#endif
 
 #if defined(__hexagon__)
 
@@ -15954,10 +15998,11 @@ __asm__ (
 
 /*
  * GCC for SPE calls these instead: the 32-bit ones save the low halves of the
- * registers as those above do, and the 64-bit ones the whole registers, where
- * the hardware holds doubles in them. The offsets of evstdd and evldd cannot
- * be negative, so r11 holds the address of the slot of r14 there, 144 bytes
- * below the top of the frame, whatever register the routine starts at.
+ * registers as those above do, and the 64-bit ones the whole registers, for
+ * code of any type, not only that of doubles. The offsets of evstdd and
+ * evldd cannot be negative, so r11 holds the address of the slot of r14
+ * there, 144 bytes below the top of the frame, whatever register the routine
+ * starts at.
  */
 
 #define LGRT_PPC_SAVE_EV(n, w, d) "evstdd %r" n ", 144-" d "(%r11)\n"
@@ -16037,7 +16082,8 @@ __asm__ (
 
 #endif
 
-#if !defined(_SOFT_FLOAT) && !defined(__NO_FPRS__)
+#if !defined(_SOFT_FLOAT) && !defined(__NO_FPRS__) \
+ && defined(FREESTANDING_LGRT_ENABLE_FLOAT)
 
 #define LGRT_PPC_SAVE_FPR(n, w, d) "stfd %f" n ", -" d "(%r11)\n"
 #define LGRT_PPC_REST_FPR(n, w, d) "lfd %f" n ", -" d "(%r11)\n"
@@ -16077,7 +16123,7 @@ __asm__ (
 
 #endif
 
-#if defined(__ALTIVEC__)
+#if defined(__ALTIVEC__) && defined(FREESTANDING_LGRT_ENABLE_SIMD)
 
 /*
  * Defines the entry points prefix N, for N from 20 to 31, all extending to
@@ -16715,7 +16761,7 @@ int32_t __ashrsi3(int32_t a, int b) {
     return (int32_t)(lgrt_sh_shift_right(x ^ flip, (uint32_t)b) ^ flip);
 }
 
-#if defined(__SH_FPU_DOUBLE__)
+#if defined(__SH_FPU_DOUBLE__) && defined(FREESTANDING_LGRT_ENABLE_FLOAT)
 
 /*
  * GCC 4.8 and 4.9 change precision by loading FPSCR from these: the first
@@ -17435,6 +17481,8 @@ int32_t __mspabi_mpyl(
 
 #endif
 
+#if LGRT_SOFT_FLOAT
+
 /*
  * GCC does the same for most of the floating-point routines, which this block
  * covers for Clang. The others follow it, for both. The run-time ABI leaves
@@ -17523,6 +17571,8 @@ uint64_t __mspabi_fltid(int16_t a) {
 uint64_t __mspabi_fltud(uint16_t a) {
     return __floatunsidf(a);
 }
+
+#endif
 
 int32_t __mspabi_mpysl(int16_t a, int16_t b) {
     return (int32_t)lgrt_shift_add_mul32(
