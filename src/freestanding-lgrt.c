@@ -2182,13 +2182,15 @@ int64_t __aeabi_uwrite8(int64_t value, void *address) {
  *
  * Workaround: GCC before 11, PA-RISC: with -mdisable-fpregs, it cannot compile
  * a function that takes or returns float, and nothing tells of that option. So
- * these exist there only with -msoft-float, which __GCC_IEC_559 tells of.
+ * these exist there only with -msoft-float, which __GCC_IEC_559 tells of, as
+ * long as finite math does not make it say the same.
  */
 #if (defined(__x86_64__) && !defined(__SSE__)) \
  || LGRT_AARCH64_NO_FP \
  || (defined(__alpha__) && (!defined(__GCC_IEC_559) || __GCC_IEC_559 == 0)) \
  || (defined(__hppa__) && __GNUC__ < 11 \
-  && (!defined(__GCC_IEC_559) || __GCC_IEC_559 != 0))
+  && (!defined(__GCC_IEC_559) || __GCC_IEC_559 != 0 \
+   || __FINITE_MATH_ONLY__ != 0))
 #define LGRT_SOFT_FLOAT 0
 #else
 #define LGRT_SOFT_FLOAT 1
@@ -2768,9 +2770,13 @@ typedef int lgrt_fp_cmp;
  * unsigned int, its library calls sign-extend the argument, where the ABI has
  * it zero-extended and code compiled for that type relies on that. So they
  * take all of the register there, and narrow it to the low half.
+ *
+ * Workaround: Clang before 12, 64-bit RISC-V: its library calls zero-extend it
+ * where the ABI has it sign-extended, and take the same way.
  */
 #if LGRT_64BIT \
- && (defined(__powerpc__) || defined(__s390__) || defined(__sparc__))
+ && (defined(__powerpc__) || defined(__s390__) || defined(__sparc__) \
+  || (defined(__clang__) && __clang_major__ < 12 && defined(__riscv)))
 typedef uint64_t lgrt_fp_unsigned_si;
 #else
 typedef uint32_t lgrt_fp_unsigned_si;
@@ -2958,7 +2964,10 @@ typedef long double lgrt_quad_value;
 #else
 #define LGRT_SOFT_QUAD 1
 #endif
-#elif defined(__SIZEOF_FLOAT128__)
+/* Workaround: GCC before 5, x86: it has __float128 without this macro. */
+#elif defined(__SIZEOF_FLOAT128__) \
+   || (!defined(__clang__) && __GNUC__ < 5 \
+    && (defined(__i386__) || defined(__x86_64__)))
 #define LGRT_SOFT_QUAD 1
 __extension__ typedef __float128 lgrt_quad_value;
 #endif
@@ -3688,7 +3697,7 @@ static inline lgrt_u128 lgrt_wide_to_u128(struct lgrt_wide a) {
  * Conversions with 128-bit integers, which can be wider than a significand on
  * top of what the macros above do, on two words rather than on the type.
  */
-#define LGRT_WIDE_TO_TI(fmt, C, M, F) \
+#define LGRT_WIDE_TO_TI_BITS(fmt, M, F) \
     static inline struct lgrt_wide lgrt_##fmt##_fix_ti( \
         struct lgrt_wide a, struct lgrt_wide limit \
     ) { \
@@ -3712,33 +3721,42 @@ static inline lgrt_u128 lgrt_wide_to_u128(struct lgrt_wide a) {
         return lgrt_wide_lt(limit, value) ? limit : value; \
     } \
     \
-    LGRT_FP_ABI lgrt_i128 __fix##fmt##ti(C a) { \
-        struct lgrt_wide x = lgrt_##fmt##_to_bits(a); \
+    static inline struct lgrt_wide lgrt_##fmt##_to_ti(struct lgrt_wide x) { \
         struct lgrt_wide top = lgrt_wide_make(LGRT_WIDE_SIGN, 0); \
-        struct lgrt_wide value; \
         \
         if ((x.high & LGRT_WIDE_SIGN) != 0) { \
-            value = lgrt_wide_sub( \
+            return lgrt_wide_sub( \
                 lgrt_wide_make(0, 0), lgrt_##fmt##_fix_ti(x, top) \
             ); \
-        } else { \
-            value = lgrt_##fmt##_fix_ti( \
-                x, lgrt_wide_sub(top, lgrt_wide_make(0, 1)) \
-            ); \
         } \
-        return (lgrt_i128)lgrt_wide_to_u128(value); \
+        return lgrt_##fmt##_fix_ti( \
+            x, lgrt_wide_sub(top, lgrt_wide_make(0, 1)) \
+        ); \
+    } \
+    \
+    static inline struct lgrt_wide lgrt_##fmt##_to_unsti( \
+        struct lgrt_wide x \
+    ) { \
+        if ((x.high & LGRT_WIDE_SIGN) != 0) { \
+            return lgrt_wide_make(0, 0); \
+        } \
+        return lgrt_##fmt##_fix_ti( \
+            x, lgrt_wide_make((uint64_t)0 - 1, (uint64_t)0 - 1) \
+        ); \
+    }
+
+#define LGRT_WIDE_TO_TI(fmt, C, M, F) \
+    LGRT_WIDE_TO_TI_BITS(fmt, M, F) \
+    \
+    LGRT_FP_ABI lgrt_i128 __fix##fmt##ti(C a) { \
+        return (lgrt_i128)lgrt_wide_to_u128( \
+            lgrt_##fmt##_to_ti(lgrt_##fmt##_to_bits(a)) \
+        ); \
     } \
     \
     LGRT_FP_ABI lgrt_u128 __fixuns##fmt##ti(C a) { \
-        struct lgrt_wide x = lgrt_##fmt##_to_bits(a); \
-        \
-        if ((x.high & LGRT_WIDE_SIGN) != 0) { \
-            return 0; \
-        } \
         return lgrt_wide_to_u128( \
-            lgrt_##fmt##_fix_ti( \
-                x, lgrt_wide_make((uint64_t)0 - 1, (uint64_t)0 - 1) \
-            ) \
+            lgrt_##fmt##_to_unsti(lgrt_##fmt##_to_bits(a)) \
         ); \
     }
 
@@ -3781,9 +3799,47 @@ static inline lgrt_u128 lgrt_wide_to_u128(struct lgrt_wide a) {
         ); \
     }
 
+/*
+ * Workaround: Clang before 22, hard-float MIPS64: it has the 128-bit integer
+ * of these in the floating-point registers of the format, going in and coming
+ * back, where the C ABI has it in integer registers.
+ */
+#if defined(__clang__) && __clang_major__ < 22 && defined(__mips64) \
+ && !defined(__mips_soft_float)
+#define LGRT_QUAD_TI_ROUTINES(fmt) \
+    LGRT_WIDE_TO_TI_BITS(fmt, 32767, 112) \
+    LGRT_WIDE_FROM_TI_BITS(fmt, 32767, 112) \
+    \
+    LGRT_FP_ABI lgrt_quad_value __fix##fmt##ti(lgrt_quad_value a) { \
+        return lgrt_##fmt##_from_bits( \
+            lgrt_##fmt##_to_ti(lgrt_##fmt##_to_bits(a)) \
+        ); \
+    } \
+    \
+    LGRT_FP_ABI lgrt_quad_value __fixuns##fmt##ti(lgrt_quad_value a) { \
+        return lgrt_##fmt##_from_bits( \
+            lgrt_##fmt##_to_unsti(lgrt_##fmt##_to_bits(a)) \
+        ); \
+    } \
+    \
+    LGRT_FP_ABI lgrt_quad_value __floatti##fmt(lgrt_quad_value i) { \
+        return lgrt_##fmt##_from_bits( \
+            lgrt_##fmt##_from_ti( \
+                (lgrt_i128)lgrt_wide_to_u128(lgrt_##fmt##_to_bits(i)) \
+            ) \
+        ); \
+    } \
+    \
+    LGRT_FP_ABI lgrt_quad_value __floatunti##fmt(lgrt_quad_value i) { \
+        return lgrt_##fmt##_from_bits( \
+            lgrt_##fmt##_float_ti(0, lgrt_##fmt##_to_bits(i)) \
+        ); \
+    }
+#else
 #define LGRT_QUAD_TI_ROUTINES(fmt) \
     LGRT_WIDE_TO_TI(fmt, lgrt_quad_value, 32767, 112) \
     LGRT_WIDE_FROM_TI(fmt, lgrt_quad_value, 32767, 112)
+#endif
 
 #else
 #define LGRT_QUAD_TI_ROUTINES(fmt)
@@ -4674,8 +4730,11 @@ static inline void lgrt_xf_return(struct lgrt_wide bits) {
 /*
  * x86-64 cannot return long double with x87 off. Passing it still works, in
  * memory, so the routines that only take one are still called there.
+ *
+ * Workaround: GCC before 5, x86-64: nothing tells of -mno-80387, so none of
+ * them return it, which nothing calls with x87 on.
  */
-#elif !defined(__x86_64__) || !defined(_SOFT_FLOAT)
+#elif !defined(__x86_64__) || (__GNUC__ >= 5 && !defined(_SOFT_FLOAT))
 
 static inline lgrt_xf_value lgrt_xf_from_bits(struct lgrt_wide bits) {
     struct lgrt_wide raw = lgrt_xf_encode(bits);
@@ -5593,11 +5652,11 @@ LGRT_WIDE_EXTEND(
 )
 
 /*
- * Workaround: Clang before 21, hard-float MIPS64: it calls this with the two
+ * Workaround: Clang before 22, hard-float MIPS64: it calls this with the two
  * words of the value in the integer registers that come first, in their order
  * in memory, where the C ABI has them in floating-point registers.
  */
-#if defined(__clang__) && __clang_major__ < 21 && defined(__mips64) \
+#if defined(__clang__) && __clang_major__ < 22 && defined(__mips64) \
  && !defined(__mips_soft_float)
 
 LGRT_WIDE_TRUNC_BITS(hf, uint32_t, 5, 10, tf, 32767, 112)
@@ -6069,6 +6128,18 @@ static inline __attribute__((__unused__)) unsigned int lgrt_cx_larger(
  * parts, as the signs of the products that would have to overflow for that
  * disagree, so a NaN is among the factors if none is infinite.
  */
+/*
+ * Workaround: GCC 5, IA-32 with PIC and x87 off: it runs out of registers in
+ * the complex routines of double, unless these helpers stay out of line and
+ * are built as at -O1.
+ */
+#if !defined(__clang__) && __GNUC__ == 5 && defined(__i386__) \
+ && defined(__PIC__) && defined(_SOFT_FLOAT)
+#define LGRT_CX_HELPER static __attribute__((__noinline__, __optimize__("O1")))
+#else
+#define LGRT_CX_HELPER LGRT_FP_HELPER
+#endif
+
 #define LGRT_CX_MULTIPLY(fmt, V, T) \
     static inline LGRT_FP_ABI bool lgrt_##fmt##_cx_infinite(V x) { \
         return lgrt_##fmt##_cx_is(lgrt_##fmt##_cx_bits(x), LGRT_FP_INFINITE); \
@@ -6106,7 +6177,7 @@ static inline __attribute__((__unused__)) unsigned int lgrt_cx_larger(
         ); \
     } \
     \
-    LGRT_FP_HELPER LGRT_FP_ABI void lgrt_##fmt##_cx_multiply( \
+    LGRT_CX_HELPER LGRT_FP_ABI void lgrt_##fmt##_cx_multiply( \
         V a, V b, V c, V d, V *parts \
     ) { \
         V ac = lgrt_##fmt##_cx_mul(a, c); \
@@ -6201,7 +6272,7 @@ static inline __attribute__((__unused__)) unsigned int lgrt_cx_larger(
         ); \
     } \
     \
-    LGRT_FP_HELPER LGRT_FP_ABI void lgrt_##fmt##_cx_divide( \
+    LGRT_CX_HELPER LGRT_FP_ABI void lgrt_##fmt##_cx_divide( \
         T a, T b, T c, T d, V *parts \
     ) { \
         bool a_finite = !lgrt_##fmt##_cx_is(a, LGRT_FP_INFINITE) \
@@ -9257,6 +9328,15 @@ lgrt_ibm_value __floattitf(LGRT_TI_PARAMETER(a)) {
  */
 #if !defined(__clang__) && defined(__QQ_FBIT__)
 
+/*
+ * Workaround: GCC 15, 64-bit MIPS, -O1: its if-conversion crashes, in
+ * mips_load_store_insns, on some 128-bit arithmetic of the conversions.
+ */
+#if defined(__mips64) && __GNUC__ == 15
+#pragma GCC push_options
+#pragma GCC optimize("no-if-conversion")
+#endif
+
 #if defined(__ARM_EABI__)
 #define LGRT_FX_NAME(name) __gnu_##name
 #else
@@ -10735,6 +10815,10 @@ LGRT_FX_CONVERSIONS(uta)
 #elif defined(__AVR__)
 LGRT_FX_CONVERSIONS(ta)
 LGRT_FX_CONVERSIONS(uta)
+#endif
+
+#if defined(__mips64) && __GNUC__ == 15
+#pragma GCC pop_options
 #endif
 
 #endif
@@ -12244,7 +12328,7 @@ static void lgrt_dec_from_binary(
     bool sticky;
 
     r.negative = negative;
-    if (l >= lgrt_dec_highest_exponent(words) + precision) {
+    if (length != 0 && l >= lgrt_dec_highest_exponent(words) + precision) {
         lgrt_dec_special(value, LGRT_DEC_INFINITE, negative, words);
         return;
     }
@@ -12662,10 +12746,10 @@ static uint64_t lgrt_dec_double_sig(uint64_t bits, int32_t *e) {
  * where that is one. An exact cancellation gives +0, and two zeros the sign of
  * the first.
  */
-static void lgrt_dec_from_ibm(
-    void *value, lgrt_ibm_value a, size_t words, uint32_t *work, size_t half
+static void lgrt_dec_from_ibm_bits(
+    void *value, struct lgrt_ibm_bits bits, size_t words, uint32_t *work,
+    size_t half
 ) {
-    struct lgrt_ibm_bits bits = lgrt_ibm_to_bits(a);
     uint64_t mask = LGRT_IBM_SIGN - 1;
     uint64_t special = (bits.high & mask) >= LGRT_IBM_INF
         ? bits.high
@@ -12735,6 +12819,16 @@ static void lgrt_dec_from_ibm(
     lgrt_dec_from_binary(
         value, sum, LGRT_DEC_IBM_SUM_LIMBS, base, negative, words, work, half
     );
+}
+
+/*
+ * Workaround: GCC 7, SPE: at -O2 and -O3, a value of this type passed on to a
+ * function that is not inlined can lose a word of its second double.
+ */
+static inline __attribute__((__always_inline__)) void lgrt_dec_from_ibm(
+    void *value, lgrt_ibm_value a, size_t words, uint32_t *work, size_t half
+) {
+    lgrt_dec_from_ibm_bits(value, lgrt_ibm_to_bits(a), words, work, half);
 }
 
 /*
@@ -14821,7 +14915,8 @@ LGRT_FE_ABI void lgrt_atomic_feraiseexcept(int excepts) __asm__ (
 );
 
 #if (defined(__i386__) || defined(__x86_64__)) \
- && (defined(__SSE__) || (!defined(__clang__) && !defined(_SOFT_FLOAT)))
+ && (defined(__SSE__) || (!defined(__clang__) && !defined(_SOFT_FLOAT) \
+  && (!defined(__x86_64__) || __GNUC__ >= 5)))
 #define LGRT_FE_ALL ((uint32_t)0x3f)
 #define LGRT_FE_INVALID ((uint32_t)0x01)
 #define LGRT_FE_DENORMAL ((uint32_t)0x02)
@@ -14969,7 +15064,9 @@ union lgrt_fe_float {
 #endif
 
 /* No operand here is denormal on SuperH, which traps on one. */
-static inline LGRT_FE_ABI void lgrt_fe_operate(uint32_t named) {
+static __attribute__((__noinline__)) LGRT_FE_ABI void lgrt_fe_operate(
+    uint32_t named
+) {
     if ((named & LGRT_FE_INVALID) != 0) {
         LGRT_FE_DIVIDE(0x00000000, 0x00000000);
     }
@@ -15000,6 +15097,20 @@ LGRT_FE_ABI void lgrt_atomic_feraiseexcept(int excepts) {
     }
 
     lgrt_fe_operate(named);
+#if defined(__sh__)
+    /*
+     * Where GCC switches precision around an operation, it can put back what
+     * it saved before that, along with the flags of then. Out here it has no
+     * more reason to switch.
+     */
+    {
+        uint32_t fpscr;
+
+        __asm__ volatile ("sts fpscr, %0" : "=r"(fpscr));
+        fpscr |= named;
+        __asm__ volatile ("lds %0, fpscr" : : "r"(fpscr));
+    }
+#endif
 }
 
 #endif
@@ -15031,7 +15142,7 @@ bool __aarch64_have_lse_atomics = false;
  * use those, and exclusive loops elsewhere. Those functions must stay apart,
  * for no exclusive loop to become an LSE instruction by inlining.
  *
- * GCC before 5 has no such attributes, and Clang before 16 ignores what it is
+ * GCC before 6 has no such attributes, and Clang before 16 ignores what it is
  * told of LSE, so those make exclusive loops in both, which all CPUs have.
  */
 #if defined(__clang__)
@@ -15047,7 +15158,7 @@ bool __aarch64_have_lse_atomics = false;
     __noinline__, __target__("no-outline-atomics") \
 ))
 #define LGRT_AARCH64_LSE __attribute__((__target__("+lse")))
-#elif __GNUC__ >= 5
+#elif __GNUC__ >= 6
 #define LGRT_AARCH64_EXCLUSIVE __attribute__((__noinline__))
 #define LGRT_AARCH64_LSE __attribute__((__target__("+lse")))
 #else
