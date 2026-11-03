@@ -23,6 +23,10 @@
 #elif (defined(__clang__) && __clang_major__ < 6) \
    || (!defined(__clang__) && (__GNUC__ < 4 || (__GNUC__ == 4 && __GNUC_MINOR__ < 8)))
 #   error "Compile freestanding-lgrt with GCC 4.8 or later, or Clang 6 or later."
+// The code generation of 32-bit LoongArch is unfinished before Clang 18.
+#elif defined(__clang__) && __clang_major__ < 18 && defined(__loongarch__) \
+   && __loongarch_grlen == 32
+#   error "Compile freestanding-lgrt for 32-bit LoongArch with Clang 18 or later."
 #endif
 
 // Options, to define when building this file:
@@ -327,19 +331,50 @@ int __ffsti2(i128 a) {
 }
 #endif
 
+// Masks of all ones for a negative value, of zeros for any other.
+//
+// Workaround: Clang 16 to 23, AVR, without optimisation: where it fills a
+// register with the sign of a value, it subtracts another register from it,
+// whatever that one holds, so the masks come from a comparison there.
+#if defined(__AVR__) && defined(__clang__) && __clang_major__ >= 16 && !defined(__OPTIMIZE__)
+static inline uint32_t sign_mask32(uint32_t x) {
+    uint32_t mask = 0;
+
+    if ((x >> 31) != 0) {
+        mask = ~(uint32_t)0;
+    }
+    return mask;
+}
+
+static inline uint64_t sign_mask64(uint64_t x) {
+    uint64_t mask = 0;
+
+    if ((x >> 63) != 0) {
+        mask = ~(uint64_t)0;
+    }
+    return mask;
+}
+
+#define SIGN_MASK32(x) sign_mask32(x)
+#define SIGN_MASK64(x) sign_mask64(x)
+#else // defined(__AVR__) && defined(__clang__) && __clang_major__ >= 16 && !defined(__OPTIMIZE__)
+#define SIGN_MASK32(x) ((uint32_t)0 - ((x) >> 31))
+#define SIGN_MASK64(x) ((uint64_t)0 - ((x) >> 63))
+#endif // defined(__AVR__) && defined(__clang__) && __clang_major__ >= 16 && !defined(__OPTIMIZE__)
+
 // The redundant sign bits are the leading zeros, but for the sign bit itself,
 // of the value with its complement for a negative one.
 
 int __clrsbsi2(int32_t a) {
     uint32_t x = (uint32_t)a;
 
-    return (int)(clz32(x ^ ((uint32_t)0 - (x >> 31))) - 1);
+    return (int)(clz32(x ^ SIGN_MASK32(x)) - 1);
 }
 
 int __clrsbdi2(int64_t a) {
     uint64_t x = (uint64_t)a;
 
-    return (int)(clz64(x ^ ((uint64_t)0 - (x >> 63))) - 1);
+    return (int)(clz64(x ^ SIGN_MASK64(x)) - 1);
 }
 
 #if HAS_INT128
@@ -647,7 +682,7 @@ SHIFT_ATTRIBUTE int64_t SHIFT_NAME(__ashrdi3)(int64_t a, shift_count b) {
 
     if ((n & 32) != 0) {
         lo = (uint32_t)((int32_t)hi >> s);
-        hi = (uint32_t)((int32_t)hi >> 31);
+        hi = SIGN_MASK32(hi);
     } else {
         lo = (lo >> s) | ((hi << 1) << (31 - s));
         hi = (uint32_t)((int32_t)hi >> s);
@@ -884,8 +919,8 @@ static inline uint32_t mulo32(int32_t a, int32_t b, bool *overflow) {
 static inline uint32_t mulo32(int32_t a, int32_t b, bool *overflow) {
     uint32_t x = (uint32_t)a;
     uint32_t y = (uint32_t)b;
-    uint32_t xs = (uint32_t)0 - (x >> 31);
-    uint32_t ys = (uint32_t)0 - (y >> 31);
+    uint32_t xs = SIGN_MASK32(x);
+    uint32_t ys = SIGN_MASK32(y);
     uint32_t xm = (x ^ xs) - xs;
     uint32_t ym = (y ^ ys) - ys;
     uint32_t neg = (x ^ y) >> 31;
@@ -925,8 +960,8 @@ int32_t __mulosi4(int32_t a, int32_t b, int *overflow) {
 static inline uint64_t mulo64(int64_t a, int64_t b, bool *overflow) {
     uint64_t x = (uint64_t)a;
     uint64_t y = (uint64_t)b;
-    uint64_t xs = (uint64_t)0 - (x >> 63);
-    uint64_t ys = (uint64_t)0 - (y >> 63);
+    uint64_t xs = SIGN_MASK64(x);
+    uint64_t ys = SIGN_MASK64(y);
     uint64_t xm = (x ^ xs) - xs;
     uint64_t ym = (y ^ ys) - ys;
     uint64_t neg = (x ^ y) >> 63;
@@ -1428,8 +1463,8 @@ u128 __umodti3(u128 a, u128 b) {
 static inline uint32_t divmod32(int32_t a, int32_t b, uint32_t *rem) {
     uint32_t x = (uint32_t)a;
     uint32_t y = (uint32_t)b;
-    uint32_t xs = (uint32_t)0 - (x >> 31);
-    uint32_t ys = (uint32_t)0 - (y >> 31);
+    uint32_t xs = SIGN_MASK32(x);
+    uint32_t ys = SIGN_MASK32(y);
     uint32_t qs = xs ^ ys;
     uint32_t r;
     uint32_t q = udivmod32((x ^ xs) - xs, (y ^ ys) - ys, &r);
@@ -1447,8 +1482,8 @@ int32_t __divsi3(int32_t a, int32_t b) {
 static inline uint64_t divmod64(int64_t a, int64_t b, uint64_t *rem) {
     uint64_t x = (uint64_t)a;
     uint64_t y = (uint64_t)b;
-    uint64_t xs = (uint64_t)0 - (x >> 63);
-    uint64_t ys = (uint64_t)0 - (y >> 63);
+    uint64_t xs = SIGN_MASK64(x);
+    uint64_t ys = SIGN_MASK64(y);
     uint64_t qs = xs ^ ys;
     uint64_t r;
     uint64_t q = udivmod64((x ^ xs) - xs, (y ^ ys) - ys, &r);
@@ -1581,7 +1616,7 @@ i128 __negvti2(i128 a) {
 
 int32_t __absvsi2(int32_t a) {
     uint32_t x = (uint32_t)a;
-    uint32_t s = (uint32_t)0 - (x >> 31);
+    uint32_t s = SIGN_MASK32(x);
     uint32_t m = (x ^ s) - s;
 
     if ((m >> 31) != 0) {
@@ -1592,7 +1627,7 @@ int32_t __absvsi2(int32_t a) {
 
 int64_t __absvdi2(int64_t a) {
     uint64_t x = (uint64_t)a;
-    uint64_t s = (uint64_t)0 - (x >> 63);
+    uint64_t s = SIGN_MASK64(x);
     uint64_t m = (x ^ s) - s;
 
     if ((m >> 63) != 0) {
@@ -2170,8 +2205,12 @@ int64_t __aeabi_uwrite8(int64_t value, void *address) {
 #endif
 
 // Workaround: GCC 13, Xtensa, optimising for size: it crashes on "+g" here.
+// Clang 6 to 8, 64-bit SPARC: it keeps only the low 32 bits of a 64-bit value
+// that it puts in a register for asm, so the values stay in memory there.
 #if !defined(__clang__) && defined(__XTENSA__) && __GNUC__ == 13
 #   define FP_HIDDEN "+r"
+#elif defined(__clang__) && __clang_major__ < 9 && defined(__sparc__) && defined(__arch64__)
+#   define FP_HIDDEN "+m"
 #else
 #   define FP_HIDDEN "+g"
 #endif
@@ -2475,8 +2514,13 @@ static inline void fp_wide_mul32(uint32_t a, uint32_t b, uint32_t *hi, uint32_t 
 // returns it on some targets, and as its low part on others, down to the low
 // byte on AVR, so it is extended to all of that register. Its value is -1, 0,
 // or 1, or unordered if either operand is a NaN.
+//
+// Workaround: Clang 6 to 10, MSP430: it reads that result as 32 bits, in r13
+// and r12, where the run-time ABI has an int, so it has 32 bits there.
 #if LGRT_64BIT || defined(__x86_64__) || defined(__mips64)
 typedef int64_t fp_cmp;
+#elif defined(__MSP430__)
+typedef int32_t fp_cmp;
 #else
 typedef int fp_cmp;
 #endif
@@ -2625,6 +2669,22 @@ typedef uint64_t fp_unsigned_di;
 typedef u128 fp_unsigned_ti;
 #endif
 
+// The types that conversions from signed integers take them in, by mode.
+//
+// Workaround: GCC before 5, 64-bit PowerPC: for those of int, its library
+// calls zero-extend the argument, where the ABI has it sign-extended and code
+// compiled for that type relies on that. So they take all of the register
+// there, and narrow it to the low half.
+#if LGRT_64BIT && defined(__powerpc__) && !defined(__clang__) && __GNUC__ < 5
+typedef uint64_t fp_signed_si;
+#else
+typedef int32_t fp_signed_si;
+#endif
+typedef int64_t fp_signed_di;
+#if HAS_INT128
+typedef i128 fp_signed_ti;
+#endif
+
 #define FP_FROM_INT(fmt, C, T, E, F, mode, I, U, iw) \
     FP_HELPER T fmt##_float_##mode(T sign, U value) { \
         unsigned int top; \
@@ -2645,7 +2705,8 @@ typedef u128 fp_unsigned_ti;
         return fmt##_round_pack(sign, FP_BIAS(E) + top, sig); \
     } \
     \
-    FP_ABI C __float##mode##fmt(I i) { \
+    FP_ABI C __float##mode##fmt(fp_signed_##mode a) { \
+        I i = (I)(U)a; \
         T sign = i < 0 ? FP_SIGN(T, E, F) : 0; \
         U value = i < 0 ? (U)0 - (U)i : (U)i; \
         \
@@ -2763,9 +2824,10 @@ FP_FROM_INT(sf, sf_value, uint32_t, 8, 23, ti, i128, u128, 128)
 #define QUAD_OWN_NAMES 1
 typedef long double quad_value;
 #elif !LGRT_SOFT_FLOAT
-// Workaround: GCC 9 to 16, 64-bit MIPS, -msingle-float: it moves long double
+// Workaround: GCC 4.9 to 16, 64-bit MIPS, -msingle-float: it moves long double
 // with instructions that the assembler rejects, so nothing can use the type.
-#elif defined(__mips_single_float) && LDBL_MANT_DIG == 113 && !defined(__clang__) && __GNUC__ >= 9
+#elif defined(__mips_single_float) && LDBL_MANT_DIG == 113 && !defined(__clang__) \
+   && (__GNUC__ >= 5 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 9))
 #elif defined(__powerpc__)
 #if defined(__FLOAT128__)
 #define SOFT_QUAD 1
@@ -3027,14 +3089,14 @@ WIDE_HELPER void wide_mul(struct wide a, struct wide b, struct wide *hi, struct 
         struct wide bits; \
         \
         __builtin_memcpy(&bits, &value, sizeof(struct wide)); \
-        __asm__ ("" : "+g"(bits.high), "+g"(bits.low)); \
+        __asm__ ("" : FP_HIDDEN(bits.high), FP_HIDDEN(bits.low)); \
         return bits; \
     } \
     \
     FP_ABI static inline C fmt##_from_bits(struct wide bits) { \
         C value; \
         \
-        __asm__ ("" : "+g"(bits.high), "+g"(bits.low)); \
+        __asm__ ("" : FP_HIDDEN(bits.high), FP_HIDDEN(bits.low)); \
         __builtin_memcpy(&value, &bits, sizeof(struct wide)); \
         return value; \
     }
@@ -5128,7 +5190,29 @@ FP_FROM_INT(hf, hf_value, uint32_t, 5, 10, di, int64_t, uint64_t, 64)
 #elif SOFT_HF
 
 FP16_BITS(hf, hf_value)
+
+// Workaround: Clang 21, s390x: with -msoft-float, which no macro tells, it
+// holds half as float, which it makes by a call of __extendhfsf2, so that this
+// called itself on its own argument with -ffinite-math-only, which marks the
+// argument as no NaN, and at -Og, which keeps it for the debugger. A structure
+// of one half goes in the same register as half, and is never marked so, and
+// without optimisation nothing keeps it.
+#if defined(__clang__) && __clang_major__ == 21 && defined(__s390x__)
+struct hf_argument {
+    hf_value value;
+};
+
+FP_EXTEND_BITS(hf, uint32_t, 5, 10, sf, uint32_t, 8, 23)
+
+__attribute__((__optnone__, __noinline__)) FP_ABI sf_value __extendhfsf2(struct hf_argument a) {
+    uint16_t bits;
+
+    __builtin_memcpy(&bits, &a, sizeof(uint16_t));
+    return sf_from_bits(sf_from_hf(bits));
+}
+#else // defined(__clang__) && __clang_major__ == 21 && defined(__s390x__)
 FP_EXTEND(hf, hf_value, uint32_t, 5, 10, sf, sf_value, uint32_t, 8, 23)
+#endif // defined(__clang__) && __clang_major__ == 21 && defined(__s390x__)
 FP_TRUNC(hf, hf_value, uint32_t, 5, 10, sf, sf_value, uint32_t, 8, 23)
 
 // Older releases of Clang call these for __fp16, with half in an integer
@@ -5240,17 +5324,37 @@ FP_FROM_INT(hf, hf_value, uint32_t, 5, 10, ti, i128, u128, 128)
 
 // bfloat16 travels as half does.
 //
-// Workaround: Clang 17 and 18, IA-32: __bf16 comes back on the x87 stack, as a
-// float whose image holds its bits, so these are written with that type there.
-#if defined(__clang__) && defined(__i386__) && (__clang_major__ == 17 || __clang_major__ == 18)
-typedef __bf16 bf_value;
-#else
+// Workaround: Clang 17, IA-32: __bf16 comes back on the x87 stack, as a float
+// whose image holds its bits in its low half, so these are written with such
+// floats there. Written with __bf16, they make what they return by a call of
+// __truncsfbf2 where the stack protector is on, which then calls itself.
+#if defined(__clang__) && defined(__i386__) && __clang_major__ == 17
+typedef float bf_value;
+
+FP16_HELPER uint32_t bf_to_bits(float value) {
+    uint32_t image;
+
+    __builtin_memcpy(&image, &value, sizeof(uint32_t));
+    __asm__ ("" : "+g"(image));
+    return (uint16_t)image;
+}
+
+FP16_HELPER float bf_from_bits(uint32_t bits) {
+    uint32_t image = (uint16_t)bits;
+    float value;
+
+    __asm__ ("" : "+g"(image));
+    __builtin_memcpy(&value, &image, sizeof(uint32_t));
+    return value;
+}
+#else // defined(__clang__) && defined(__i386__) && __clang_major__ == 17
 typedef hf_value bf_value;
-#endif
+
+FP16_BITS(bf, bf_value)
+#endif // defined(__clang__) && defined(__i386__) && __clang_major__ == 17
 
 #define SOFT_BF 1
 
-FP16_BITS(bf, bf_value)
 FP_STICKY_SHIFT(bf, uint32_t, 7)
 FP_ROUND_PACK(bf, uint32_t, 8, 7)
 FP_COMPARE(bf, uint32_t, 8, 7)
@@ -5770,10 +5874,12 @@ __attribute__((__unused__)) static inline unsigned int cx_larger(unsigned int a,
 
 // The type that powers take their exponent in.
 //
-// Workaround: Clang before 12, 64-bit RISC-V: it zero-extends the exponent for
-// these calls, where the ABI has it sign-extended and code compiled for int
-// relies on that. So they take all of the register there, and narrow it.
-#if defined(__clang__) && __clang_major__ < 12 && defined(__riscv) && __riscv_xlen == 64
+// Workaround: Clang before 12, 64-bit RISC-V, and GCC before 5, 64-bit
+// PowerPC: they zero-extend the exponent for these calls, where the ABI has it
+// sign-extended and code compiled for int relies on that. So they take all of
+// the register there, and narrow it.
+#if (defined(__clang__) && __clang_major__ < 12 && defined(__riscv) && __riscv_xlen == 64) \
+ || (LGRT_64BIT && defined(__powerpc__) && !defined(__clang__) && __GNUC__ < 5)
 typedef long powi_exponent;
 #else
 typedef int powi_exponent;
@@ -5999,6 +6105,10 @@ CX_VFP_ROUTINES(df, dc, uint64_t, "32", "d0", "d1", "d3")
 // go where uint64_t does on the latter two, the real part low. ARM without
 // those standards returns them in registers, and only has soft floating point
 // to care about, where GCC accepts the types.
+//
+// Workaround: Clang 6 to 10, MSP430, and 11 and 12, AVR: they return 8 bytes
+// of a complex value in memory too, so the routines return the type itself
+// there, as their calls of them expect.
 #if defined(__ARM_EABI__) || !defined(__arm__)
 struct dc_value {
     uint64_t parts[2];
@@ -6008,16 +6118,20 @@ struct sc_value {
     uint32_t parts[2];
 };
 #define SC_RETURN struct sc_value
+#elif (defined(__MSP430__) && defined(__clang__) && __clang_major__ < 11) \
+   || (defined(__AVR__) && defined(__clang__) && __clang_major__ < 13)
+__extension__ typedef _Complex float sc_value;
+#define SC_RETURN sc_value
 #else
 #define SC_RETURN uint64_t
 #endif
 #define DC_RETURN struct dc_value
-#else
+#else // defined(__ARM_EABI__) || !defined(__arm__)
 __extension__ typedef _Complex float sc_value;
 __extension__ typedef _Complex double dc_value;
 #define SC_RETURN sc_value
 #define DC_RETURN dc_value
-#endif
+#endif // defined(__ARM_EABI__) || !defined(__arm__)
 
 CX_LABELLED_ROUTINES(sf, sc, uint32_t, SC_RETURN)
 #if SOFT_DOUBLE
@@ -6789,7 +6903,7 @@ ibm_value __gcc_qneg(df_value a, df_value b) {
 
 IBM_FROM_NAMED(sf_value, __gcc_stoq, ibm_make(df_from_sf(sf_to_bits(i)), 0))
 IBM_FROM_NAMED(df_value, __gcc_dtoq, ibm_make(df_to_bits(i), 0))
-IBM_FROM_NAMED(int32_t, __gcc_itoq, ibm_from_si(i))
+IBM_FROM_NAMED(fp_signed_si, __gcc_itoq, ibm_from_si((int32_t)(uint32_t)i))
 IBM_FROM_NAMED(fp_unsigned_si, __gcc_utoq, ibm_float_si(false, (uint32_t)i))
 
 sf_value __gcc_qtos(df_value a, df_value b) {
@@ -6828,19 +6942,84 @@ IBM_HELPER struct ibm_bits ibm_tidy_bits(ibm_value value) {
     return ibm_tidy(ibm_to_bits(value));
 }
 
+// Workaround: GCC 7, SPE: code that computes with values of this type comes
+// out wrong in places that move as the code around them changes, as the
+// complex division does at -Og, so these routines compute on the bits there,
+// with the routines of the format, and take values of the type only at their
+// ends.
+#if defined(__SPE__) && __GNUC__ == 7
+CX_NO_CONVERSIONS(ibm, struct ibm_bits)
+
+static inline struct ibm_bits ibm_cx_add(struct ibm_bits x, struct ibm_bits y) {
+    return ibm_add(x, y);
+}
+
+static inline struct ibm_bits ibm_cx_sub(struct ibm_bits x, struct ibm_bits y) {
+    return ibm_sub(x, y);
+}
+
+static inline struct ibm_bits ibm_cx_mul(struct ibm_bits x, struct ibm_bits y) {
+    return ibm_mul(x, y);
+}
+
+static inline struct ibm_bits ibm_cx_div(struct ibm_bits x, struct ibm_bits y) {
+    return ibm_div(x, y);
+}
+
+#define IBM_CX_VALUE struct ibm_bits
+#else // defined(__SPE__) && __GNUC__ == 7
 CX_FP_OPERATIONS(ibm, ibm_value, struct ibm_bits, ibm_tidy_bits, ibm_from_bits)
+
+#define IBM_CX_VALUE ibm_value
+#endif // defined(__SPE__) && __GNUC__ == 7
+
 CX_SPECIAL_VALUES(
     ibm, struct ibm_bits, ibm_make(0, 0), ibm_make(1, 0), ibm_make(IBM_INF, 0),
     ibm_make(IBM_NAN, 0)
 )
-CX_MULTIPLY(ibm, ibm_value, struct ibm_bits)
-CX_DIVIDE(ibm, ibm_value, struct ibm_bits, ibm_make(IBM_NAN, 0), ibm_make(0, 0))
+CX_MULTIPLY(ibm, IBM_CX_VALUE, struct ibm_bits)
+CX_DIVIDE(ibm, IBM_CX_VALUE, struct ibm_bits, ibm_make(IBM_NAN, 0), ibm_make(0, 0))
 CX_POWER(
-    ibm, ibm_value, struct ibm_bits, ibm_make(0, 0), ibm_make(IBM_INF, 0), ibm_make(IBM_ONE, 0)
+    ibm, IBM_CX_VALUE, struct ibm_bits, ibm_make(0, 0), ibm_make(IBM_INF, 0), ibm_make(IBM_ONE, 0)
 )
-CX_NAMED_ROUTINES(ibm, ibm_value, ibm_complex, __multc3, __divtc3, __powitf2)
 
-#endif
+#if defined(__SPE__) && __GNUC__ == 7
+ibm_complex __multc3(ibm_value a, ibm_value b, ibm_value c, ibm_value d) {
+    struct ibm_bits parts[2];
+    union {
+        ibm_value parts[2];
+        ibm_complex whole;
+    } z;
+
+    ibm_cx_multiply(ibm_tidy_bits(a), ibm_tidy_bits(b), ibm_tidy_bits(c), ibm_tidy_bits(d), parts);
+    z.parts[0] = ibm_from_bits(parts[0]);
+    z.parts[1] = ibm_from_bits(parts[1]);
+    return z.whole;
+}
+
+ibm_complex __divtc3(ibm_value a, ibm_value b, ibm_value c, ibm_value d) {
+    struct ibm_bits parts[2];
+    union {
+        ibm_value parts[2];
+        ibm_complex whole;
+    } z;
+
+    ibm_cx_divide(ibm_tidy_bits(a), ibm_tidy_bits(b), ibm_tidy_bits(c), ibm_tidy_bits(d), parts);
+    z.parts[0] = ibm_from_bits(parts[0]);
+    z.parts[1] = ibm_from_bits(parts[1]);
+    return z.whole;
+}
+
+ibm_value __powitf2(ibm_value x, powi_exponent n) {
+    return ibm_from_bits(ibm_cx_power(ibm_tidy_bits(x), (int)n));
+}
+#else // defined(__SPE__) && __GNUC__ == 7
+CX_NAMED_ROUTINES(ibm, ibm_value, ibm_complex, __multc3, __divtc3, __powitf2)
+#endif // defined(__SPE__) && __GNUC__ == 7
+
+#undef IBM_CX_VALUE
+
+#endif // LDBL_MANT_DIG == 106
 
 #endif // HAS_IBM_128
 
@@ -6854,10 +7033,38 @@ __extension__ typedef _Complex long double quad_complex;
 __extension__ typedef _Complex float quad_complex __attribute__((__mode__(__TC__)));
 #endif
 
+// Workaround: Clang 6 and 7, x32: without optimisation, its back end stops on
+// any function that returns a complex __float128, with
+// "Unable to copy EFLAGS physical register!" or
+// "Cannot emit physreg copy instruction". Such a value goes back in memory,
+// whose address the caller passes as the first integer argument and the
+// routine returns, so there these take and return it.
+#if defined(__clang__) && __clang_major__ < 8 && defined(__x86_64__) && defined(__ILP32__) \
+ && !defined(__OPTIMIZE__)
+#   define QUAD_CX_ROUTINES(fmt, cfmt) \
+        void *__mul##cfmt##3(void *z, quad_value a, quad_value b, quad_value c, quad_value d) { \
+            fmt##_cx_multiply(a, b, c, d, z); \
+            return z; \
+        } \
+        \
+        void *__div##cfmt##3(void *z, quad_value a, quad_value b, quad_value c, quad_value d) { \
+            fmt##_cx_divide( \
+                fmt##_cx_bits(a), fmt##_cx_bits(b), fmt##_cx_bits(c), fmt##_cx_bits(d), z \
+            ); \
+            return z; \
+        } \
+        \
+        quad_value __powi##fmt##2(quad_value x, powi_exponent n) { \
+            return fmt##_cx_power(x, (int)n); \
+        }
+#else
+#   define QUAD_CX_ROUTINES(fmt, cfmt) CX_ROUTINES(fmt, cfmt, quad_value, quad_complex)
+#endif
+
 #define QUAD_COMPLEX_ROUTINES(fmt, cfmt) \
     CX_FP_OPERATIONS(fmt, quad_value, struct wide, fmt##_to_bits, fmt##_from_bits) \
     CX_WIDE(fmt, quad_value, 32767, 112) \
-    CX_ROUTINES(fmt, cfmt, quad_value, quad_complex)
+    QUAD_CX_ROUTINES(fmt, cfmt)
 
 // The same choice of names as the routines of the format.
 #if defined(__powerpc__) && (defined(__FLOAT128__) || defined(__VSX__) || defined(__clang__))
@@ -7970,8 +8177,8 @@ TI_DIVMOD(__modti3, true, true)
 TI_DIVMOD(__umodti3, false, true)
 
 // A signed product, whose overflow shows in the half above it not being the
-// extension of what is below that. Clang has this inline on SPARC.
-#if !defined(__sparc__)
+// extension of what is below that. Clang has this inline on SPARC from 14 on.
+#if !defined(__sparc__) || (defined(__clang__) && __clang_major__ < 14)
 TI_ABI ti_return __muloti4(TI_PARAMETER(a), TI_PARAMETER(b), int *overflow) {
     struct ti x = TI_VALUE(a);
     struct ti y = TI_VALUE(b);
@@ -10875,7 +11082,8 @@ static void dec_from_u128(void *value, u128 i, bool negative, size_t words) {
         return dec_to_u##bits(&a, false, words); \
     } \
     \
-    DEC_RETURN T DEC_NAME(float##mode##fmt)(I i) { \
+    DEC_RETURN T DEC_NAME(float##mode##fmt)(fp_signed_##mode a) { \
+        I i = (I)(U)a; \
         U magnitude = i < 0 ? (U)0 - (U)i : (U)i; \
         T r; \
         \
@@ -11390,6 +11598,17 @@ DEC_FROM_WIDE(kf, quad_value, 32767, 112)
 DEC_TO_WIDE(kf, quad_value, 32767, 112, 16384, -16494)
 DEC_FROM_ALL(trunckfsd, trunckfdd, extendkftd, kf, quad_value, 113, 16384, -16494)
 DEC_TO_ALL(extendsdkf, extendddkf, trunctdkf, kf, quad_value, 113, 16384, -16494)
+
+#if __GNUC__ < 9
+// GCC before 9 calls these by other names, with a 2 at the end, and with trunc
+// and extend the other way round between kf and td.
+FP_ALIAS(sd_value, __dpd_trunckfsd2, "__dpd_trunckfsd", (quad_value a))
+FP_ALIAS(dd_value, __dpd_trunckfdd2, "__dpd_trunckfdd", (quad_value a))
+FP_ALIAS(td_value, __dpd_trunckftd2, "__dpd_extendkftd", (quad_value a))
+FP_ALIAS(quad_value, __dpd_extendsdkf2, "__dpd_extendsdkf", (sd_value a))
+FP_ALIAS(quad_value, __dpd_extendddkf2, "__dpd_extendddkf", (dd_value a))
+FP_ALIAS(quad_value, __dpd_extendtdkf2, "__dpd_trunctdkf", (td_value a))
+#endif
 #elif SOFT_QUAD
 DEC_FROM_WIDE(tf, quad_value, 32767, 112)
 DEC_TO_WIDE(tf, quad_value, 32767, 112, 16384, -16494)
@@ -12966,6 +13185,43 @@ bool atomic_compare_exchange_1(
     return locked_compare_exchange(1, ptr, expected, &desired);
 }
 
+// Workaround: Clang 16, RISC-V: at -O1 and -Og, the flag of its 2-byte
+// compare-exchanges comes from a register that their loop has reused, so that
+// they report a failure where they stored.
+#if defined(__clang__) && __clang_major__ == 16 && defined(__riscv) && defined(__riscv_atomic)
+#define RISCV_CAS_2 1
+
+// So this compares itself, on the aligned word that holds the value, which is
+// little-endian, and goes through the compare-exchange that it gets right.
+static inline bool riscv_compare_exchange_2(volatile void *ptr, void *expected, uint16_t desired) {
+    uintptr_t address = (uintptr_t)ptr;
+    volatile atomic_u32 *whole = (volatile atomic_u32 *)(address & ~(uintptr_t)3);
+    uint32_t shift = (uint32_t)(address & 2) * 8;
+    uint32_t others = ~((uint32_t)UINT16_MAX << shift);
+    uint32_t old = __atomic_load_n(whole, __ATOMIC_SEQ_CST);
+    uint16_t e;
+
+    copy(&e, expected, 2);
+    for (;;) {
+        uint16_t found = (uint16_t)(old >> shift);
+
+        if (found != e) {
+            copy(expected, &found, 2);
+            return false;
+        }
+        bool exchanged = __atomic_compare_exchange_n(
+            whole, &old, (old & others) | ((uint32_t)desired << shift), true, __ATOMIC_SEQ_CST,
+            __ATOMIC_SEQ_CST
+        );
+        if (exchanged) {
+            return true;
+        }
+    }
+}
+#else // defined(__clang__) && __clang_major__ == 16 && defined(__riscv) && defined(__riscv_atomic)
+#define RISCV_CAS_2 0
+#endif // defined(__clang__) && __clang_major__ == 16 && defined(__riscv) && defined(__riscv_atomic)
+
 bool atomic_compare_exchange_2(
     volatile void *ptr,
     void *expected,
@@ -12975,7 +13231,11 @@ bool atomic_compare_exchange_2(
 ) {
     if (LOCK_FREE(2)) {
         if (aligned(ptr, 2)) {
-#if WORD_CAS
+#if RISCV_CAS_2
+            (void)success;
+            (void)failure;
+            return riscv_compare_exchange_2(ptr, expected, desired);
+#elif WORD_CAS
             (void)success;
             (void)failure;
             return word_compare_exchange(ptr, 2, expected, &desired);
@@ -15049,14 +15309,14 @@ int32_t __ashrsi3(int32_t a, int b) {
 
 // GCC 4.8 and 4.9 change precision by loading FPSCR from these: the first
 // entry for the precision that functions do not start in, the second for the
-// one they do. Both round to nearest and flush denormal numbers to zero, as
-// those would otherwise raise FPU errors on SH-4.
+// one they do. Both round to nearest and keep denormal numbers, as IEEE 754
+// has them.
 __attribute__((__used__, __section__(".rodata.__fpscr_values")))
 const uint32_t __fpscr_values[2] = {
 #if defined(__SH4_SINGLE__) || defined(__SH2A_SINGLE__)
-    0x000c0000, 0x00040000
+    0x00080000, 0x00000000
 #else
-    0x00040000, 0x000c0000
+    0x00000000, 0x00080000
 #endif
 };
 
@@ -15743,7 +16003,7 @@ FP_ALIAS(uint32_t, __mspabi_fltullf, "__floatundisf", (uint64_t a))
 
 MSP430_FROM_64("__mspabi_cmpd", "__ltdf2")
 
-FP_ALIAS(int, __mspabi_cmpf, "__ltsf2", (uint32_t a, uint32_t b))
+FP_ALIAS(fp_cmp, __mspabi_cmpf, "__ltsf2", (uint32_t a, uint32_t b))
 FP_ALIAS(uint32_t, __mspabi_negf, "__negsf2", (uint32_t a))
 FP_ALIAS(uint64_t, __mspabi_negd, "__negdf2", (uint64_t a))
 FP_ALIAS(uint32_t, __mspabi_fixful, "__fixunssfsi", (uint32_t a))
