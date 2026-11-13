@@ -13414,6 +13414,16 @@ bool atomic_compare_exchange_16(
 #define OP_XOR(x, v) ((x) ^ (v))
 #define OP_NAND(x, v) (~((x) & (v)))
 
+// Workaround: GCC 13.1 and 13.2, C2x and later, optimising beyond -O1: dead
+// store elimination drops the store of the new value, which store_object then
+// reads, so the routines under the lock write back what was in its place, and
+// at -Os it warns that the old value, which load_object writes, is unset.
+#if !defined(__clang__) && __GNUC__ == 13 && __GNUC_MINOR__ < 3 && __STDC_VERSION__ > 201710L
+#   define KEEP_STORED(object) __asm__ ("" : "+m"(object))
+#else
+#   define KEEP_STORED(object) ((void)0)
+#endif
+
 // fetch(op, n) names the builtin, or the function, that the lock-free path
 // calls.
 #define FETCH_OP(op, apply, n, type, atomic_type, arith_type, fetch) \
@@ -13433,7 +13443,9 @@ bool atomic_compare_exchange_16(
         lock = lock_of(ptr); \
         lgrt_lock(lock); \
         load_object(&x, ptr, n); \
+        KEEP_STORED(x); \
         y = (type)apply((arith_type)x, (arith_type)val); \
+        KEEP_STORED(y); \
         store_object(ptr, &y, n); \
         unlock(lock); \
         return x; \
