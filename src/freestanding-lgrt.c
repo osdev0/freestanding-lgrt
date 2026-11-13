@@ -5408,6 +5408,13 @@ FP_ABI bf_value __trunchfbf2(hf_value a) {
     return bf_from_bits(bits);
 }
 
+// Workaround: GCC 13.1, 13.2, and 14.1: converting half to bfloat16, they call
+// __extendhfbf2, which their own library does not define.
+#if !defined(__clang__) \
+ && ((__GNUC__ == 13 && __GNUC_MINOR__ < 3) || (__GNUC__ == 14 && __GNUC_MINOR__ < 2))
+FP_ALIAS(bf_value, __extendhfbf2, "__trunchfbf2", (hf_value a))
+#endif
+
 #endif // defined(__BFLT16_MANT_DIG__) || (defined(__clang__) && (defined(__i386__) || defined(__x86_64__) || defined(__aarch64__) || defined(__riscv) || defined(__loongarch__)))
 
 #endif // !HF_PASSED_AS_INT
